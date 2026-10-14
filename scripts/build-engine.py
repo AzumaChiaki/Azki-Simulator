@@ -276,6 +276,10 @@ def main():
         if p.is_file():p.chmod(p.stat().st_mode & ~0o022)
     files=[{'path':p.relative_to(engine).as_posix(),'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'executable':bool(p.stat().st_mode&0o111)} for p in sorted(engine.rglob('*')) if p.is_file()]
     # These are build records used by the existing packager, not startup gates.
+    capabilities=json.loads((INPUT/'capabilities.json').read_text())
+    qemu_record=next(item for item in files if item['path']=='project/backend/build/qemu-system-arm')
+    for capability in capabilities.values():
+        capability['qemuSHA256']=qemu_record['sha256']
     manifest={'schema':'azki.simulator.engine.v1','version':1,'profile':'local-assets',
       'entrypoints':{'python':'python/bin/python3.12','qemu':'project/backend/build/qemu-system-arm','project':'project','bootstrap':'bootstrap.py'},
       'python':{'version':'3.12','home':'python','stdlib':'python/lib/python3.12','sitePackages':'python/lib/python3.12/site-packages','startupFlags':['-I','-S','-B']},
@@ -283,7 +287,7 @@ def main():
       'distribution':{'mode':'runtime-only','firmwareIncluded':False,'publicReady':True},
       'signing':{'developerIDSigned':False,'notarized':False,'adHoc':True},'executionVerified':False,
       'build':{'qemu':QEMU_VERSION,'python':PYTHON_VERSION,'packages':PACKAGES,'nativeLibraries':formulas},
-      **json.loads((INPUT/'capabilities.json').read_text())}
+      **capabilities}
     (engine/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
     copytree(INPUT,delivery/'engine')
     (delivery/'scripts').mkdir(exist_ok=True)

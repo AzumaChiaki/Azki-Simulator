@@ -24,6 +24,22 @@ cp "$bin/AzkiSimulator" "$app/Contents/MacOS/AzkiSimulator"
 cp "$root/Assets/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 cp "$root/engine/catalog.json" "$app/Contents/Resources/Firmware/catalog.json"
 cp "$root/LICENSE" "$app/Contents/Resources/LICENSE"
+"$app/Contents/Resources/Engine/python/bin/python3.12" -I -S -B - "$app/Contents/Resources" <<'PY'
+import pathlib, sys
+resources = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(resources / 'Runtime'))
+from azki_simulator.bundled_runtime import _manifest
+from azki_simulator.firmware_catalog import FirmwareCatalog
+from azki_simulator.instance_storage import checked_capabilities
+info = _manifest(resources / 'Engine')
+record = info['files'][info['manifest']['entrypoints']['qemu']]
+checked_capabilities(info['manifest'], record['sha256'])
+catalog = FirmwareCatalog(resources / 'Firmware')
+catalog.list_items()
+if not catalog.imports:
+    raise RuntimeError('Firmware import recipes are missing')
+print('Packaged runtime metadata ready')
+PY
 python3 -B - "$root" "$app" <<'PY'
 import pathlib, plistlib, shutil, sys
 root, app = map(pathlib.Path, sys.argv[1:])

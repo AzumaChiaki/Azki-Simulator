@@ -16060,7 +16060,826 @@
       }
     }
   ],
-  "imports": [],
+  "imports": [
+    {
+      "sha256": "9c4129a2bb62be559b31dce883715264862854504f44b47f6cf27f1e66888498",
+      "bytes": 6786920,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.n66cn@3.1.17@38d1681ec71b",
+        "miwear.watch.n66nfc@3.1.17@38d1681ec71b",
+        "miwear.watch.n66tc@3.1.17@38d1681ec71b"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "38d1681ec71b39acfdff9181fc9cc3aa5513a052ae1c17c550fc6b5d725bf711",
+      "bytes": 44004114,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.n66cn@3.1.17@38d1681ec71b",
+        "miwear.watch.n66nfc@3.1.17@38d1681ec71b",
+        "miwear.watch.n66tc@3.1.17@38d1681ec71b"
+      ],
+      "members": [
+        {
+          "asset": "9c4129a2bb62be559b31dce883715264862854504f44b47f6cf27f1e66888498",
+          "record": {
+            "index": 8,
+            "name": "vela_ap.bin",
+            "header_offset": 30868792,
+            "data_offset": 30868861,
+            "compressed_size": 4195710,
+            "size": 6786920,
+            "compression_method": 8,
+            "crc32": "5db53ab0",
+            "sha256": "9c4129a2bb62be559b31dce883715264862854504f44b47f6cf27f1e66888498",
+            "descriptor": "0008-vela_ap.bin.json"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "9c02dab4020b2cc9666ee7d34cf27d311b76aadcec519a38361bbcbd94c53264",
+      "bytes": 6791552,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.n66cn@3.1.32@489f20502ae2",
+        "miwear.watch.n66nfc@3.1.32@489f20502ae2",
+        "miwear.watch.n66tc@3.1.32@489f20502ae2"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "489f20502ae2ee371d06aac055a934ca9e1d9a0dd84ae4804409a8dc4eebc0ec",
+      "bytes": 44018868,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.n66cn@3.1.32@489f20502ae2",
+        "miwear.watch.n66nfc@3.1.32@489f20502ae2",
+        "miwear.watch.n66tc@3.1.32@489f20502ae2"
+      ],
+      "members": [
+        {
+          "asset": "9c02dab4020b2cc9666ee7d34cf27d311b76aadcec519a38361bbcbd94c53264",
+          "record": {
+            "index": 8,
+            "name": "vela_ap.bin",
+            "header_offset": 30871112,
+            "data_offset": 30871181,
+            "compressed_size": 4194796,
+            "size": 6791552,
+            "compression_method": 8,
+            "crc32": "6c03f0ea",
+            "sha256": "9c02dab4020b2cc9666ee7d34cf27d311b76aadcec519a38361bbcbd94c53264",
+            "descriptor": "0008-vela_ap.bin.json"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "7b04219dd18da07f4e81be7fb42ceb0feffdb306fca9b70be2a7879d1f1e8315",
+      "bytes": 7774544,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.n67cn@3.1.171@01591845f76e"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "01591845f76e7ec83f20f454fc8de89ae0c583131400dd5956a2de5030cc1c4e",
+      "bytes": 50301988,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.n67cn@3.1.171@01591845f76e"
+      ],
+      "members": [
+        {
+          "asset": "7b04219dd18da07f4e81be7fb42ceb0feffdb306fca9b70be2a7879d1f1e8315",
+          "record": {
+            "index": 0,
+            "name": "vela_ap.bin",
+            "header_offset": 609020,
+            "data_offset": 609089,
+            "compressed_size": 4816530,
+            "size": 7774544,
+            "compression_method": 8,
+            "crc32": "9012d467",
+            "sha256": "7b04219dd18da07f4e81be7fb42ceb0feffdb306fca9b70be2a7879d1f1e8315",
+            "descriptor": "0000-vela_ap.bin.json"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "4f43b325addd6d9e6e7c7e2a4d00ffe3f23d5fb1560d8fe503544002ac1f516b",
+      "bytes": 7774696,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.n67cn@3.1.175@a8274e4cb29c"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "a8274e4cb29c427e020d08b7be109478750fb883498fd4bab0aad2064ef7131c",
+      "bytes": 50302103,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.n67cn@3.1.175@a8274e4cb29c"
+      ],
+      "members": [
+        {
+          "asset": "4f43b325addd6d9e6e7c7e2a4d00ffe3f23d5fb1560d8fe503544002ac1f516b",
+          "record": {
+            "index": 0,
+            "name": "vela_ap.bin",
+            "header_offset": 609016,
+            "data_offset": 609085,
+            "compressed_size": 4816380,
+            "size": 7774696,
+            "compression_method": 8,
+            "crc32": "32f59155",
+            "sha256": "4f43b325addd6d9e6e7c7e2a4d00ffe3f23d5fb1560d8fe503544002ac1f516b",
+            "descriptor": "0000-vela_ap.bin.json"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "acb9b0e867140f09c90747c0ada98f340e2edb540eb69b999c4b78adbc102595",
+      "bytes": 7774864,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.n67cn@3.1.187@6d33afe20089"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "6d33afe200897d6c307f98738176d95c55e86ca568c4a4fb8d8f653c43924cd2",
+      "bytes": 50328021,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.n67cn@3.1.187@6d33afe20089"
+      ],
+      "members": [
+        {
+          "asset": "acb9b0e867140f09c90747c0ada98f340e2edb540eb69b999c4b78adbc102595",
+          "record": {
+            "index": 0,
+            "name": "vela_ap.bin",
+            "header_offset": 609016,
+            "data_offset": 609085,
+            "compressed_size": 4814975,
+            "size": 7774864,
+            "compression_method": 8,
+            "crc32": "fb930e09",
+            "sha256": "acb9b0e867140f09c90747c0ada98f340e2edb540eb69b999c4b78adbc102595",
+            "descriptor": "0000-vela_ap.bin.json"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "8df4bebc9fb2cc977ce3c945ba32f2c280660fed82b4f09bda80b3e9d0231bdf",
+      "bytes": 7441924,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.o66cn@3.1.16@435fd32b5a23",
+        "miwear.watch.o66lj@3.1.16@435fd32b5a23",
+        "miwear.watch.o66nfc@3.1.16@435fd32b5a23",
+        "miwear.watch.o66tc@3.1.16@435fd32b5a23"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "435fd32b5a23e4ed81f712a7047fdcd4a4577fdfffa7a9f38e0d8bac7a6470d9",
+      "bytes": 54317859,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.o66cn@3.1.16@435fd32b5a23",
+        "miwear.watch.o66lj@3.1.16@435fd32b5a23",
+        "miwear.watch.o66nfc@3.1.16@435fd32b5a23",
+        "miwear.watch.o66tc@3.1.16@435fd32b5a23"
+      ],
+      "members": [
+        {
+          "asset": "8df4bebc9fb2cc977ce3c945ba32f2c280660fed82b4f09bda80b3e9d0231bdf",
+          "record": {
+            "index": 8,
+            "name": "vela_ap.bin",
+            "header_offset": 33426007,
+            "data_offset": 33426076,
+            "compressed_size": 4625581,
+            "size": 7441924,
+            "compression_method": 8,
+            "crc32": "4b543f1d",
+            "sha256": "8df4bebc9fb2cc977ce3c945ba32f2c280660fed82b4f09bda80b3e9d0231bdf",
+            "descriptor": "0008-vela_ap.bin.json"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "ea455686bd4dcf55eab93ac03382734b20a959db1ec73448f8f6c8bd06773c50",
+      "bytes": 7501780,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.o66cn@3.1.23@1a1bc068db45",
+        "miwear.watch.o66lj@3.1.23@1a1bc068db45",
+        "miwear.watch.o66nfc@3.1.23@1a1bc068db45",
+        "miwear.watch.o66tc@3.1.23@1a1bc068db45"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "1a1bc068db451d136c533aae5ba4998af6cbe4fa5938f97330672baf801d99f2",
+      "bytes": 54389730,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.o66cn@3.1.23@1a1bc068db45",
+        "miwear.watch.o66lj@3.1.23@1a1bc068db45",
+        "miwear.watch.o66nfc@3.1.23@1a1bc068db45",
+        "miwear.watch.o66tc@3.1.23@1a1bc068db45"
+      ],
+      "members": [
+        {
+          "asset": "ea455686bd4dcf55eab93ac03382734b20a959db1ec73448f8f6c8bd06773c50",
+          "record": {
+            "index": 8,
+            "name": "vela_ap.bin",
+            "header_offset": 33436832,
+            "data_offset": 33436901,
+            "compressed_size": 4655082,
+            "size": 7501780,
+            "compression_method": 8,
+            "crc32": "624881f0",
+            "sha256": "ea455686bd4dcf55eab93ac03382734b20a959db1ec73448f8f6c8bd06773c50",
+            "descriptor": "0008-vela_ap.bin.json"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "185fc5737fa203ff3f109a282feca89a09c12d84bccd44fd7b61d74853f7fa49",
+      "bytes": 7516120,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.o66cn@3.1.26@d4e61778eee0",
+        "miwear.watch.o66lj@3.1.26@d4e61778eee0",
+        "miwear.watch.o66nfc@3.1.26@d4e61778eee0",
+        "miwear.watch.o66tc@3.1.26@d4e61778eee0"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "d4e61778eee0b051fc599c3f7adb79b2d087c1636109a386fe18ec28d206f4e5",
+      "bytes": 54398028,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.o66cn@3.1.26@d4e61778eee0",
+        "miwear.watch.o66lj@3.1.26@d4e61778eee0",
+        "miwear.watch.o66nfc@3.1.26@d4e61778eee0",
+        "miwear.watch.o66tc@3.1.26@d4e61778eee0"
+      ],
+      "members": [
+        {
+          "asset": "185fc5737fa203ff3f109a282feca89a09c12d84bccd44fd7b61d74853f7fa49",
+          "record": {
+            "index": 8,
+            "name": "vela_ap.bin",
+            "header_offset": 33436831,
+            "data_offset": 33436900,
+            "compressed_size": 4663381,
+            "size": 7516120,
+            "compression_method": 8,
+            "crc32": "27c2d431",
+            "sha256": "185fc5737fa203ff3f109a282feca89a09c12d84bccd44fd7b61d74853f7fa49",
+            "descriptor": "0008-vela_ap.bin.json"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "fb726472416e99ba11d1c20ce8f0d4f0831a6e9a673d63bb5918e2c3921d8845",
+      "bytes": 7515648,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.o66cn@3.1.28@03ac3e2b8325",
+        "miwear.watch.o66nfc@3.1.28@03ac3e2b8325",
+        "miwear.watch.o66tc@3.1.28@03ac3e2b8325"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "03ac3e2b832596ebdd6563e81c7a02bfa46161e15e31109bd1a697946142034b",
+      "bytes": 54396577,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.o66cn@3.1.28@03ac3e2b8325",
+        "miwear.watch.o66nfc@3.1.28@03ac3e2b8325",
+        "miwear.watch.o66tc@3.1.28@03ac3e2b8325"
+      ],
+      "members": [
+        {
+          "asset": "fb726472416e99ba11d1c20ce8f0d4f0831a6e9a673d63bb5918e2c3921d8845",
+          "record": {
+            "index": 8,
+            "name": "vela_ap.bin",
+            "header_offset": 33436832,
+            "data_offset": 33436901,
+            "compressed_size": 4661929,
+            "size": 7515648,
+            "compression_method": 8,
+            "crc32": "8de5888b",
+            "sha256": "fb726472416e99ba11d1c20ce8f0d4f0831a6e9a673d63bb5918e2c3921d8845",
+            "descriptor": "0008-vela_ap.bin.json"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "af5484d349e8f5c010612fb6cc0abfb5e249334cc9cf8f05f3a388e902ecef7a",
+      "bytes": 7441656,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.o66tc@3.1.11@90daf23812bf"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "90daf23812bfef3eec3063c78abd669107222a9547e781d201eb5900fbc31a6d",
+      "bytes": 54318994,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.o66tc@3.1.11@90daf23812bf"
+      ],
+      "members": [
+        {
+          "asset": "af5484d349e8f5c010612fb6cc0abfb5e249334cc9cf8f05f3a388e902ecef7a",
+          "record": {
+            "index": 8,
+            "name": "vela_ap.bin",
+            "header_offset": 33426005,
+            "data_offset": 33426074,
+            "compressed_size": 4627107,
+            "size": 7441656,
+            "compression_method": 8,
+            "crc32": "3413bb46",
+            "sha256": "af5484d349e8f5c010612fb6cc0abfb5e249334cc9cf8f05f3a388e902ecef7a"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "e3a9b4320fcdf333954e9e2dfa885791c66d326c50592c1f022612bb62312159",
+      "bytes": 13603240,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.p67cn@3.101.021@5b17ada0842d",
+        "miwear.watch.p67tc@3.101.021@5b17ada0842d"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "5b17ada0842d2773694935cd1ead018d8ed38afc27dbff51b5062260cd98c0eb",
+      "bytes": 90294663,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.p67cn@3.101.021@5b17ada0842d",
+        "miwear.watch.p67tc@3.101.021@5b17ada0842d"
+      ],
+      "members": [
+        {
+          "asset": "e3a9b4320fcdf333954e9e2dfa885791c66d326c50592c1f022612bb62312159",
+          "record": {
+            "index": 1,
+            "name": "vela_ap.bin",
+            "header_offset": 308,
+            "data_offset": 349,
+            "compressed_size": 7872638,
+            "size": 13603240,
+            "compression_method": 8,
+            "crc32": "8321413c",
+            "sha256": "e3a9b4320fcdf333954e9e2dfa885791c66d326c50592c1f022612bb62312159",
+            "descriptor": "0001-vela_ap.bin.json"
+          }
+        },
+        {
+          "asset": "344f08f25bcb6dd497f2bcafebd5909b8ba84998be1ee36788ceba9016df8131",
+          "record": {
+            "index": 4,
+            "name": "vela_resource.bin",
+            "header_offset": 8473066,
+            "data_offset": 8473113,
+            "compressed_size": 81815064,
+            "size": 173953024,
+            "compression_method": 8,
+            "crc32": "2e8f2621",
+            "sha256": "344f08f25bcb6dd497f2bcafebd5909b8ba84998be1ee36788ceba9016df8131",
+            "descriptor": "0004-vela_resource.bin.json"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "bd222f3da1aadc6e510870c24039c2b1802cdc3f65fc8027e276163801eb8cf2",
+      "bytes": 13616592,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.p67cn@3.101.028@6534235d895f",
+        "miwear.watch.p67tc@3.101.028@a1d6e3e08a1c"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "6534235d895ffd36adf57e5fde88110c51445439315e4c751a52a44e75251784",
+      "bytes": 90342346,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.p67cn@3.101.028@6534235d895f"
+      ],
+      "members": [
+        {
+          "asset": "bd222f3da1aadc6e510870c24039c2b1802cdc3f65fc8027e276163801eb8cf2",
+          "record": {
+            "index": 1,
+            "name": "vela_ap.bin",
+            "header_offset": 306,
+            "data_offset": 347,
+            "compressed_size": 7879814,
+            "size": 13616592,
+            "compression_method": 8,
+            "crc32": "6946a063",
+            "sha256": "bd222f3da1aadc6e510870c24039c2b1802cdc3f65fc8027e276163801eb8cf2",
+            "descriptor": "0001-vela_ap.bin.json"
+          }
+        },
+        {
+          "asset": "74dd54cd93d4e9c0ad418fd88124f74f229555f2f02954b7fbf0d0a70bfa8581",
+          "record": {
+            "index": 4,
+            "name": "vela_resource.bin",
+            "header_offset": 8480301,
+            "data_offset": 8480348,
+            "compressed_size": 81854178,
+            "size": 173961216,
+            "compression_method": 8,
+            "crc32": "2071f0df",
+            "sha256": "74dd54cd93d4e9c0ad418fd88124f74f229555f2f02954b7fbf0d0a70bfa8581",
+            "descriptor": "0004-vela_resource.bin.json"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "662d67f5e247e31e194d3161024890ba93b9d29d70b290fadb9aac8ce8ec3c81",
+      "bytes": 13616208,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.p67cn@3.101.036@17a1ea48d581",
+        "miwear.watch.p67tc@3.101.036@17a1ea48d581"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "17a1ea48d58117c50223faf36ecc66bd0d42828495ef9a219e84ef3168e11f71",
+      "bytes": 90342166,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.p67cn@3.101.036@17a1ea48d581",
+        "miwear.watch.p67tc@3.101.036@17a1ea48d581"
+      ],
+      "members": [
+        {
+          "asset": "662d67f5e247e31e194d3161024890ba93b9d29d70b290fadb9aac8ce8ec3c81",
+          "record": {
+            "index": 1,
+            "name": "vela_ap.bin",
+            "header_offset": 309,
+            "data_offset": 350,
+            "compressed_size": 7880403,
+            "size": 13616208,
+            "compression_method": 8,
+            "crc32": "05c47c88",
+            "sha256": "662d67f5e247e31e194d3161024890ba93b9d29d70b290fadb9aac8ce8ec3c81",
+            "descriptor": "0001-vela_ap.bin.json"
+          }
+        },
+        {
+          "asset": "2666110c552f52b797df335f805d1ceb3d15f65bb604c83b71177b6d9260f5b2",
+          "record": {
+            "index": 4,
+            "name": "vela_resource.bin",
+            "header_offset": 8481033,
+            "data_offset": 8481080,
+            "compressed_size": 81854604,
+            "size": 173963264,
+            "compression_method": 8,
+            "crc32": "784d1732",
+            "sha256": "2666110c552f52b797df335f805d1ceb3d15f65bb604c83b71177b6d9260f5b2",
+            "descriptor": "0004-vela_resource.bin.json"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "ccd6e1cd55de8782c98f26ce6d29c0b4157e2aca7f419d7e2164b1ccba6a71b3",
+      "bytes": 13795552,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.p67cn@3.101.042@616d0faba20c"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "616d0faba20c37edb07d4c3a9ee5b8b6e09cd230b7365744618e581fd5ba0fff",
+      "bytes": 90740509,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.p67cn@3.101.042@616d0faba20c"
+      ],
+      "members": [
+        {
+          "asset": "ccd6e1cd55de8782c98f26ce6d29c0b4157e2aca7f419d7e2164b1ccba6a71b3",
+          "record": {
+            "index": 1,
+            "name": "vela_ap.bin",
+            "header_offset": 307,
+            "data_offset": 348,
+            "compressed_size": 7986331,
+            "size": 13795552,
+            "compression_method": 8,
+            "crc32": "66d8ba35",
+            "sha256": "ccd6e1cd55de8782c98f26ce6d29c0b4157e2aca7f419d7e2164b1ccba6a71b3"
+          }
+        },
+        {
+          "asset": "a9129fc049237b47c438d32fc2f4ca73026e5b4b25f5d810e237b72bd806768d",
+          "record": {
+            "index": 4,
+            "name": "vela_resource.bin",
+            "header_offset": 8586965,
+            "data_offset": 8587012,
+            "compressed_size": 82147013,
+            "size": 171755520,
+            "compression_method": 8,
+            "crc32": "ab32fa8b",
+            "sha256": "a9129fc049237b47c438d32fc2f4ca73026e5b4b25f5d810e237b72bd806768d"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "519307675665e4866d722a8119a98589c397b614ac3294cb87bfc86de45756ec",
+      "bytes": 13795728,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.p67cn@3.101.043@a4ce85647786",
+        "miwear.watch.p67tc@3.101.043@a4ce85647786"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "a4ce8564778624f8287ea91015867dc1725b649fbc10f2c4fa4b6813af7bc4d9",
+      "bytes": 90739541,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.p67cn@3.101.043@a4ce85647786",
+        "miwear.watch.p67tc@3.101.043@a4ce85647786"
+      ],
+      "members": [
+        {
+          "asset": "519307675665e4866d722a8119a98589c397b614ac3294cb87bfc86de45756ec",
+          "record": {
+            "index": 1,
+            "name": "vela_ap.bin",
+            "header_offset": 302,
+            "data_offset": 343,
+            "compressed_size": 7985245,
+            "size": 13795728,
+            "compression_method": 8,
+            "crc32": "f369d56b",
+            "sha256": "519307675665e4866d722a8119a98589c397b614ac3294cb87bfc86de45756ec",
+            "descriptor": "0001-vela_ap.bin.json"
+          }
+        },
+        {
+          "asset": "e80a8772935814afbd56365e003521bf47f5b11eeeeaf3ff659536ce60bc6c78",
+          "record": {
+            "index": 4,
+            "name": "vela_resource.bin",
+            "header_offset": 8585905,
+            "data_offset": 8585952,
+            "compressed_size": 82147104,
+            "size": 171755520,
+            "compression_method": 8,
+            "crc32": "695a45db",
+            "sha256": "e80a8772935814afbd56365e003521bf47f5b11eeeeaf3ff659536ce60bc6c78",
+            "descriptor": "0004-vela_resource.bin.json"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "a1d6e3e08a1c43dd142739c172896bfd271deb6786d218692c66ad76b047a3d1",
+      "bytes": 90341009,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.p67tc@3.101.028@a1d6e3e08a1c"
+      ],
+      "members": [
+        {
+          "asset": "bd222f3da1aadc6e510870c24039c2b1802cdc3f65fc8027e276163801eb8cf2",
+          "record": {
+            "index": 1,
+            "name": "vela_ap.bin",
+            "header_offset": 306,
+            "data_offset": 347,
+            "compressed_size": 7879814,
+            "size": 13616592,
+            "compression_method": 8,
+            "crc32": "6946a063",
+            "sha256": "bd222f3da1aadc6e510870c24039c2b1802cdc3f65fc8027e276163801eb8cf2",
+            "descriptor": "0001-vela_ap.bin.json"
+          }
+        },
+        {
+          "asset": "74dd54cd93d4e9c0ad418fd88124f74f229555f2f02954b7fbf0d0a70bfa8581",
+          "record": {
+            "index": 4,
+            "name": "vela_resource.bin",
+            "header_offset": 8480301,
+            "data_offset": 8480348,
+            "compressed_size": 81854178,
+            "size": 173961216,
+            "compression_method": 8,
+            "crc32": "2071f0df",
+            "sha256": "74dd54cd93d4e9c0ad418fd88124f74f229555f2f02954b7fbf0d0a70bfa8581",
+            "descriptor": "0004-vela_resource.bin.json"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "bf36cc88905271e7f596b1de9b8c314e6a9737d5e36f8d67f60535f003ee229c",
+      "bytes": 11995124,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.q66glt@4.200.078@754da125b286"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "754da125b2864eb340ab9127c5b15961961943f2798a6ded458c6901168cec5f",
+      "bytes": 66575612,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.q66glt@4.200.078@754da125b286"
+      ],
+      "members": [
+        {
+          "asset": "bf36cc88905271e7f596b1de9b8c314e6a9737d5e36f8d67f60535f003ee229c",
+          "record": {
+            "index": 1,
+            "name": "vela_ap.bin",
+            "header_offset": 283,
+            "data_offset": 324,
+            "compressed_size": 5852928,
+            "size": 11995124,
+            "compression_method": 8,
+            "crc32": "c00fb805",
+            "sha256": "bf36cc88905271e7f596b1de9b8c314e6a9737d5e36f8d67f60535f003ee229c"
+          }
+        },
+        {
+          "asset": "c043813369f18b9d8506740742bc8ba6b5f70dcc78807ad24eff169c3d3c48e0",
+          "record": {
+            "index": 3,
+            "name": "vela_resource.bin",
+            "header_offset": 6207115,
+            "data_offset": 6207162,
+            "compressed_size": 60362085,
+            "size": 126570496,
+            "compression_method": 8,
+            "crc32": "dc900cca",
+            "sha256": "c043813369f18b9d8506740742bc8ba6b5f70dcc78807ad24eff169c3d3c48e0"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "ea0bdf1920cb30223d616432af00565ca67622e6468328f5eab155f8cdc2fb9f",
+      "bytes": 12304852,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.q66tc@4.100.155@f1c824fef81d"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "f1c824fef81d8c3b23db7ea6bb5eeb39ae3b480453b2fb2783ef96d704d0437f",
+      "bytes": 66712457,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.q66tc@4.100.155@f1c824fef81d"
+      ],
+      "members": [
+        {
+          "asset": "ea0bdf1920cb30223d616432af00565ca67622e6468328f5eab155f8cdc2fb9f",
+          "record": {
+            "index": 1,
+            "name": "vela_ap.bin",
+            "header_offset": 282,
+            "data_offset": 323,
+            "compressed_size": 6090689,
+            "size": 12304852,
+            "compression_method": 8,
+            "crc32": "45ff53bb",
+            "sha256": "ea0bdf1920cb30223d616432af00565ca67622e6468328f5eab155f8cdc2fb9f"
+          }
+        },
+        {
+          "asset": "d2448749dfbacffb7fc4040614e1ef93ea9726eff0be77aa6c8206e61eaed4b1",
+          "record": {
+            "index": 3,
+            "name": "vela_resource.bin",
+            "header_offset": 6445081,
+            "data_offset": 6445128,
+            "compressed_size": 60260965,
+            "size": 120954880,
+            "compression_method": 8,
+            "crc32": "715d8ed6",
+            "sha256": "d2448749dfbacffb7fc4040614e1ef93ea9726eff0be77aa6c8206e61eaed4b1"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "9315ca353f624cec25dfcfc98a95ba959e2d7b24573bf1d6adf16ea10341bd99",
+      "bytes": 12209500,
+      "kind": "ap",
+      "profileIDs": [
+        "miwear.watch.q66u@4.100.108@6ef691453a86"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "6ef691453a86b9f772c6cb3684a98a000fd7163f8d45c3c300a9d007f301adc1",
+      "bytes": 65948363,
+      "kind": "ota",
+      "profileIDs": [
+        "miwear.watch.q66u@4.100.108@6ef691453a86"
+      ],
+      "members": [
+        {
+          "asset": "9315ca353f624cec25dfcfc98a95ba959e2d7b24573bf1d6adf16ea10341bd99",
+          "record": {
+            "index": 1,
+            "name": "vela_ap.bin",
+            "header_offset": 281,
+            "data_offset": 322,
+            "compressed_size": 6021842,
+            "size": 12209500,
+            "compression_method": 8,
+            "crc32": "fd601218",
+            "sha256": "9315ca353f624cec25dfcfc98a95ba959e2d7b24573bf1d6adf16ea10341bd99"
+          }
+        },
+        {
+          "asset": "8b148782e99a349a3da494e954125878363cccd7b02977593295c09b5dc328f6",
+          "record": {
+            "index": 3,
+            "name": "vela_resource.bin",
+            "header_offset": 6370256,
+            "data_offset": 6370303,
+            "compressed_size": 59571694,
+            "size": 119930880,
+            "compression_method": 8,
+            "crc32": "8106a36a",
+            "sha256": "8b148782e99a349a3da494e954125878363cccd7b02977593295c09b5dc328f6"
+          }
+        }
+      ]
+    },
+    {
+      "sha256": "0b78f4d6c22104b98d259b1bd3bf2e07b89695eab23a0e72addcfe1ce5795f5c",
+      "bytes": 12030944,
+      "kind": "ap",
+      "profileIDs": [
+        "q66@4.100.071"
+      ],
+      "members": []
+    },
+    {
+      "sha256": "ff74c6f467529963b6afd40669437d8ec39a02e48c10d0893739847b3ba3dc2b",
+      "bytes": 12292708,
+      "kind": "ap",
+      "profileIDs": [
+        "q66@4.100.177"
+      ],
+      "members": []
+    }
+  ],
   "distribution": "local",
   "packaging": {
     "mode": "metadata-only",
