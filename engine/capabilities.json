@@ -1,0 +1,207 @@
+{
+  "nandPersistence": {
+    "schema": 1,
+    "runnerProtocol": 1
+  },
+  "norPersistence": {
+    "schema": 1,
+    "runnerProtocol": 1,
+    "profiles": {
+      "miwear.watch.n66cn@3.1.32@489f20502ae2": {
+        "apSHA256": "9c02dab4020b2cc9666ee7d34cf27d311b76aadcec519a38361bbcbd94c53264",
+        "apBytes": 6791552,
+        "offset": 8355840,
+        "bytes": 32768,
+        "factoryOffset": 8380416,
+        "apOffset": 1048576,
+        "flashBytes": 8388608
+      },
+      "miwear.watch.n66nfc@3.1.32@489f20502ae2": {
+        "apSHA256": "9c02dab4020b2cc9666ee7d34cf27d311b76aadcec519a38361bbcbd94c53264",
+        "apBytes": 6791552,
+        "offset": 8355840,
+        "bytes": 32768,
+        "factoryOffset": 8380416,
+        "apOffset": 1048576,
+        "flashBytes": 8388608
+      },
+      "miwear.watch.n66tc@3.1.32@489f20502ae2": {
+        "apSHA256": "9c02dab4020b2cc9666ee7d34cf27d311b76aadcec519a38361bbcbd94c53264",
+        "apBytes": 6791552,
+        "offset": 8355840,
+        "bytes": 32768,
+        "factoryOffset": 8380416,
+        "apOffset": 1048576,
+        "flashBytes": 8388608
+      },
+      "miwear.watch.n67cn@3.1.187@6d33afe20089": {
+        "apSHA256": "acb9b0e867140f09c90747c0ada98f340e2edb540eb69b999c4b78adbc102595",
+        "apBytes": 7774864,
+        "offset": 8372224,
+        "bytes": 32768,
+        "factoryOffset": 8380416,
+        "apOffset": 524288,
+        "flashBytes": 8388608,
+        "configOffset": 507904,
+        "configBytes": 16384
+      },
+      "miwear.watch.o66cn@3.1.28@03ac3e2b8325": {
+        "apSHA256": "fb726472416e99ba11d1c20ce8f0d4f0831a6e9a673d63bb5918e2c3921d8845",
+        "apBytes": 7515648,
+        "offset": 8355840,
+        "bytes": 32768,
+        "factoryOffset": 8380416,
+        "apOffset": 655360,
+        "flashBytes": 8388608
+      },
+      "miwear.watch.o66lj@3.1.26@d4e61778eee0": {
+        "apSHA256": "185fc5737fa203ff3f109a282feca89a09c12d84bccd44fd7b61d74853f7fa49",
+        "apBytes": 7516120,
+        "offset": 8355840,
+        "bytes": 32768,
+        "factoryOffset": 8380416,
+        "apOffset": 655360,
+        "flashBytes": 8388608
+      },
+      "miwear.watch.o66nfc@3.1.28@03ac3e2b8325": {
+        "apSHA256": "fb726472416e99ba11d1c20ce8f0d4f0831a6e9a673d63bb5918e2c3921d8845",
+        "apBytes": 7515648,
+        "offset": 8355840,
+        "bytes": 32768,
+        "factoryOffset": 8380416,
+        "apOffset": 655360,
+        "flashBytes": 8388608
+      },
+      "miwear.watch.o66tc@3.1.28@03ac3e2b8325": {
+        "apSHA256": "fb726472416e99ba11d1c20ce8f0d4f0831a6e9a673d63bb5918e2c3921d8845",
+        "apBytes": 7515648,
+        "offset": 8355840,
+        "bytes": 32768,
+        "factoryOffset": 8380416,
+        "apOffset": 655360,
+        "flashBytes": 8388608
+      },
+      "miwear.watch.p67cn@3.101.043@a4ce85647786": {
+        "apSHA256": "519307675665e4866d722a8119a98589c397b614ac3294cb87bfc86de45756ec",
+        "apBytes": 13795728,
+        "apOffset": 786432,
+        "flashBytes": 16777216,
+        "offset": 14589952,
+        "bytes": 2187264,
+        "factoryOffset": 16515072
+      },
+      "miwear.watch.p67tc@3.101.043@a4ce85647786": {
+        "apSHA256": "519307675665e4866d722a8119a98589c397b614ac3294cb87bfc86de45756ec",
+        "apBytes": 13795728,
+        "apOffset": 786432,
+        "flashBytes": 16777216,
+        "offset": 14589952,
+        "bytes": 2187264,
+        "factoryOffset": 16515072
+      },
+      "miwear.watch.q66glt@4.200.078@754da125b286": {
+        "apSHA256": "bf36cc88905271e7f596b1de9b8c314e6a9737d5e36f8d67f60535f003ee229c",
+        "apBytes": 11995124,
+        "offset": 16482304,
+        "bytes": 294912,
+        "factoryOffset": 16515072,
+        "apOffset": 786432,
+        "flashBytes": 16777216
+      },
+      "miwear.watch.q66tc@4.100.155@f1c824fef81d": {
+        "apSHA256": "ea0bdf1920cb30223d616432af00565ca67622e6468328f5eab155f8cdc2fb9f",
+        "apBytes": 12304852,
+        "offset": 16482304,
+        "bytes": 294912,
+        "factoryOffset": 16515072,
+        "apOffset": 786432,
+        "flashBytes": 16777216
+      },
+      "miwear.watch.q66u@4.100.108@6ef691453a86": {
+        "apSHA256": "9315ca353f624cec25dfcfc98a95ba959e2d7b24573bf1d6adf16ea10341bd99",
+        "apBytes": 12209500,
+        "offset": 16482304,
+        "bytes": 294912,
+        "factoryOffset": 16515072,
+        "apOffset": 786432,
+        "flashBytes": 16777216
+      },
+      "q66@4.100.177": {
+        "apSHA256": "ff74c6f467529963b6afd40669437d8ec39a02e48c10d0893739847b3ba3dc2b",
+        "apBytes": 12292708,
+        "offset": 16482304,
+        "bytes": 294912,
+        "factoryOffset": 16515072,
+        "apOffset": 786432,
+        "flashBytes": 16777216
+      }
+    }
+  },
+  "pmuAdcRaw": {
+    "schema": 1,
+    "runnerProtocol": 1
+  },
+  "virtualPeer": {
+    "schema": 1,
+    "runnerProtocol": 1,
+    "controlProtocol": 1,
+    "transport": "local-virtual-hci",
+    "profiles": {
+      "q66@4.100.177": {
+        "apSHA256": "ff74c6f467529963b6afd40669437d8ec39a02e48c10d0893739847b3ba3dc2b"
+      },
+      "miwear.watch.q66glt@4.200.078@754da125b286": {
+        "apSHA256": "bf36cc88905271e7f596b1de9b8c314e6a9737d5e36f8d67f60535f003ee229c"
+      },
+      "miwear.watch.q66tc@4.100.155@f1c824fef81d": {
+        "apSHA256": "ea0bdf1920cb30223d616432af00565ca67622e6468328f5eab155f8cdc2fb9f"
+      },
+      "miwear.watch.q66u@4.100.108@6ef691453a86": {
+        "apSHA256": "9315ca353f624cec25dfcfc98a95ba959e2d7b24573bf1d6adf16ea10341bd99"
+      },
+      "miwear.watch.n66cn@3.1.32@489f20502ae2": {
+        "apSHA256": "9c02dab4020b2cc9666ee7d34cf27d311b76aadcec519a38361bbcbd94c53264"
+      },
+      "miwear.watch.n66nfc@3.1.32@489f20502ae2": {
+        "apSHA256": "9c02dab4020b2cc9666ee7d34cf27d311b76aadcec519a38361bbcbd94c53264"
+      },
+      "miwear.watch.n66tc@3.1.32@489f20502ae2": {
+        "apSHA256": "9c02dab4020b2cc9666ee7d34cf27d311b76aadcec519a38361bbcbd94c53264"
+      },
+      "miwear.watch.n67cn@3.1.187@6d33afe20089": {
+        "apSHA256": "acb9b0e867140f09c90747c0ada98f340e2edb540eb69b999c4b78adbc102595"
+      },
+      "miwear.watch.o66cn@3.1.28@03ac3e2b8325": {
+        "apSHA256": "fb726472416e99ba11d1c20ce8f0d4f0831a6e9a673d63bb5918e2c3921d8845"
+      },
+      "miwear.watch.o66lj@3.1.26@d4e61778eee0": {
+        "apSHA256": "185fc5737fa203ff3f109a282feca89a09c12d84bccd44fd7b61d74853f7fa49"
+      },
+      "miwear.watch.o66nfc@3.1.28@03ac3e2b8325": {
+        "apSHA256": "fb726472416e99ba11d1c20ce8f0d4f0831a6e9a673d63bb5918e2c3921d8845"
+      },
+      "miwear.watch.o66tc@3.1.28@03ac3e2b8325": {
+        "apSHA256": "fb726472416e99ba11d1c20ce8f0d4f0831a6e9a673d63bb5918e2c3921d8845"
+      },
+      "miwear.watch.p67cn@3.101.043@a4ce85647786": {
+        "apSHA256": "519307675665e4866d722a8119a98589c397b614ac3294cb87bfc86de45756ec"
+      },
+      "miwear.watch.p67tc@3.101.043@a4ce85647786": {
+        "apSHA256": "519307675665e4866d722a8119a98589c397b614ac3294cb87bfc86de45756ec"
+      }
+    },
+    "stateSchema": 1,
+    "automaticConnect": false,
+    "physicalRadio": false,
+    "maxRequestBytes": 2048,
+    "maxResponseBytes": 65536,
+    "commands": [
+      "status",
+      "connect",
+      "inventory",
+      "install",
+      "watchface-select",
+      "operation-status"
+    ]
+  }
+}

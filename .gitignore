@@ -1,0 +1,22 @@
+.build/
+.swiftpm/
+build/
+dist/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+*.dmg
+*.app/
+*.zip
+*.tar.gz
+.env
+.env.*
+!.env.example
+
+# Local development assistants and private firmware/instance data
+.agents/
+.codex/
+AGENTS.md
+Firmware/
+instances/

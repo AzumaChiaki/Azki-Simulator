@@ -1,0 +1,45 @@
+name: Build unsigned DMG
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dmg-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      AZKI_BUILD_JOBS: '3'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: brew install python@3.12 meson ninja pkgconf glib gettext libffi pcre2 zstd dtc
+      - name: Select build Python
+        run: echo "$(brew --prefix python@3.12)/libexec/bin" >> "$GITHUB_PATH"
+      - name: Build app, DMG and corresponding sources
+        run: ./scripts/build-dmg.sh dist
+      - name: Upload DMG and sources
+        uses: actions/upload-artifact@v7
+        with:
+          name: Azki-Simulator-macos-arm64-${{ github.sha }}
+          path: |
+            dist/*.dmg
+            dist/*-sources.tar.gz
+            dist/*-source.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
