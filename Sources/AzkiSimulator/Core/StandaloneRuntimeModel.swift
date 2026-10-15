@@ -179,7 +179,7 @@ final class StandaloneRuntimeModel {
             } else {
                 statusMessage = candidates.count > 1
                     ? "固件已导入；相同文件对应多个型号，请明确选择目标型号。"
-                    : "固件已导入，可选择后运行。"
+                    : "固件已导入，将按本实例的硬件预设启动；不兼容时会提示原因。"
             }
         } catch {
             guard token == revision, !Task.isCancelled else { return }
@@ -561,7 +561,9 @@ nonisolated enum StandalonePython {
         defer {
             if process.isRunning { owner.cancel(); process.waitUntilExit() }
         }
-        let timeout = ["prepare", "prepare-bundled", "library-import", "library-probe"].contains(command) ? 45.0 : 15.0
+        // Importing an arbitrary full OTA hashes and validates every member.
+        let timeout = command == "library-import" ? 300.0
+            : ["prepare", "prepare-bundled", "library-probe"].contains(command) ? 45.0 : 15.0
         let deadline = StandaloneCommandDeadline()
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
             if process.isRunning {
@@ -576,7 +578,7 @@ nonisolated enum StandalonePython {
         var output = Data()
         while let part = try pipe.fileHandleForReading.read(upToCount: 4_096), !part.isEmpty {
             output.append(part)
-            if output.count > 65_536 {
+            if output.count > FirmwareLibraryValidation.maximumResponseBytes {
                 if process.isRunning {
                     process.terminate()
                     DispatchQueue.global().asyncAfter(deadline: .now() + 1) {

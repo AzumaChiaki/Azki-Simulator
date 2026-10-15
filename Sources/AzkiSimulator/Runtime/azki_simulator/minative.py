@@ -59,6 +59,27 @@ INCLUDED_PROFILE_IDS = frozenset((
     "miwear.watch.q66glt@4.200.078@754da125b286", "miwear.watch.q66tc@4.100.155@f1c824fef81d",
     "miwear.watch.q66u@4.100.108@6ef691453a86", "q66@4.100.071", "q66@4.100.177",
 ))
+# A user-imported full OTA runs on the instance's hardware preset. Its profile
+# ID binds that preset model, the package's own version and its OTA SHA-256
+# prefix; boot compatibility is checked per launch, not by a version allowlist.
+GENERATED_PROFILE_ID = re.compile(
+    r"(?P<model>miwear\.watch\.[a-z0-9]{3,16}|q66)@(?P<version>[0-9][0-9.]{0,31})@(?P<sha>[0-9a-f]{12})\Z")
+
+
+def generated_profile(profile_id):
+    """Return (model, version, sha prefix) for a generated imported-firmware ID."""
+    match = GENERATED_PROFILE_ID.fullmatch(profile_id) if type(profile_id) is str else None
+    if match is None or profile_id in INCLUDED_PROFILE_IDS:
+        return None
+    try:
+        _geometry(match["model"])
+    except MError:
+        return None
+    return match["model"], match["version"], match["sha"]
+
+
+def profile_in_scope(profile_id):
+    return profile_id in INCLUDED_PROFILE_IDS or generated_profile(profile_id) is not None
 
 
 MAX_RUN_SECONDS = 28800
@@ -253,9 +274,10 @@ def _catalog(project):
     scope = _json(project / "profiles/mi-band-scope.json")
     ids = scope.get("included_profile_ids")
     if (scope.get("schema_version") != 1 or scope.get("scope") != "xiaomi_smart_band_only"
-            or not isinstance(ids, list) or len(ids) != 39
-            or any(not isinstance(x, str) for x in ids) or set(ids) != INCLUDED_PROFILE_IDS):
-        raise MError("unsupported_scope", "Scope must contain exactly the reviewed 39 profile IDs")
+            or not isinstance(ids, list) or not 39 <= len(ids) <= 64 or len(set(ids)) != len(ids)
+            or any(not isinstance(x, str) or not profile_in_scope(x) for x in ids)
+            or not INCLUDED_PROFILE_IDS <= set(ids)):
+        raise MError("unsupported_scope", "Scope must contain the reviewed profiles plus generated imported-firmware profiles")
     catalog = _json(project / "profiles/catalog.json")
     rows = catalog.get("profiles")
     if catalog.get("schema_version") != 1 or not isinstance(rows, list) or len(rows) > 100:
@@ -265,9 +287,9 @@ def _catalog(project):
         if not isinstance(row, dict) or not isinstance(row.get("id"), str) or row["id"] in known:
             raise MError("invalid_catalog", "Missing or duplicate profile ID")
         known[row["id"]] = row
-    if not INCLUDED_PROFILE_IDS <= known.keys():
+    if not set(ids) <= known.keys():
         raise MError("invalid_catalog", "Catalog is missing a scoped profile")
-    for key in INCLUDED_PROFILE_IDS:
+    for key in ids:
         row = known[key]
         if (row.get("ap", {}).get("chip") != "best1503"
                 or "@".join(key.split("@")[:2]) != str(row.get("model")) + "@" + str(row.get("version"))):
@@ -439,7 +461,8 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
             engine["files"][engine["manifest"]["entrypoints"]["qemu"]]["sha256"])
     project = _path(project)
     rows = _catalog(project)
-    if profile_id not in INCLUDED_PROFILE_IDS:
+    scoped = _json(project / "profiles/mi-band-scope.json")["included_profile_ids"]
+    if not profile_in_scope(profile_id) or profile_id not in scoped:
         raise MError("unsupported_profile", "Choose a complete included profile ID; aliases are rejected")
     if not isinstance(prepared, dict) or set(prepared) - {"board", "resource", "seed", "seedProof", "resourceProof", "factory"}:
         raise MError("invalid_prepared", "Unknown prepared input field")
@@ -726,6 +749,27 @@ def classify_result(result, returncode, *, stopped=False):
     return dict(base, state="failed", reason=reason)
 
 
+def _failure_detail(result, log):
+    """One readable line explaining a failed run: the runner's own error
+    (for example an engine-level incompatibility) or its control failure."""
+    if isinstance(result, dict) and isinstance(result.get("qmp_error"), str):
+        return result["qmp_error"][:512]
+    try:
+        fd = os.open(log, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        size = os.fstat(fd).st_size
+        tail = os.pread(fd, 8192, max(0, size - 8192)).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+    lines = [line.strip() for line in tail.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if "error:" in line or line.startswith(("ValueError", "RuntimeError", "OSError")):
+            return line.split("error:", 1)[-1].strip()[:512] or None
+    return None
+
+
 class MinativeAdapter:
     """One launch, one immutable plan, one private run directory.
 
@@ -767,6 +811,7 @@ class MinativeAdapter:
         self._cleanup = None
         self._finished = False
         self._observed_board = None
+        self._detail = None
 
     @property
     def run_root(self):
@@ -1144,6 +1189,8 @@ class MinativeAdapter:
         outcome = classify_result(result, self.process.returncode, stopped=self._stop_requested)
         self._state = "failed" if self._reason else outcome["state"]
         self._reason = self._reason or outcome["reason"]
+        if self._state == "failed":
+            self._detail = _failure_detail(result, self.run / "adapter-runner.log")
         if self._log:
             self._log.close()
             self._log = None
@@ -1232,6 +1279,7 @@ class MinativeAdapter:
                     "pid": self.process.pid if self.process is not None else None,
                     "lastExit": self.process.returncode if self.process is not None else None,
                     "error": self._reason if self._state == "failed" else None,
+                    "detail": self._detail,
                     "runDirectory": str(self.run), "cleanup": self._cleanup,
                     "approvalDigest": self.plan["approvalDigest"], "fixtureOnly": self.fixture_only,
                     "guestInstallSupported": False, "desktopVerified": False,

@@ -23,6 +23,7 @@ from .instance_data import (validate_instance_images, instance_machine_options, 
                             instance_nor_result_geometry)
 
 
+QMP_START_SECONDS = 60
 WATCH_FLAGS = ('bt_peer', 'bt_tx_capture', 'bt_hci_reset_fixture', 'panel_id_fixture',
                'lcd_frame_capture', 'panel_te_fixture', 'spi0_unconnected',
                'gpu_probe', 'gpu_id_fixture', 'gpu_software_renderer', 'touch',
@@ -610,8 +611,13 @@ def main():
             native_window = None
             try:
                 if proc.poll() is None:
+                    # A freshly copied, quarantined core is assessed by macOS on
+                    # its first exec (several seconds on a cold machine). A live
+                    # QEMU gets a generous window; an exited one fails at once.
                     while not qmp_path.exists():
-                        if proc.poll() is not None or time.monotonic() - started > 5:
+                        if proc.poll() is not None:
+                            raise RuntimeError('QEMU exited before its control socket started')
+                        if time.monotonic() - started > QMP_START_SECONDS:
                             raise RuntimeError('QEMU control socket did not start')
                         time.sleep(.02)
                     connection = QMP(qmp_path)

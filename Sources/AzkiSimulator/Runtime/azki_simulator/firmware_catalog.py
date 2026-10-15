@@ -9,7 +9,9 @@ imports:[{sha256,bytes,kind:'ap'|'ota',profileIDs:[exact-id],members:[
 
 Bundled assets and user-imported private objects have separate distribution
 rules. Public distribution never turns a user's local import into a redistributable
-asset. Full-package recognition requires its exact SHA before parsing any member.
+asset. A catalog package is recognized by its exact SHA; any other complete OTA is
+statically inventoried (imports[].generic) and offered on every hardware preset,
+with boot compatibility decided per launch by check_compatibility().
 """
 from __future__ import annotations
 
@@ -28,8 +30,8 @@ import time
 import uuid
 import zlib
 
-from .minative import (INCLUDED_PROFILE_IDS, _canonical, _decode, _directory_fd,
-                       _geometry, _json, _open_file, _path, _pin, _read)
+from .minative import (INCLUDED_PROFILE_IDS, MError, _canonical, _decode, _directory_fd,
+                       _geometry, _json, _open_file, _path, _pin, _read, generated_profile)
 
 SCHEMA = "azki.simulator.firmware.v1"
 MAX_ASSET = 768 * 1024 * 1024
@@ -66,6 +68,45 @@ def display_name(profile):
 
 def storage_mode(profile):
     return "prepared" if "board" in profile["assets"] else "generated"
+
+
+def check_compatibility(model, recipe, ap_path):
+    """Static launch gate for imported firmware on an instance hardware preset.
+
+    Mirrors only what the runner can model: BES1503 boot header, a ROMFS
+    resource package or a YAFFS layout of a supported product family, and
+    the product family named by the AP itself. Everything else boots and
+    reports its own runtime outcome.
+    """
+    name = display_name({"id": model, "model": model, "version": ""}).rstrip(" ·") or model
+    ap = recipe["ap"]
+    def refuse(reason):
+        raise CatalogError("firmware_incompatible", "此固件无法在「" + name + "」硬件预设上启动：" + reason,
+                           {"model": model, "version": recipe.get("version")})
+    if ap.get("chip") != "best1503":
+        refuse("芯片为 " + str(ap.get("chip")) + "，模拟核心只实现了 BES1503")
+    if not all(type(ap.get(key)) is int for key in ("ap_offset", "flash_bytes", "reset_entry", "reset_sp")):
+        refuse("AP 启动头无法识别（" + str(ap.get("backend_requirement", ""))[:160] + "）")
+    names = [record["name"] for record in recipe["partitions"]]
+    if names.count("vela_resource.bin") > 1:
+        refuse("固件包含多个 ROMFS 资源分区")
+    if "vela_resource.bin" not in names:
+        if not model.startswith(("miwear.watch.n66", "miwear.watch.o66", "miwear.watch.n67")):
+            refuse("固件使用多分区 YAFFS 资源，此硬件预设只支持 ROMFS 资源包（vela_resource.bin）")
+        if not model.startswith("miwear.watch.n67") and "ota.json" not in names:
+            refuse("多分区固件缺少 ota.json 资源清单")
+    code = model.rsplit(".", 1)[-1]
+    family = code[:3]
+    declared = set()
+    data = Path(ap_path).read_bytes() if ap_path else b""
+    for match in re.finditer(rb"miwear\.watch\.([a-z0-9]{3,16})(?![a-z0-9])", data):
+        declared.add(match[1].decode("ascii"))
+    if recipe.get("family"):
+        declared.add(str(recipe["family"]))
+    if declared and not any(item[:3] == family for item in declared):
+        families = sorted({item[:3] for item in declared})
+        products = "、".join(PRODUCT_NAMES.get(item, item) for item in families)
+        refuse("固件声明的设备为 " + products + "，与实例的 " + PRODUCT_NAMES.get(family, family) + " 不一致")
 ROLES = {"ap", "ota", "resource", "board", "factory", "seed", "seedProof", "resourceProof"}
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -223,7 +264,8 @@ def _extract_member(source_fd, record, target, source_size, *, directory_fd=None
     _need(len(header) == 30, "archive_bounds", "固件包头不完整")
     magic, _, flags, method, _, _, crc, local_packed, local_size, names, extras = struct.unpack("<4s5H3I2H", header)
     data_offset = offset + 30 + names + extras
-    _need(magic == b"PK\x03\x04" and flags & ~0x800 == 0 and method in (0, 8)
+    # Bits 1-2 only describe the DEFLATE level; encryption/data descriptors stay rejected.
+    _need(magic == b"PK\x03\x04" and flags & ~0x806 == 0 and method in (0, 8)
           and data_offset == record["data_offset"] and data_offset + packed <= source_size
           and (local_packed, local_size, method, f"{crc:08x}") ==
           (packed, size, record["compression_method"], record["crc32"]),
@@ -435,10 +477,110 @@ class FirmwareCatalog:
                                  "missingRoles": missing, "verification": "required_before_run"},
                 "source": "imported" if "imported" in sources else "bundled"}
 
+    @property
+    def hardware_models(self):
+        """Instance hardware presets: every product model the catalog describes."""
+        return sorted({profile["model"] for profile in self.profiles.values()})
+
+    def _object_path(self, digest, size, index):
+        """Library (or permitted bundled) object path for an exact size, else None."""
+        if digest in self.objects:
+            return self._asset(digest, index)[0]
+        record = index["objects"].get(digest)
+        if self.library_root is None or record is None or record.get("bytes") != size:
+            return None
+        path = self.library_root / "objects" / digest
+        try:
+            fd, info = _open_file(path, MAX_ASSET, private=True)
+        except FileNotFoundError:
+            return None
+        os.close(fd)
+        _need(info.st_size == size, "asset_hash_mismatch", "导入固件对象大小发生变化", sha256=digest)
+        return path
+
+    def _generic_sources(self, index):
+        """Every imported full OTA, keyed by SHA-256; each may run on any preset."""
+        sources = {}
+        for entry in index["imports"]:
+            if not isinstance(entry, dict) or not _sha(entry.get("sha256")) or entry.get("inputKind") != "ota":
+                continue
+            digest = entry["sha256"]
+            generic = entry.get("generic")
+            if isinstance(generic, dict):
+                recipe = generic.get("recipe")
+                if not (isinstance(recipe, dict) and isinstance(recipe.get("ap"), dict)
+                        and isinstance(recipe.get("partitions"), list) and _sha(generic.get("apSHA256"))
+                        and type(generic.get("apBytes")) is int and isinstance(generic.get("version"), str)
+                        and re.fullmatch(r"[0-9][0-9.]{0,31}", generic["version"])):
+                    continue
+                sources[digest] = {"version": generic["version"], "ap": generic["apSHA256"],
+                                   "apBytes": generic["apBytes"], "recipe": recipe}
+            elif digest in self.imports and self.imports[digest]["kind"] == "ota":
+                profile = self.profiles[sorted(self.imports[digest]["profileIDs"])[0]]
+                ap = profile["assets"]["ap"]
+                sources[digest] = {"version": profile["version"], "ap": ap, "apBytes": self.objects[ap]["bytes"],
+                                   "recipe": {"ap": profile["recipe"]["ap"],
+                                              "partitions": profile["recipe"].get("partitions", []), "family": ""}}
+        return sources
+
+    def _generic_item(self, model, digest, source, index):
+        profile_id = model + "@" + source["version"] + "@" + digest[:12]
+        width, height = _geometry(model)
+        ready = (self._object_path(source["ap"], source["apBytes"], index) is not None
+                 and self._object_path(digest, index["objects"].get(digest, {}).get("bytes", -1), index) is not None)
+        return {"id": profile_id, "displayName": display_name({"id": profile_id, "model": model,
+                                                                "version": source["version"]}) + " · " + digest[:8],
+                "device": model, "model": model, "firmwareVersion": source["version"],
+                "width": width, "height": height,
+                "availability": {"ready": ready, "assetsReady": ready,
+                                 "reason": "" if ready else "导入的固件文件已缺失，请重新导入",
+                                 "missingRoles": [] if ready else ["ota"], "verification": "checked_at_launch"},
+                "source": "imported"}
+
+    def _generic_items(self, index, only=None):
+        items = []
+        for digest, source in sorted(self._generic_sources(index).items()):
+            if only is not None and digest != only:
+                continue
+            for model in self.hardware_models:
+                item = self._generic_item(model, digest, source, index)
+                if item["id"] not in self.profiles:
+                    items.append(item)
+        return items
+
     def list_items(self):
         self._recheck_catalog()
         index = self._index()
-        return [self._item(self.profiles[key], index) for key in sorted(self.profiles)]
+        return [self._item(self.profiles[key], index) for key in sorted(self.profiles)] + self._generic_items(index)
+
+    def resolve_generic(self, profile_id):
+        """Runner recipe for imported firmware on the profile's hardware preset."""
+        self._recheck_catalog()
+        parsed = generated_profile(profile_id)
+        _need(parsed is not None and profile_id not in self.profiles, "unknown_profile", "请选择固件库中的固件")
+        model, version, prefix = parsed
+        _need(model in self.hardware_models, "unknown_profile", "未知的实例硬件预设", model=model)
+        index = self._index()
+        sources = self._generic_sources(index)
+        matches = [digest for digest, source in sources.items()
+                   if digest.startswith(prefix) and source["version"] == version]
+        _need(len(matches) == 1, "unknown_profile", "所选导入固件已不在固件库中，请重新导入", profileID=profile_id)
+        digest = matches[0]
+        source = sources[digest]
+        ota_bytes = index["objects"].get(digest, {}).get("bytes", -1)
+        ap_path = self._object_path(source["ap"], source["apBytes"], index)
+        ota_path = self._object_path(digest, ota_bytes, index)
+        _need(ap_path is not None and ota_path is not None, "missing_assets", "导入的固件文件已缺失，请重新导入",
+              profileID=profile_id, missingRoles=["ota"])
+        item = self._generic_item(model, digest, source, index)
+        recipe = {"id": profile_id, "model": model, "version": version, "ap": source["recipe"]["ap"],
+                  "ota_sha256": digest, "partitions": source["recipe"]["partitions"],
+                  "family": source["recipe"].get("family", "")}
+        storage = "romfs" if any(p.get("name") == "vela_resource.bin" for p in recipe["partitions"]) else "yaffs"
+        return {"version": 1, "profileID": profile_id, "item": item, "recipe": recipe, "storageKind": storage,
+                "assets": {"ap": {"path": str(ap_path), "sha256": source["ap"], "bytes": source["apBytes"], "source": "imported"},
+                           "ota": {"path": str(ota_path), "sha256": digest, "bytes": ota_bytes, "source": "imported"}},
+                "catalogSHA256": self.catalog_sha256, "executionApproved": False}
 
     def resolve_profile(self, profile_id, *, verify=True):
         self._recheck_catalog()
@@ -509,11 +651,32 @@ class FirmwareCatalog:
             stage_fd = os.open(stage_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
             actual = _copy(source, "input", directory_fd=stage_fd, created=created)
             entry = self.imports.get(actual["sha256"])
-            _need(entry is not None and entry["bytes"] == actual["bytes"], "unknown_firmware",
-                  "无法识别此文件的精确固件版本；未导入未知内容", sha256=actual["sha256"])
-            candidates = sorted(entry["profileIDs"])
+            generic = None
+            if entry is None or entry["bytes"] != actual["bytes"]:
+                # Not a catalog package: any complete OTA is accepted. Whether it
+                # boots is decided per launch against the instance hardware preset.
+                from .firmware_probe import ProbeError, ota_recipe
+                input_fd = os.open("input", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=stage_fd)
+                try:
+                    _need(os.pread(input_fd, 4, 0) == b"PK\x03\x04", "unknown_firmware",
+                          "请导入完整 OTA 固件包（ZIP，包含 vela_ap.bin 和资源）；单独的 AP 文件缺少启动所需的资源",
+                          sha256=actual["sha256"])
+                    try:
+                        generic = ota_recipe(input_fd, actual["bytes"])
+                    except (ProbeError, MError, ValueError, OSError, zlib.error) as error:
+                        raise CatalogError("unknown_firmware", "固件包结构无法识别：" + str(error)[:240],
+                                           {"sha256": actual["sha256"]}) from error
+                finally:
+                    os.close(input_fd)
+                ap_record = next(r for r in generic["partitions"] if r["name"].rsplit("/", 1)[-1] == "vela_ap.bin")
+                _need(ap_record["sha256"] == generic["ap"]["sha256"], "asset_hash_mismatch", "AP 成员与分析结果不一致")
+                entry = {"kind": "ota", "profileIDs": [], "members": [{"asset": ap_record["sha256"], "record": ap_record}]}
+            generic_ids = [model + "@" + (generic["version"] if generic else
+                                          self.profiles[sorted(entry["profileIDs"])[0]]["version"]) + "@" + actual["sha256"][:12]
+                           for model in self.hardware_models] if entry["kind"] == "ota" else []
+            candidates = sorted(set(entry["profileIDs"]) | {x for x in generic_ids if x not in self.profiles})
             _need(profile_id is None or profile_id in candidates, "profile_mismatch", "此固件不属于所选配置", candidateIDs=candidates)
-            _need(self.objects[actual["sha256"]]["localAllowed"], "local_use_unavailable", "此固件尚无本地使用许可记录")
+            _need(generic is not None or self.objects[actual["sha256"]]["localAllowed"], "local_use_unavailable", "此固件尚无本地使用许可记录")
             _need(existing_total + actual["bytes"] + sum(member["record"]["size"] for member in entry.get("members", [])) <= MAX_LIBRARY,
                   "library_quota", "固件包的临时展开将超过私有库容量限制")
             os.replace("input", actual["sha256"], src_dir_fd=stage_fd, dst_dir_fd=stage_fd)
@@ -528,7 +691,8 @@ class FirmwareCatalog:
                     for member in entry.get("members", []):
                         digest, record = member["asset"], member["record"]
                         if digest not in staged:
-                            _need(self.objects[digest]["localAllowed"], "local_use_unavailable", "固件包成员缺少本地使用记录")
+                            _need(generic is not None or self.objects[digest]["localAllowed"], "local_use_unavailable",
+                                  "固件包成员缺少本地使用记录")
                             _extract_member(source_fd, record, digest, actual["bytes"], directory_fd=stage_fd, created=created)
                             staged[digest] = record["size"]
                 finally:
@@ -545,8 +709,17 @@ class FirmwareCatalog:
                 index["objects"][digest] = {"bytes": size}
             os.fsync(objects_fd)
             index["generation"] += 1
-            index["imports"].append({"sha256": actual["sha256"], "inputKind": entry["kind"],
-                                     "profileIDs": candidates, "importedAtUnix": int(time.time())})
+            record = {"sha256": actual["sha256"], "inputKind": entry["kind"],
+                      "profileIDs": sorted(entry["profileIDs"]), "importedAtUnix": int(time.time())}
+            if generic is not None:
+                record["generic"] = {"version": generic["version"], "family": generic["family"],
+                                     "declaredModels": generic["declaredModels"],
+                                     "apSHA256": generic["ap"]["sha256"], "apBytes": generic["ap"]["size"],
+                                     "recipe": {"ap": generic["ap"], "partitions": generic["partitions"],
+                                                "family": generic["family"]}}
+            # Re-importing the same bytes replaces, never duplicates, its record.
+            index["imports"] = [item for item in index["imports"]
+                                if not (isinstance(item, dict) and item.get("sha256") == actual["sha256"])] + [record]
             # The sole visibility/commit point. Interrupted object publication
             # leaves unreferenced objects, never a partially visible profile.
             anchored()
@@ -555,7 +728,9 @@ class FirmwareCatalog:
             chosen = [profile_id] if profile_id else candidates
             return {"version": 1, "recognized": True, "imported": True, "inputKind": entry["kind"],
                     "sha256": actual["sha256"], "needsSelection": profile_id is None and len(candidates) > 1,
-                    "candidateIDs": candidates, "items": [self._item(self.profiles[key], index) for key in chosen]}
+                    "candidateIDs": candidates,
+                    "items": [self._item(self.profiles[key], index) for key in chosen if key in self.profiles]
+                             + [item for item in self._generic_items(index, only=actual["sha256"]) if item["id"] in chosen]}
         finally:
             if stage_fd is not None:
                 for name, identity in created.items():

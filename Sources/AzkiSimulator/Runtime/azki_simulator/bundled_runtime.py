@@ -12,7 +12,7 @@ import os
 from pathlib import Path, PurePosixPath
 import stat
 
-from .firmware_catalog import (CatalogError, FirmwareCatalog, _atomic_json, _copy,
+from .firmware_catalog import (CatalogError, FirmwareCatalog, _atomic_json, _copy, check_compatibility,
                                EXECUTION_PROFILES, _need, _sha, _text, storage_mode)
 from .minative import (INCLUDED_PROFILE_IDS, _canonical, _decode, _directory_fd,
                        _open_file, _path, _pin, _read, inspect_backend)
@@ -174,10 +174,16 @@ def prepare_profile(engine_root, library_root, profile_id, session_root, *, rese
     engine = _manifest(engine_root)
     catalog = FirmwareCatalog(engine["root"].parent / "Firmware", library_root,
                               distribution="public" if engine["manifest"]["profile"] == "public" else "local")
-    resolved = catalog.resolve_profile(profile_id, verify=False)
-    _need(profile_id in EXECUTION_PROFILES, "profile_execution_unavailable",
-          "此固件不在可运行的小米手环配置范围内", profileID=profile_id)
     _need(set(catalog.profiles) == INCLUDED_PROFILE_IDS, "profile_scope_incomplete", "内置目录缺少完整的 39 项手环配置元数据")
+    imported = profile_id not in catalog.profiles
+    if imported:
+        # Imported firmware runs on the instance hardware preset named by the ID.
+        resolved = catalog.resolve_generic(profile_id)
+        check_compatibility(resolved["recipe"]["model"], resolved["recipe"], resolved["assets"]["ap"]["path"])
+    else:
+        resolved = catalog.resolve_profile(profile_id, verify=False)
+        _need(profile_id in EXECUTION_PROFILES, "profile_execution_unavailable",
+              "此固件不在可运行的小米手环配置范围内", profileID=profile_id)
     container = _path(session_root)
     from .bridge import SessionReservation
     reservation = SessionReservation(container, reservation_nonce) if reservation_nonce is not None else None
@@ -198,13 +204,16 @@ def prepare_profile(engine_root, library_root, profile_id, session_root, *, rese
             prepared.mkdir(mode=0o700)
         _materialize(engine, prepared)
         project = prepared / "project"
-        generated = storage_mode(catalog.profiles[profile_id]) == "generated"
+        generated = imported or storage_mode(catalog.profiles[profile_id]) == "generated"
         # The sandboxed runner builds storage caches here; nothing in it is pre-approved.
         (project / "assets").mkdir(mode=0o700)
         (project / "assets/devices").mkdir(mode=0o700)
         rows = []
-        for key, profile in sorted(catalog.profiles.items()):
-            row = dict(profile["recipe"])
+        recipes = {key: profile["recipe"] for key, profile in catalog.profiles.items()}
+        if imported:
+            recipes[profile_id] = resolved["recipe"]
+        for key, recipe in sorted(recipes.items()):
+            row = dict(recipe)
             # Paths exist only in this newly materialized private recipe. The
             # portable bundled catalog contains no developer absolute paths.
             absent = project / "assets/unavailable"
@@ -219,7 +228,7 @@ def prepare_profile(engine_root, library_root, profile_id, session_root, *, rese
             rows.append(row)
         _write_json(project / "profiles/catalog.json", {"schema_version": 1, "profiles": rows})
         _write_json(project / "profiles/mi-band-scope.json", {"schema_version": 1, "scope": "xiaomi_smart_band_only",
-                                                            "included_profile_ids": sorted(INCLUDED_PROFILE_IDS)})
+                                                            "included_profile_ids": sorted(recipes)})
         prepared_assets = {} if generated else {
             role: data["path"] for role, data in resolved["assets"].items()
             if role in {"board", "resource", "factory", "seed", "seedProof", "resourceProof"}}

@@ -41,7 +41,8 @@ nonisolated struct BundledFirmwareCatalog: Decodable, Sendable {
 
     static func decode(_ data: Data) throws -> Self {
         let value: Self = try FirmwareLibraryValidation.decode(data)
-        guard value.version == 1, value.items.count <= 128,
+        // Each imported full OTA is listed once per hardware preset.
+        guard value.version == 1, value.items.count <= 4_096,
               Set(value.items.map(\.id)).count == value.items.count,
               FirmwareLibraryValidation.text(value.runtime.reason, limit: 1_024, empty: true) else {
             throw SimulatorError.invalidSession("固件目录版本或内容无效")
@@ -66,10 +67,10 @@ nonisolated struct FirmwareImportReceipt: Decodable, Sendable {
         let value: Self = try FirmwareLibraryValidation.decode(data)
         guard value.version == 1, value.recognized, value.imported,
               FirmwareLibraryValidation.digest(value.sha256),
-              !value.candidateIDs.isEmpty, value.candidateIDs.count <= 128,
+              !value.candidateIDs.isEmpty, value.candidateIDs.count <= 256,
               Set(value.candidateIDs).count == value.candidateIDs.count,
               value.candidateIDs.allSatisfy(FirmwareLibraryValidation.identifier),
-              value.items.count <= 128,
+              value.items.count <= 256,
               Set(value.items.map(\.id)).count == value.items.count,
               Set(value.candidateIDs).isSubset(of: Set(value.items.map(\.id))),
               value.needsSelection || value.candidateIDs.count == 1 else {
@@ -221,6 +222,7 @@ nonisolated struct BundledPreparedSession: Sendable {
 }
 
 nonisolated enum FirmwareLibraryValidation {
+    static let maximumResponseBytes = 4_194_304
     static func text(_ value: String, limit: Int, empty: Bool = false) -> Bool {
         (empty || !value.isEmpty) && value.utf8.count <= limit && !value.contains("\0")
     }
@@ -233,7 +235,7 @@ nonisolated enum FirmwareLibraryValidation {
         value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
     }
     static func decode<T: Decodable>(_ data: Data) throws -> T {
-        guard !data.isEmpty, data.count <= 65_536 else { throw SimulatorError.invalidSession("目录响应超出限制") }
+        guard !data.isEmpty, data.count <= maximumResponseBytes else { throw SimulatorError.invalidSession("目录响应超出限制") }
         do { return try JSONDecoder().decode(T.self, from: data) }
         catch { throw SimulatorError.invalidSession("目录响应格式无效") }
     }

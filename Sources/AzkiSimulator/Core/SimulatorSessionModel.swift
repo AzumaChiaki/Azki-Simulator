@@ -7,7 +7,14 @@ final class SimulatorSessionModel {
     private(set) var manifest: SimulatorSessionManifest?
     private(set) var frame: SimulatorFrame?
     private(set) var image: CGImage?
-    private(set) var status: SimulatorJSON?
+    private(set) var status: SimulatorJSON? {
+        didSet {
+            // A guest that exits on its own (e.g. firmware incompatible with the
+            // instance hardware preset) must not look like an idle connection.
+            guard status?["state"]?.string == "crashed", oldValue?["state"]?.string != "crashed" else { return }
+            errorMessage = Self.failureDescription(status)
+        }
+    }
     private(set) var logs = ""
     private(set) var packageReport = ""
     private(set) var screenshotName: String?
@@ -39,6 +46,20 @@ final class SimulatorSessionModel {
         case "crashed": return "已退出"
         default: return "已连接"
         }
+    }
+
+    nonisolated static func failureDescription(_ status: SimulatorJSON?) -> String {
+        let reason = status?["stopReason"]?.string ?? status?["error"]?.string
+        let summary = switch reason {
+        case "host_error": "模拟核心未能启动"
+        case "guest_fault": "固件运行时出现异常，可能与此实例的硬件预设不兼容"
+        case "missing_result": "运行器在开机前退出，固件可能与此实例的硬件预设不兼容"
+        default: "设备意外退出"
+        }
+        var lines = ["设备启动失败：" + summary]
+        if let detail = status?["failureDetail"]?.string, !detail.isEmpty { lines.append(String(detail.prefix(512))) }
+        if let reason { lines.append("原因代码：" + reason) }
+        return lines.joined(separator: "\n")
     }
 
     func attach(_ url: URL) {

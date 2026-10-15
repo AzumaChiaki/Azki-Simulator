@@ -7,6 +7,7 @@ known identities, not the parser's list of accepted firmware versions.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import PurePosixPath
 import re
@@ -158,6 +159,72 @@ def _zip(fd, size):
         return bytes(ap_data), {"members": count, "expandedBytes": expanded,
             "resourceLayout": "romfs" if any(PurePosixPath(e.filename).name == "vela_resource.bin" for e in entries) else "multi-partition",
             "allMemberCRCChecked": True}
+
+
+VERSION_TEXT = re.compile(r"[0-9]+(?:\.[0-9]+){1,7}")
+DECLARED_MODEL = re.compile(rb"miwear\.watch\.([a-z0-9]{3,16})(?![a-z0-9])")
+
+
+def _version(text):
+    match = VERSION_TEXT.search(text or "")
+    return match[0] if match and len(match[0]) <= 32 else None
+
+
+def engine_ap(ap_data):
+    """The runner's catalog AP record, derived only from these bytes."""
+    probe = inspect_ap(ap_data)
+    ap = {"sha256": probe["sha256"], "size": probe["bytes"], "chip": probe["chip"]}
+    if "build" in probe:
+        ap["build"] = probe["build"]
+    if probe["headerRecognized"]:
+        ap.update(image_format="bes-header", ap_offset=probe["apOffset"], flash_bytes=probe["flashBytes"],
+                  data_alias=probe["dataAlias"], reset_entry=probe["resetEntry"], reset_sp=probe["resetSP"],
+                  backend_requirement="BES1503 peripheral and product storage/panel profile")
+    else:
+        ap.update(image_format="unrecognized", backend_requirement=probe.get("diagnostic", "启动头尚未适配"))
+    return ap
+
+
+def ota_recipe(fd, size):
+    """Static runner recipe for any complete OTA ZIP: member boundaries, AP
+    header, package version and the product models the AP itself declares.
+    Nothing is executed and no member name becomes a host path."""
+    ap_data, archive = _zip(fd, size)
+    records, small = [], {}
+    with os.fdopen(os.dup(fd), "rb") as stream, zipfile.ZipFile(stream) as zipped:
+        for index, info in enumerate(zipped.infolist()):
+            if info.is_dir():
+                continue
+            need(not info.flag_bits & 9, "固件包成员使用了加密或数据描述符，无法按偏移读取")
+            head = os.pread(fd, 30, info.header_offset)
+            names, extras = struct.unpack_from("<HH", head, 26)
+            digest = hashlib.sha256()
+            with zipped.open(info) as member:
+                while chunk := member.read(1024 * 1024):
+                    digest.update(chunk)
+            records.append({"index": index, "name": info.filename, "header_offset": info.header_offset,
+                            "data_offset": info.header_offset + 30 + names + extras,
+                            "compressed_size": info.compress_size, "size": info.file_size,
+                            "compression_method": info.compress_type, "crc32": f"{info.CRC:08x}",
+                            "sha256": digest.hexdigest()})
+            base = PurePosixPath(info.filename).name
+            if base in ("ota.json", "version", "version.ini", "ota.sh") and info.file_size <= 65536:
+                small.setdefault(base, zipped.read(info).decode("utf-8", "replace"))
+    family, version = "", None
+    if "ota.json" in small:
+        try:
+            spec = json.loads(small["ota.json"])
+            family = str(spec.get("magic_string", ""))[:16] if isinstance(spec, dict) else ""
+            version = _version(str(spec.get("sw_version", ""))) if isinstance(spec, dict) else None
+        except ValueError:
+            pass
+    for name in ("version", "version.ini", "ota.sh"):
+        version = version or _version(small.get(name))
+    ap = engine_ap(ap_data)
+    version = version or _version(ap.get("build", {}).get("VERSION")) or "0"
+    declared = sorted({m.decode("ascii") for m in DECLARED_MODEL.findall(ap_data)})[:64]
+    return {"version": version, "family": family, "declaredModels": declared, "ap": ap,
+            "partitions": records, "resourceLayout": archive["resourceLayout"]}
 
 
 def inspect_firmware(source):

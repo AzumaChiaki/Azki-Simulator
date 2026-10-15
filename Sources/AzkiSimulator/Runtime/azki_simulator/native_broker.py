@@ -17,7 +17,7 @@ import sys
 import time
 import uuid
 
-from .minative import (INCLUDED_PROFILE_IDS, MAX_RUN_SECONDS, MError, _canonical, _decode,
+from .minative import (MAX_RUN_SECONDS, MError, _canonical, _decode, profile_in_scope,
                        _directory_fd, _open_file, _path)
 
 LIMIT = 4096
@@ -90,7 +90,7 @@ class NativeBrokerSession:
                 raise ValueError()
         except (ValueError, AttributeError) as error:
             raise MError("native_broker_mismatch", "Native broker request identity must be a canonical UUID") from error
-        if plan.get("profileID") not in INCLUDED_PROFILE_IDS or plan.get("identity", {}).get("storageKind") not in ("romfs", "yaffs"):
+        if not profile_in_scope(plan.get("profileID")) or plan.get("identity", {}).get("storageKind") not in ("romfs", "yaffs"):
             raise MError("isolation_unavailable", "Native broker requires an included Xiaomi Smart Band profile")
         self.run = self.root / config["run"]
         self.run_identity = self._directory_identity(self.run)
