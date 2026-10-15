@@ -162,11 +162,14 @@ final class SimulatorInstanceLibrary {
     }
 }
 
+/// An empty field always shows and uses the selected model's default name, so
+/// clearing the text returns to following the model instead of freezing it.
 nonisolated struct SimulatorInstanceNameDraft: Equatable {
-    private(set) var name: String
-    private(set) var followsDefault = true
+    private(set) var text = ""
+    private(set) var defaultName: String
 
-    init(defaultName: String) { name = defaultName }
-    mutating func edit(_ value: String) { name = value; followsDefault = false }
-    mutating func updateDefault(_ value: String) { if followsDefault { name = value } }
+    init(defaultName: String) { self.defaultName = defaultName }
+    var name: String { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? defaultName : text }
+    mutating func edit(_ value: String) { text = value }
+    mutating func updateDefault(_ value: String) { defaultName = value }
 }

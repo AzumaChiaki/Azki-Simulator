@@ -222,7 +222,8 @@ import SwiftUI
                         Text(SimulatorInstanceLibrary.deviceName(item)).tag(item.model)
                     }
                 }.accessibilityIdentifier("simulator.new-instance-model")
-                TextField("实例名称", text: Binding(get: { nameDraft.name }, set: { nameDraft.edit($0); failureMessage = nil }))
+                TextField("实例名称", text: Binding(get: { nameDraft.text }, set: { nameDraft.edit($0); failureMessage = nil }),
+                          prompt: Text(nameDraft.defaultName))
                     .textFieldStyle(.roundedBorder)
                     .accessibilityIdentifier("simulator.new-instance-name")
                     .help("用于实例列表、设备标题和录屏文件名；不会修改固件型号或序列号")
