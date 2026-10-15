@@ -29,7 +29,7 @@ export PATH="$(brew --prefix python@3.12)/libexec/bin:$PATH"
 | `AZKI_BUILD_JOBS` | Swift 并行任务数，默认 2 |
 | `DEVELOPER_DIR` | 要使用的完整 Xcode 开发目录 |
 
-`VERSION` 与 `BUILD_NUMBER` 分别写入 `CFBundleShortVersionString` 和 `CFBundleVersion`。构建号从 1 开始，由维护者显式递增；GitHub 运行次数不会改写仓库或构建号。
+`VERSION` 与 `BUILD_NUMBER` 分别写入 `CFBundleShortVersionString` 和 `CFBundleVersion`。本地构建直接使用文件中的值。GitHub Actions 把它作为起点，按“起点 + 运行序号 − 1”自动递增，只在构建机上写入，不回写仓库；需要跳号时调大 `BUILD_NUMBER` 即可。
 
 ## 产物
 
@@ -45,6 +45,6 @@ export PATH="$(brew --prefix python@3.12)/libexec/bin:$PATH"
 
 `.github/workflows/build-dmg.yml` 在 `main` 收到 push 时运行，因此普通合并、squash 合并、rebase 合并和直接提交都能触发。也可手动执行 `workflow_dispatch`。
 
-工作流使用 Apple Silicon macOS 15 runner 和 Xcode 26.2，从源码构建并上传 DMG 与源码包，保留 30 天。它只有 `contents: read` 权限，不创建提交、不发布 Release、不配置项目成员，也不使用签名或公证凭据。
+工作流使用 Apple Silicon macOS 15 runner 和 Xcode 26.2，从源码构建后发布 Release（标签 `v<版本>-build<构建号>`）：DMG 作为独立附件直接下载，GPL 对应源码包作为单独的可选附件。Release 先以草稿创建，全部上传完成后才公开。它只需要 `contents: write` 权限，不创建提交、不配置项目成员，也不使用签名或公证凭据。重新运行同一次构建会沿用构建号并替换该 Release 的附件。
 
 GitHub 实际 runner 软件清单以[官方镜像说明](https://github.com/actions/runner-images/blob/main/images/macos/macos-15-arm64-Readme.md)为准。

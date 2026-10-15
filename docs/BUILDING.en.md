@@ -29,7 +29,7 @@ The script builds the customized QEMU core, embedded Python and required depende
 | `AZKI_BUILD_JOBS` | Swift build parallelism; defaults to 2 |
 | `DEVELOPER_DIR` | Full Xcode developer directory to use |
 
-`VERSION` and `BUILD_NUMBER` populate `CFBundleShortVersionString` and `CFBundleVersion`. The build number starts at 1 and is incremented explicitly by the maintainer. GitHub run numbers do not rewrite the repository or the build number.
+`VERSION` and `BUILD_NUMBER` populate `CFBundleShortVersionString` and `CFBundleVersion`. Local builds use the file value. GitHub Actions treats it as a base and increments automatically as base + run number − 1, writing only on the runner, never back to the repository; raise `BUILD_NUMBER` to skip ahead.
 
 ## Outputs
 
@@ -45,6 +45,6 @@ The firmware catalog contains model/import metadata only. It excludes AP and OTA
 
 `.github/workflows/build-dmg.yml` runs on pushes to `main`, including merge commits, squash merges, rebase merges and direct commits. It also supports manual `workflow_dispatch` runs.
 
-The workflow uses an Apple Silicon macOS 15 runner with Xcode 26.2. It builds from source and uploads the DMG and source archives with a 30-day retention period. Its token has only `contents: read` permission. It creates no commits or Releases, changes no project membership and uses no signing or notarization credentials.
+The workflow uses an Apple Silicon macOS 15 runner with Xcode 26.2. It builds from source and publishes a Release tagged `v<version>-build<number>`: the DMG is a standalone asset for direct download, and the GPL corresponding sources are separate optional assets. The Release is created as a draft and published only after every upload succeeds. Its token needs only `contents: write`. It creates no commits, changes no project membership and uses no signing or notarization credentials. Re-running the same run keeps its build number and replaces that Release's assets.
 
 See the [official runner image inventory](https://github.com/actions/runner-images/blob/main/images/macos/macos-15-arm64-Readme.md) for the software available on GitHub's actual runners.

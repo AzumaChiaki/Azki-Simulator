@@ -13,6 +13,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+.vscode
 
 # Local development assistants and private firmware/instance data
 .agents/
