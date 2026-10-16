@@ -196,6 +196,10 @@ class WatchControl:
         self.server = self.thread = None
         self.input_server = self.input_thread = None
         self._servers_stop = threading.Event()
+        # Board inputs the runner resolved for this session (live.get reports
+        # them so the host maps levels/temperatures without guessing wiring).
+        self.battery_channel = None
+        self.ntc_channels = 0
 
     def _serve_requests(self, server):
         # Both selector wait and accept are bounded. A stale readiness event
@@ -371,7 +375,63 @@ class WatchControl:
             return self.health()
         if set(data) == {'command', 'value'} and data['command'] == 'health.set':
             return self.health(data['value'])
+        if set(data) == {'command', 'steps'} and data['command'] == 'health.walk':
+            return self.walk(data['steps'])
+        if set(data) == {'command'} and data['command'] == 'live.get':
+            return self.live()
+        if set(data) == {'command', 'value'} and data['command'] == 'charger.set':
+            return self.charger(data['value'])
+        if set(data) == {'command', 'channels'} and data['command'] == 'pmu.adcChannels.set':
+            return self.adc_channels(data['channels'])
         raise ValueError('Unsupported input command or fields')
+
+    def walk(self, steps):
+        """Walk steps more from now at the current cadence (live input)."""
+        if type(steps) is not int or not 1 <= steps <= 100000:
+            raise ValueError('health.walk steps must be an integer in 1..100000')
+        with self.lock:
+            state = self.health()
+            target = max(state['walkSteps'], state['walked']) + steps
+            if target > 10000000:
+                raise ValueError('health.walk would exceed 10000000 steps since boot')
+            return self.health({'walkSteps': target})
+
+    def charger(self, value):
+        """Plug/unplug the modeled charger now; the firmware's own charger
+        driver sees the PMU plug edge and charger chip status."""
+        if value not in ('unplugged', 'charging', 'full'):
+            raise ValueError('charger.set value must be unplugged, charging or full')
+        with self.lock:
+            self.qmp.execute('qom-set', {'path': '/machine', 'property': 'battery-charger', 'value': value})
+            return self.live()
+
+    def adc_channels(self, channels):
+        """Replace selected raw ADC words, keeping the others (live input)."""
+        if (type(channels) is not dict or not 1 <= len(channels) <= 8 or any(
+                type(key) is not str or key not in '01234567' or len(key) != 1 or
+                type(value) is not int or not 0 <= value <= 65535
+                for key, value in channels.items())):
+            raise ValueError('pmu.adcChannels.set requires {"0".."7": raw 0..65535}')
+        with self.lock:
+            if not getattr(self, 'adc_raw_available', False):
+                raise RuntimeError('unsupported_hardware_input: pmu.adcRaw')
+            values = list(self._adc_raw_state()['values'])
+            for key, value in channels.items():
+                values[int(key)] = value
+            self.adc_raw(values)
+            return self.live()
+
+    def live(self):
+        """One snapshot of every live input this session drives."""
+        with self.lock:
+            try:
+                health = self.health()
+            except RuntimeError:
+                health = None
+            charger = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'battery-charger'})
+            adc = self._adc_raw_state()['values'] if getattr(self, 'adc_raw_available', False) else None
+            return {'health': health, 'charger': charger if charger in ('unplugged', 'charging', 'full') else None,
+                    'adc': adc, 'batteryChannel': self.battery_channel, 'ntcChannels': self.ntc_channels}
 
     def health(self, value=None):
         """Live health input of the session's modeled sensors.

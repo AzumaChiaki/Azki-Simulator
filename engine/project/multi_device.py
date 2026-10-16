@@ -114,7 +114,9 @@ def board_profile(profile, resource_bytes, storage_kind='romfs'):
                 'charger-i2c':0x0307,'charger-id':0xc6,'charger-map':1,
                 # [lc ntc] shell/skin thermistors on PMU ADC 2/5 (0x0c0e2dd0,
                 # 0x0c0e2e84); battery voltage is ADC 4 x 4.9 (0x0c0e2f00).
-                'pmu-adc-ntc':(1<<2)|(1<<5)},
+                # Their mV->C table (0x2c5e3e5c, index = C + 40) puts 25 C at
+                # 250 mV, raw 5303 on the PMU calibration.
+                'pmu-adc-ntc':(1<<2)|(1<<5),'pmu-adc-ntc-room':5303},
             evidence=dict(nand_data=data[0],config=config[0],nv='BES header USER_SEC_SIZE + FACT_SEC_SIZE',
                           touch='N67 .187 table at file 0x6777d4: IRQ76/reset77; power52 at 0x0c0caf84; runtime I2C5=0x40063000',
                           panel='N67 .187 power sequence 0x0c0caef0 and accepted ID in 0x0c0df760; TE47 requires runtime verification'))
@@ -172,7 +174,7 @@ def board_profile(profile, resource_bytes, storage_kind='romfs'):
                                   # 0x07, identity 0xc6 at register 0x60.
                                   'charger-i2c':0x0307,'charger-id':0xc6,'charger-map':1,
                                   # [lc ntc] shell/skin thermistors as on N67
-                                  'pmu-adc-ntc':(1<<2)|(1<<5)})
+                                  'pmu-adc-ntc':(1<<2)|(1<<5),'pmu-adc-ntc-room':5303})
         board['evidence']['touch']='P67 .043 Hynitron setup 0x0c3f87e4; file 0xc460a0 config; GPIO IRQ 76/reset 78/power 52'
         board['evidence']['panel']='P67 .043 power sequence 0x0c3dd0a8 and panel dispatch 0x0c3e2108; other P67 versions require runtime verification'
     return _attach_nor_geometry(board, profile, ap_data, factory[0]['count'] * 512)

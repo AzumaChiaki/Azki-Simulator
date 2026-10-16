@@ -13,6 +13,7 @@ from .bridge import (BridgeError, CAPABILITIES, SessionBridge, atomic_json,
                      create_session, validate_frame)
 from .minative import MAX_RUN_SECONDS, MError, MinativeAdapter, _json, revalidate_plan
 from .adc_commands import supports_adc, get_raw, set_raw
+from .live_commands import live_get, live_set
 from .virtual_peer import supports_peer, COMMANDS as GUEST_COMMANDS
 
 
@@ -77,7 +78,8 @@ class MinativeSessionBridge(SessionBridge):
                 "hostProcessRunning": running, "bootVerified": False, "guestHealth": "unverified",
                 "guestInstallSupported": supports_peer(self.plan), "capabilities": list(CAPABILITIES) +
                     (list(GUEST_COMMANDS) if supports_peer(self.plan) else []) +
-                    (["pmu-adc-get", "pmu-adc-set"] if supports_adc(self.plan) else []),
+                    (["pmu-adc-get", "pmu-adc-set"] if supports_adc(self.plan) else []) +
+                    ["live-get", "live-set"],
                 "generation": self.generation, "hardwareInputs": ["touch"] +
                     (["pmu.adcRaw"] if supports_adc(self.plan) else []),
                 "width": self.width, "height": self.height}
@@ -178,6 +180,12 @@ class MinativeSessionBridge(SessionBridge):
 
     def pmu_adc_set(self, arguments):
         return set_raw(self.adapter, arguments)
+
+    def live_get(self, arguments):
+        return live_get(self.adapter, arguments)
+
+    def live_set(self, arguments):
+        return live_set(self.adapter, arguments)
 
     def stop(self):
         self._frames_stop.set()

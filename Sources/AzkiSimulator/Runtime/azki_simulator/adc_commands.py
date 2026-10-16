@@ -90,44 +90,62 @@ def _response(payload, request):
 def _remaining(deadline):
     seconds = deadline - time.monotonic()
     if seconds <= 0:
-        raise MError("adc_timeout", "ADC command exceeded its two-second total deadline")
+        raise MError("runner_timeout", "Command exceeded its two-second total deadline")
     return seconds
 
 
 def _request(adapter, arguments, *, write):
     deadline = time.monotonic() + DEADLINE_SECONDS
     request = validate_arguments(arguments, write=write)
+    if adapter is not None and not supports_adc(adapter.plan):
+        raise MError("unsupported_hardware", "This exact core does not declare pmu.adcRaw support")
+    try:
+        result = _response(runner_exchange(adapter, request, write=write, deadline=deadline), request)
+        _remaining(deadline)
+        return result
+    except MError as error:
+        renamed = {"runner_outcome_unknown": ("adc_outcome_unknown", "ADC write may have been applied; state is unconfirmed. Do not automatically retry."),
+                   "runner_timeout": ("adc_timeout", "ADC command exceeded its two-second total deadline"),
+                   "runner_protocol": ("adc_protocol", str(error))}
+        if error.code in renamed:
+            raise MError(*renamed[error.code]) from error
+        raise
+
+
+def runner_exchange(adapter, request, *, write, deadline):
+    """Send one fixed request to this instance's own runner input socket.
+
+    Returns the raw response line. Shared by the narrow ADC and live-input
+    commands; never a generic QMP path."""
     payload = _canonical(request) + b"\n"
     if len(payload) > MAX_REQUEST:
-        raise MError("invalid_adc", "ADC request exceeds 1 KiB")
+        raise MError("invalid_request", "Runner request exceeds 1 KiB")
     if adapter is None:
-        raise MError("not_running", "ADC requires a running instance")
-    if not supports_adc(adapter.plan):
-        raise MError("unsupported_hardware", "This exact core does not declare pmu.adcRaw support")
+        raise MError("not_running", "This input requires a running instance")
     if not adapter._lock.acquire(timeout=_remaining(deadline)):
-        raise MError("adc_timeout", "ADC command timed out waiting for this instance")
+        raise MError("runner_timeout", "Command timed out waiting for this instance")
     sent = False
     try:
         if (adapter._stop_requested or adapter.process is None or
                 adapter.process.poll() is not None or adapter._control is None):
-            raise MError("not_running", "Instance ADC input is not ready or is stopping")
+            raise MError("not_running", "Instance input is not ready or is stopping")
         # This revalidates actual runner/core/source identity and control paths.
         control = adapter._read_control()
         path = _inside_private(control["input_socket"], adapter.run / "tmp")
         if path.name != "input.sock" or not path.parent.name.startswith("q66-qmp-"):
-            raise MError("unsafe_control", "ADC endpoint is not the fixed runner input socket")
+            raise MError("unsafe_control", "Input endpoint is not the fixed runner input socket")
         before = path.lstat()
         if not stat.S_ISSOCK(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o077:
-            raise MError("unsafe_control", "ADC endpoint must be this user's private socket")
+            raise MError("unsafe_control", "Input endpoint must be this user's private socket")
         runner_pid = adapter._runner_pid()
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(_remaining(deadline))
             connection.connect(str(path))
             if _peer_identity(connection) != (runner_pid, os.getuid()):
-                raise MError("peer_identity", "ADC socket peer is not this instance's owned runner")
+                raise MError("peer_identity", "Input socket peer is not this instance's owned runner")
             after = path.lstat()
             if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-                raise MError("peer_identity", "ADC socket changed while connecting")
+                raise MError("peer_identity", "Input socket changed while connecting")
             connection.settimeout(_remaining(deadline))
             # Once any write could reach the peer, failed transport is uncertain.
             # Never retry automatically: QOM may already have accepted the set.
@@ -138,20 +156,18 @@ def _request(adapter, arguments, *, write):
                 connection.settimeout(_remaining(deadline))
                 data = connection.recv(MAX_RESPONSE + 1 - len(received))
                 if not data:
-                    raise MError("adc_protocol", "Runner closed without an ADC response")
+                    raise MError("runner_protocol", "Runner closed without a response")
                 received.extend(data)
                 if len(received) > MAX_RESPONSE:
-                    raise MError("adc_protocol", "ADC response exceeds 4 KiB")
+                    raise MError("runner_protocol", "Runner response exceeds 4 KiB")
             if received.count(b"\n") != 1 or not received.endswith(b"\n"):
-                raise MError("adc_protocol", "Runner sent multiple or trailing ADC messages")
-            result = _response(bytes(received[:-1]), request)
-            _remaining(deadline)
-            return result
+                raise MError("runner_protocol", "Runner sent multiple or trailing messages")
+            return bytes(received[:-1])
     except (OSError, ValueError, KeyError, TypeError, RecursionError) as error:
         if write and sent:
-            raise MError("adc_outcome_unknown", "ADC write may have been applied; state is unconfirmed. Do not automatically retry.") from error
+            raise MError("runner_outcome_unknown", "Write may have been applied; state is unconfirmed. Do not automatically retry.") from error
         if isinstance(error, socket.timeout):
-            raise MError("adc_timeout", "ADC command exceeded its two-second total deadline") from error
+            raise MError("runner_timeout", "Command exceeded its two-second total deadline") from error
         raise
     finally:
         adapter._lock.release()

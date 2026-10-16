@@ -97,6 +97,9 @@ typedef struct {
      * reconfiguring GPIO27. A queued report must be presented after that
      * EOI/mask/enable sequence, not synchronously from the ACK. */
     bool irq_rearm_pending;
+    /* Host press seen while the controller sleeps in gesture mode. */
+    bool gesture_down;
+    unsigned gesture_x, gesture_y;
     QEMUPutMouseEntry *mouse;
 } BesTouch;
 
@@ -259,7 +262,7 @@ struct Best1503State {
     bool power_adc_fixture;
     QemuMutex adc_lock;
     BesAdcInput adc_input;
-    uint32_t adc_ntc_channels;
+    uint32_t adc_ntc_channels, adc_ntc_room;
     /* PMU RTC (BEST1503 PMU regs 0x23/0x24 load, 0x54/0x55 value). Seconds
      * advance with the virtual clock from an anchor; the host may set it. */
     int64_t rtc_base;
@@ -2415,6 +2418,20 @@ static bool touch_powered(Best1503State *s)
     return true;
 }
 
+/* GESTURE_SLEEP (D104): the controller scans at low rate and reports only
+ * gestures; the driver turns them into wake events if the firmware's own
+ * screen settings enable them. */
+static bool touch_gesture_mode(BesTouch *t)
+{
+    return t->mode == 4 && t->sleep_mode == 3 && !t->bootloader;
+}
+
+/* Modes in which the controller raises its data-ready line for reports. */
+static bool touch_reporting(BesTouch *t)
+{
+    return (t->mode == 9 && !t->sleep_mode && !t->bootloader) || touch_gesture_mode(t);
+}
+
 static bool touch_irq_ready(Best1503State *s)
 {
     BesGpio *g = &s->gpio[s->touch_irq_pin / 32];
@@ -2431,8 +2448,7 @@ static void touch_irq(Best1503State *s)
     BesGpio *g = &s->gpio[s->touch_irq_pin / 32];
     uint32_t bit = 1u << (s->touch_irq_pin % 32);
     bool available = touch_powered(s) && s->touch.queue_count &&
-                     s->touch.mode == 9 && !s->touch.sleep_mode &&
-                     !s->touch.bootloader;
+                     touch_reporting(&s->touch);
     bool low = available && !s->touch.irq_rearm_pending;
     bool old = !!(g->input & bit), level = !low;
     g->input = (g->input & ~bit) | (level ? bit : 0);
@@ -2456,8 +2472,7 @@ static void touch_irq_rearm(void *opaque)
     BesTouch *t = &s->touch;
     uint32_t bit = 1u << (s->touch_irq_pin % 32);
 
-    if (!touch_powered(s) || !t->queue_count || t->mode != 9 ||
-        t->sleep_mode || t->bootloader) {
+    if (!touch_powered(s) || !t->queue_count || !touch_reporting(t)) {
         touch_irq(s);
         return;
     }
@@ -2485,7 +2500,7 @@ static void touch_reset(Best1503State *s)
     if (s->touch_irq_timer) {
         timer_del(s->touch_irq_timer);
     }
-    t->host_down = false;
+    t->host_down = t->gesture_down = false;
     t->tx_count = t->read_count = t->queue_head = t->queue_count = 0;
     t->pointer = t->mem_address = 0;
     t->mode = t->reply_mode = 9;
@@ -2508,6 +2523,34 @@ static void touch_queue_remove(BesTouch *t, unsigned offset)
     t->queue_count--;
 }
 
+static void touch_publish(Best1503State *s, const uint8_t *report);
+
+/* A press and release on the sleeping controller: a tap reports gesture
+ * 0x10 and an upward slide 0x40 (report byte 4 high nibble, no fingers),
+ * the codes the band's hynitron driver handles in gesture sleep. */
+static void touch_gesture(Best1503State *s, bool down, unsigned px, unsigned py,
+                          unsigned height)
+{
+    BesTouch *t = &s->touch;
+    if (down) {
+        if (!t->gesture_down) {
+            t->gesture_down = true;
+            t->gesture_x = px; t->gesture_y = py;
+        }
+        return;
+    }
+    if (!t->gesture_down) { return; }
+    t->gesture_down = false;
+    int dx = (int)px - (int)t->gesture_x, dy = (int)t->gesture_y - (int)py;
+    uint8_t r[10] = {0};
+    r[4] = dy > (int)height / 4 && abs(dx) < dy ? 0x40 : 0x10;
+    r[6] = 0xab;
+    if (t->queue_count == ARRAY_SIZE(t->queue)) { return; }
+    touch_publish(s, r);
+    qemu_log_mask(LOG_GUEST_ERROR, "BES touch gesture: code=0x%02x queued=%u\n",
+                  r[4], t->queue_count);
+}
+
 static void touch_mouse(void *opaque, int x, int y, int z, int buttons)
 {
     Best1503State *s = opaque;
@@ -2517,6 +2560,10 @@ static void touch_mouse(void *opaque, int x, int y, int z, int buttons)
     unsigned height = s->lcdc.frame_height ? s->lcdc.frame_height : 520;
     unsigned px = CLAMP(x, 0, 32767) * (width - 1) / 32767;
     unsigned py = CLAMP(y, 0, 32767) * (height - 1) / 32767;
+    if (touch_powered(s) && touch_gesture_mode(t)) {
+        touch_gesture(s, down, px, py, height);
+        return;
+    }
     if (!touch_powered(s) || t->mode != 9 || t->sleep_mode || t->bootloader ||
         (!down && !t->host_down) ||
         (down == t->host_down && px == t->x && py == t->y)) {
@@ -2562,22 +2609,28 @@ static void touch_mouse(void *opaque, int x, int y, int z, int buttons)
     }
     bool was_down = t->host_down;
     t->x = px; t->y = py; t->host_down = down;
-    unsigned tail = (t->queue_head + t->queue_count++) % ARRAY_SIZE(t->queue);
-    uint8_t *r = t->queue[tail];
-    memset(r, 0, 10);
+    uint8_t r[10] = {0};
     r[0] = down ? (was_down ? 7 : 6) : 0; /* finger 0: down/move/up */
     r[1] = px >> 4; r[2] = py >> 4;
     r[3] = (px << 4) | (py & 15);
     r[5] = 1; r[6] = 0xab;
+    touch_publish(s, r);
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "BES touch input: index=%u down=%u x=%u y=%u queued=%u\n",
+                  ++t->input_count, down, px, py, t->queue_count);
+}
+
+static void touch_publish(Best1503State *s, const uint8_t *report)
+{
+    BesTouch *t = &s->touch;
+    unsigned tail = (t->queue_head + t->queue_count++) % ARRAY_SIZE(t->queue);
+    memcpy(t->queue[tail], report, 10);
     if (t->queue_count == 1) {
-        memcpy(t->report, r, 10);
+        memcpy(t->report, report, 10);
         /* A new event can also arrive between the previous ACK and the
          * driver's GPIO re-enable. Use the same delayed publication path. */
         t->irq_rearm_pending = true;
     }
-    qemu_log_mask(LOG_GUEST_ERROR,
-                  "BES touch input: index=%u down=%u x=%u y=%u queued=%u\n",
-                  ++t->input_count, down, px, py, t->queue_count);
     touch_irq(s);
 }
 
@@ -2656,6 +2709,8 @@ static bool touch_write_packet(Best1503State *s)
         switch (reg) {
         case 0xd109: t->mode = 9; t->sleep_mode = 0; break;
         case 0xd11e: break; /* Enter command interface; scan mode is unchanged. */
+        /* hynitron_ts_resume: leave any sleep and report touches again. */
+        case 0xd11d: t->mode = 9; t->sleep_mode = 0; break;
         case 0xd11f: case 0xd120: /* Charger state */
         case 0xd123: case 0xd124: /* Wear state */
         case 0xd125: case 0xd126: /* Gyroscope state */
@@ -2670,6 +2725,14 @@ static bool touch_write_packet(Best1503State *s)
         case 0xd107: t->mode = 7; t->sleep_mode = 2; break;
         case 0xd104: t->mode = 4; t->sleep_mode = 3; break;
         default: break; /* Two-byte register-pointer selection. */
+        }
+        if (reg == 0xd104 || reg == 0xd105 || reg == 0xd107) {
+            /* A sleeping controller starts over: unread finger reports and
+             * a half-made gesture are discarded. */
+            t->queue_count = 0; t->report[5] = 0;
+            t->host_down = t->gesture_down = false;
+            t->irq_rearm_pending = false;
+            timer_del(s->touch_irq_timer);
         }
         if (reg >= 0xd100 && reg <= 0xd11e) {
             t->reply_mode = reg & 0xff;
@@ -2732,8 +2795,9 @@ static bool touch_write_packet(Best1503State *s)
     return ok;
 }
 
-/* DesignWare-style I2C interface from reg_i2cip.h. Only the optional
- * CST9217 at I2C3/0x5a is attached; other targets NACK. Empty TX FIFO is
+/* DesignWare-style I2C interface from reg_i2cip.h. The touch controller,
+ * the board's register devices and I2C-wired motion/optical sensors are
+ * attached; other targets NACK. Empty TX FIFO is
  * a level interrupt. Slave transfers are synchronous, with a bounded RX FIFO.
  */
 static uint32_t i2c_raw(BesI2c *i2c)
@@ -2861,6 +2925,32 @@ static MemTxResult i2c_write(void *opaque, hwaddr offset, uint64_t value,
                 i2c->abort_source = 1 << 3;
                 i2c->pending |= (1 << 6) | (1 << 9);
                 t->tx_count = 0;
+            }
+            i2c_update(i2c);
+            return MEMTX_OK;
+        }
+        /* Board motion/optical sensors wired to this controller. */
+        BesSensorPort *sensor = i2c->regs[1] & (1 << 12) ? NULL :
+            bes_sensors_i2c_port(&s->sensors, i2c - s->i2c, i2c->regs[1] & 0x7f);
+        if (sensor) {
+            bool ok = true;
+            if (value & 0x100) {
+                if (i2c->rx_count == ARRAY_SIZE(i2c->rx)) {
+                    ok = false;
+                } else {
+                    i2c->rx[(i2c->rx_head + i2c->rx_count++) % ARRAY_SIZE(i2c->rx)] =
+                        bes_sensors_i2c_read(&s->sensors, sensor);
+                }
+            } else {
+                bes_sensors_i2c_write(&s->sensors, sensor, value & 0xff);
+            }
+            if (value & 0x200) {
+                bes_sensors_i2c_stop(&s->sensors, sensor);
+                i2c->pending |= 1 << 9;
+            }
+            if (!ok) {
+                i2c->abort_source = 1 << 3;
+                i2c->pending |= (1 << 6) | (1 << 9);
             }
             i2c_update(i2c);
             return MEMTX_OK;
@@ -4452,8 +4542,20 @@ static void best1503_set_power_adc_fixture(Object *obj, bool value, Error **errp
 /* Board thermistor channels boot at a room-temperature sample: 8990 raw is
  * ~440 mV on the Band 9 calibration (0.051538 * raw - 23.3), 25 °C in its
  * get_bat_temp table. The generic 21000 default reads below 0 °C and the
- * charger managers then stop charging ("temperature too low"). */
+ * charger managers then stop charging ("temperature too low"). Boards whose
+ * thermistor network differs give their own sample (pmu-adc-ntc-room). */
 #define BES_ADC_NTC_ROOM 8990
+
+static void best1503_apply_adc_ntc(Best1503State *s)
+{
+    qemu_mutex_lock(&s->adc_lock);
+    for (unsigned i = 0; i < BES_ADC_CHANNELS; i++) {
+        if (s->adc_ntc_channels & (1u << i)) {
+            s->adc_input.values[i] = s->adc_ntc_room;
+        }
+    }
+    qemu_mutex_unlock(&s->adc_lock);
+}
 
 static void best1503_get_adc_ntc(Object *obj, Visitor *v, const char *name,
                                  void *opaque, Error **errp)
@@ -4475,13 +4577,30 @@ static void best1503_set_adc_ntc(Object *obj, Visitor *v, const char *name,
         return;
     }
     s->adc_ntc_channels = value;
-    qemu_mutex_lock(&s->adc_lock);
-    for (unsigned i = 0; i < BES_ADC_CHANNELS; i++) {
-        if (value & (1u << i)) {
-            s->adc_input.values[i] = BES_ADC_NTC_ROOM;
-        }
+    best1503_apply_adc_ntc(s);
+}
+
+static void best1503_get_adc_ntc_room(Object *obj, Visitor *v, const char *name,
+                                      void *opaque, Error **errp)
+{
+    uint32_t value = ((Best1503State *)obj)->adc_ntc_room;
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void best1503_set_adc_ntc_room(Object *obj, Visitor *v, const char *name,
+                                      void *opaque, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    uint32_t value;
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
     }
-    qemu_mutex_unlock(&s->adc_lock);
+    if (value > 0xffff) {
+        error_setg(errp, "pmu-adc-ntc-room is a raw ADC word 0..65535");
+        return;
+    }
+    s->adc_ntc_room = value;
+    best1503_apply_adc_ntc(s);
 }
 
 /* The runner owns QMP and exposes only pmu.adcRaw.set/get. Do not surface
@@ -5128,6 +5247,7 @@ static void best1503_instance_init(Object *obj)
     s->panel_te_pin = 65;
     s->touch_i2c = 3;
     s->touch_power_pin = 74;
+    s->adc_ntc_room = BES_ADC_NTC_ROOM;
     s->touch_reset_pin = 28;
     s->touch_irq_pin = 27;
     s->touch_module_id = 1;
@@ -5207,6 +5327,10 @@ static void best1503_class_init(ObjectClass *oc, const void *data)
         best1503_get_adc_ntc, best1503_set_adc_ntc, NULL, NULL);
     object_class_property_set_description(oc, "pmu-adc-ntc",
         "Mask of the board's thermistor ADC channels; they boot at a room-temperature sample");
+    object_class_property_add(oc, "pmu-adc-ntc-room", "uint32",
+        best1503_get_adc_ntc_room, best1503_set_adc_ntc_room, NULL, NULL);
+    object_class_property_set_description(oc, "pmu-adc-ntc-room",
+        "Raw ADC word of the board's thermistors at 25 C (default 8990)");
     object_class_property_add_str(oc, "battery-charger", best1503_get_battery_charger,
                                   best1503_set_battery_charger);
     object_class_property_set_description(oc, "battery-charger",

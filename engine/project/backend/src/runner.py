@@ -22,7 +22,7 @@ from .qmp import QMP
 from .instance_data import (validate_instance_images, instance_machine_options, initialize_instance_data, validate_instance_nor,
                             load_instance_settings, apply_instance_settings, read_instance_properties,
                             instance_settings_options,
-                            instance_settings_runtime,
+                            instance_settings_runtime, instance_settings_walk,
                             initialize_instance_nor, instance_nor_machine_options, validate_nor_geometry,
                             instance_nor_result_geometry)
 
@@ -31,6 +31,9 @@ QMP_START_SECONDS = 60
 # Seconds after the control socket opens before host battery/charger state is
 # applied; the guest must already be past its power-on charger check.
 RUNTIME_SETTINGS_DELAY = 8
+# Guest seconds until every preset's pedometer service counts IMU samples
+# (Band 9..11 subscribe their accelerometer 45..60 s after power-on).
+WALK_START_DELAY = 75
 # How often the runner samples the vCPU run state while a debugger may hold it.
 GDB_STATE_POLL_SECONDS = .25
 GDB_CHARDEV = re.compile(r'tcp:127\.0\.0\.1:([0-9]{1,5})(?:,|$)')
@@ -356,7 +359,8 @@ def main():
         optional = {'panel-power0','panel-power1','panel-power2','panel-id','resource-yaffs',
                     'pmu-calibration','panel-te-pin','touch-i2c','touch-power-pin',
                     'touch-reset-pin','touch-irq-pin','touch-module-id','touch-health-format','charger-i2c',
-                    'charger-id','charger-map','pmu-adc-ntc','config-offset','config-bytes','nand-data-bytes'}
+                    'charger-id','charger-map','pmu-adc-ntc','pmu-adc-ntc-room','config-offset','config-bytes',
+                    'nand-data-bytes'}
         geometry = board['geometry']
         if board.get('chip') != 'best1503' or not allowed <= set(geometry) or set(geometry)-allowed-optional or any(
                 type(v) is not int or not 0 <= v <= 0xffffffff for v in geometry.values()):
@@ -627,7 +631,8 @@ def main():
             # silently running with a different device.
             try:
                 for option in instance_settings_options(instance_settings, adc_fixture=args.power_adc_fixture,
-                                                        ntc_channels=geometry.get('pmu-adc-ntc', 0)):
+                                                        ntc_channels=geometry.get('pmu-adc-ntc', 0),
+                                                        ntc_sample=geometry.get('pmu-adc-ntc-room', 8990)):
                     machine += ',' + option
             except ValueError as error:
                 parser.error('Instance settings failed: ' + str(error))
@@ -689,6 +694,9 @@ def main():
                         log_directory=logdir, frame_file=frame_file if args.lcd_frame_capture else None)
                     input_socket = Path(temporary) / 'input.sock'
                     adc_raw = control.probe_adc_raw() if args.power_adc_fixture else False
+                    control.ntc_channels = geometry.get('pmu-adc-ntc', 0)
+                    if instance_settings is not None and instance_settings.get('battery'):
+                        control.battery_channel = instance_settings['battery']['channel']
                     has_input = args.touch or adc_raw
                     if has_input:
                         control.serve_input(input_socket)
@@ -730,6 +738,8 @@ def main():
                     def guest_seconds(now):
                         return now - halted_total - (now - halted_since if halted_since is not None else 0)
                     runtime_settings_due = guest_seconds(time.monotonic()) + RUNTIME_SETTINGS_DELAY
+                    walk_steps = instance_settings_walk(instance_settings) if instance_settings is not None else 0
+                    walk_due = guest_seconds(time.monotonic()) + WALK_START_DELAY
                     tap_index, pressed, due = 0, False, 0
                     fault_check_due = 0
                     fault_records = []
@@ -770,6 +780,12 @@ def main():
                                 for name, value in runtime_settings:
                                     control.execute('qom-set', {'path': '/machine', 'property': name, 'value': value})
                                 runtime_settings = []
+                            if walk_steps and guest_seconds(now) >= walk_due:
+                                # A live walk already requested by the host is kept.
+                                state = control.health()
+                                if state['walkSteps'] < walk_steps:
+                                    control.health({'walkSteps': walk_steps})
+                                walk_steps = 0
                             if now >= fault_check_due:
                                 fault_check_due = now + 1
                                 fault_status = control.execute('human-monitor-command',

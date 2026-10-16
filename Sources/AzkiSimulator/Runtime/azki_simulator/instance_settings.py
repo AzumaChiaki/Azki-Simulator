@@ -24,7 +24,8 @@ import re
 import stat
 import time
 
-from .minative import _canonical, _decode, _path, _read, battery_inputs, battery_level_sample, board_hardware
+from .minative import (_canonical, _decode, _path, _read, battery_inputs, battery_level_sample,
+                       battery_level_value, board_hardware)
 
 SCHEMA = 1
 KEY = re.compile(r"persist\.[A-Za-z0-9._-]{1,120}\Z")
@@ -235,7 +236,7 @@ def describe(library_root, instance_id):
     from .minative import BATTERY_INPUTS, HEALTH_SENSORS
     result = {"ok": True, "version": 1, "settings": settings, "observed": observed(library_root, instance_id),
               # Presets whose firmware a boot level / charger state really drives.
-              "batteryInputs": [{"modelPrefix": prefix, "level": "levelKey" in inputs,
+              "batteryInputs": [{"modelPrefix": prefix, "level": "ocvMillivolts" in inputs,
                                 "charger": bool(inputs.get("charger"))}
                                 for prefix, inputs in sorted(BATTERY_INPUTS.items())],
               # Presets whose own firmware counts the walked steps / measures
@@ -307,14 +308,16 @@ def resolve(settings, model):
         # A gauge chosen for another preset (for example after the instance's
         # preset changed) is dropped for this board instead of failing the start.
         battery.pop("gauge")
-    # A boot level becomes the firmware's own inputs: its saved state of charge
-    # and the matching battery voltage sample. Explicit values win; a preset
-    # without verified inputs keeps the firmware's default (no shown fake level).
+    # A boot level becomes the firmware's own inputs: the matching battery
+    # voltage sample and, where its gauge restores one, its saved state of
+    # charge. Explicit values win; a preset without verified inputs keeps the
+    # firmware's default (no shown fake level).
     inputs = battery_inputs(model)
     level = battery.pop("level", None)
-    if level is not None and inputs is not None and "levelKey" in inputs:
+    if level is not None and inputs is not None and "ocvMillivolts" in inputs:
         battery.setdefault("sampleRaw", battery_level_sample(inputs, level))
-        settings["properties"].setdefault(inputs["levelKey"], str(level * inputs["levelScale"]))
+        if "levelKey" in inputs:
+            settings["properties"].setdefault(inputs["levelKey"], str(battery_level_value(inputs, level)))
     if "charger" in battery and not (inputs or {}).get("charger"):
         battery.pop("charger")
     resolved = {"channel": hardware["batteryADCChannel"], "gauge": hardware["batteryGauge"],
@@ -324,13 +327,17 @@ def resolve(settings, model):
 
 
 def _resolve_health(health, hardware):
-    """Session health block, or None when nothing the preset models is set.
+    """Session health block, or None when the preset models no sensor.
 
-    Only inputs verified to drive this preset's firmware are kept; the others
-    are dropped instead of being passed to a board that would ignore them."""
+    A preset whose firmware the modeled sensors drive always gets them, so its
+    steps and pulse can also change while it runs; without saved values the
+    wearer stands still and the band is off the wrist (heart rate 0). Only
+    inputs verified to drive this preset's firmware are kept; the others are
+    dropped instead of being passed to a board that would ignore them."""
     inputs = hardware.get("healthInputs") or {}
-    if not health or not hardware.get("sensorBoard"):
+    if not hardware.get("sensorBoard") or not (inputs.get("steps") or inputs.get("heartRate")):
         return None
+    health = health or {}
     resolved = {}
     if inputs.get("steps") and "walkSteps" in health:
         resolved["walkSteps"] = health["walkSteps"]
@@ -338,8 +345,6 @@ def _resolve_health(health, hardware):
             resolved["cadence"] = health["cadence"]
     if inputs.get("heartRate") and "heartRate" in health:
         resolved["heartRate"] = health["heartRate"]
-    if not resolved:
-        return None
     resolved["sensorBoard"] = hardware["sensorBoard"]
     return resolved
 

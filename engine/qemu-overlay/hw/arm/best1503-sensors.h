@@ -75,6 +75,7 @@ typedef struct {
 typedef enum {
     BES_PPG_NONE = 0,
     BES_PPG_HX3695,
+    BES_PPG_HX3697,
 } BesPpgKind;
 
 #define BES_PPG_FIFO_WORDS 512
@@ -84,6 +85,7 @@ typedef struct {
     BesSensorPort port;
     uint8_t regs[256];
     uint8_t slot[8][8];          /* HX3695 0x44..0x4b, banked by 0x43 */
+    uint8_t page[4][256];        /* HX3697 register pages, selected by 0x00 */
     uint32_t fifo[BES_PPG_FIFO_WORDS];
     unsigned fifo_head, fifo_count;
     unsigned read_byte;          /* byte within the current FIFO word */
@@ -697,7 +699,11 @@ static inline void icm_write(BesSensorHub *h, uint8_t reg, uint8_t value)
 
 /* TYHX HX3695, as driven by the band's hx3695 driver:
  *  0x00 chip id 0x65; 0x1b bit 4 runs the sampler, bit 7 enables the FIFO
- *  (clearing it drops the FIFO);
+ *  (clearing it drops the FIFO), bit 0 stores one ambient-subtracted word
+ *  per channel (tag = channel; Band 9 / Band 10 drivers write 0x91), else
+ *  the ambient and LED phase words of each channel (tags 2ch and 2ch+1;
+ *  the Band 10 Pro driver writes 0x90 and rebuilds
+ *  16 * (LED - ambient + 13000 * offset));
  *  0x38 = 1 selects a per-conversion interrupt instead of the FIFO;
  *  0x1c/0x1d FIFO watermark in words; 0x20/0x21[0] FIFO level in words;
  *  0x22 FIFO data port, 3 bytes per word, little endian: bits 0..20 signed
@@ -711,6 +717,7 @@ static inline void ppg_reset(BesPpg *p)
 {
     memset(p->regs, 0, sizeof(p->regs));
     memset(p->slot, 0, sizeof(p->slot));
+    memset(p->page, 0, sizeof(p->page));
     p->fifo_head = p->fifo_count = p->read_byte = 0;
     p->next_sample_ns = 0;
     p->irq_sent = false;
@@ -743,7 +750,9 @@ static inline void ppg_pulse(BesSensorHub *h)
 
 /* Photodiode signal of channel ch in ADC counts above ambient: reflectance
  * times the channel's LED current code (slot 2ch+1 register 0x45). On a
- * wrist the green channel carries a pulse at heart_rate. */
+ * wrist a channel whose LED-phase slot drives the green LED (register 0x44
+ * bit 1: Band 9 0x42, Band 10 0x43) carries a pulse at heart_rate, one
+ * driving only the infrared LED (bit 0) a weak pulse. */
 static inline double ppg_photo(BesSensorHub *h, unsigned ch)
 {
     BesPpg *p = &h->ppg;
@@ -754,13 +763,13 @@ static inline double ppg_photo(BesSensorHub *h, unsigned ch)
         return current * 15 + bes_noise(h) * 200;      /* light leak only */
     }
     double v = reflect[ch] * current;
-    if (ch == 0) {
-        double q = p->beat_phase - floor(p->beat_phase);
+    unsigned led = p->slot[(2 * ch + 1) & 7][0] & 3;
+    double q = p->beat_phase - floor(p->beat_phase);
+    if (led & 2) {
         double pulse = exp(-pow((q - 0.15) / 0.07, 2)) +
                        0.35 * exp(-pow((q - 0.45) / 0.09, 2));
         v *= 1 - 0.012 * pulse + 0.003 * sin(2 * M_PI * p->t / 9.0);
-    } else if (ch >= 2) {
-        double q = p->beat_phase - floor(p->beat_phase);
+    } else if (led & 1) {
         v *= 1 - 0.004 * exp(-pow((q - 0.15) / 0.07, 2));
     }
     return v + bes_noise(h) * 60;
@@ -781,12 +790,20 @@ static inline int32_t ppg_value(BesSensorHub *h, unsigned ch, double photo)
     return (int32_t)(5 * ppg_after_offset(h, ch, photo));
 }
 
+/* Phase words: the ambient phase reads a small dark level, the LED phase
+ * that level plus the signal at the scale the raw-phase driver expects. */
+#define BES_PPG_AMBIENT_WORD 200
+static inline int32_t ppg_led_word(BesSensorHub *h, unsigned ch, double photo)
+{
+    return BES_PPG_AMBIENT_WORD + (int32_t)(10.4 * ppg_after_offset(h, ch, photo));
+}
+
 static inline void ppg_put24(uint8_t *r, uint32_t v)
 {
     r[0] = v; r[1] = v >> 8; r[2] = v >> 16;
 }
 
-static inline void ppg_push(BesPpg *p, unsigned ch, int32_t v)
+static inline void ppg_push(BesPpg *p, unsigned tag, int32_t v)
 {
     if (p->fifo_count == BES_PPG_FIFO_WORDS) {
         return;                           /* full: newest samples are lost */
@@ -794,13 +811,18 @@ static inline void ppg_push(BesPpg *p, unsigned ch, int32_t v)
     if (v > 0xfffff) { v = 0xfffff; }
     if (v < -0x100000) { v = -0x100000; }
     p->fifo[(p->fifo_head + p->fifo_count) % BES_PPG_FIFO_WORDS] =
-        ((uint32_t)v & 0x1fffff) | (ch << 21);
+        ((uint32_t)v & 0x1fffff) | (tag << 21);
     p->fifo_count++;
 }
 
+static inline void hx7_update(BesSensorHub *h);
 static inline void ppg_update(BesSensorHub *h)
 {
     BesPpg *p = &h->ppg;
+    if (p->kind == BES_PPG_HX3697) {
+        hx7_update(h);
+        return;
+    }
     if (p->kind != BES_PPG_HX3695) {
         return;
     }
@@ -832,7 +854,12 @@ static inline void ppg_update(BesSensorHub *h)
             ppg_put24(&p->regs[0x03 + 6 * ch], 0x80000 + 2000);
             ppg_put24(&p->regs[0x06 + 6 * ch], led > 0xffffff ? 0xffffff : (uint32_t)led);
             if (ppg_fifo_on(p) && (p->regs[0x26 + ch] & 0x88) == 0x88) {
-                ppg_push(p, ch, v);
+                if (p->regs[0x1b] & 1) {
+                    ppg_push(p, ch, v);
+                } else {
+                    ppg_push(p, 2 * ch, BES_PPG_AMBIENT_WORD);
+                    ppg_push(p, 2 * ch + 1, ppg_led_word(h, ch, photo));
+                }
                 p->channels++;
             }
         }
@@ -852,8 +879,14 @@ static inline void ppg_update(BesSensorHub *h)
     h->host.schedule(h->host.opaque, p->next_sample_ns);
 }
 
+static inline uint8_t hx7_read(BesSensorHub *h, uint8_t reg);
+static inline void hx7_write(BesSensorHub *h, uint8_t reg, uint8_t value);
+
 static inline uint8_t ppg_read(BesSensorHub *h, uint8_t reg)
 {
+    if (h->ppg.kind == BES_PPG_HX3697) {
+        return hx7_read(h, reg);
+    }
     BesPpg *p = &h->ppg;
     uint8_t v;
     ppg_update(h);
@@ -882,6 +915,10 @@ static inline uint8_t ppg_read(BesSensorHub *h, uint8_t reg)
 
 static inline void ppg_write(BesSensorHub *h, uint8_t reg, uint8_t value)
 {
+    if (h->ppg.kind == BES_PPG_HX3697) {
+        hx7_write(h, reg, value);
+        return;
+    }
     BesPpg *p = &h->ppg;
     ppg_update(h);
     if (reg >= 0x44 && reg <= 0x4b) {
@@ -903,7 +940,179 @@ static inline void ppg_write(BesSensorHub *h, uint8_t reg, uint8_t value)
 /* Address auto-increment, except on the FIFO data port. */
 static inline uint8_t ppg_next(BesPpg *p, uint8_t reg)
 {
+    if (p->kind == BES_PPG_HX3697) {
+        return reg == 0x6a ? reg : reg + 1;
+    }
     return reg == 0x22 ? reg : reg + 1;
+}
+
+/* ---- HX3697 ------------------------------------------------------------- */
+
+/* TYHX HX3697, as driven by the Band 11 hx3697 driver (Q66 4.200.078) over
+ * SPI with the TYHX write flag (address bit 7):
+ *  0x00 selects the register page for every other address (pages 0..2);
+ *  page 0 0x01/0x02 read the chip id 0x69/0x19;
+ *  page 0 0x34 | (0x35 & 3) << 8 enables receive slots: slot k is channel
+ *  k & 7, its second receiver when k >= 8 (Q66 heart rate: 0x343 = channels
+ *  0 and 1 with both receivers plus channel 6, the wear infrared channel);
+ *  page 0 0x5a..0x5c sample period in ticks of a 32.192 kHz clock (the
+ *  driver writes 32000 / rate * 1.006);
+ *  page 0 0x68 | (0x69 & 3) << 8 FIFO level in words, 0x6a FIFO data port
+ *  (no auto-increment): 3 bytes little endian, bits 0..19 signed sample,
+ *  bits 20..23 the slot. The first word after a FIFO reset (page 1 0x08
+ *  bit 7 cleared) is a pipeline word the driver discards;
+ *  page 1 0x0b | (0x0c & 3) << 8 FIFO watermark in words; the interrupt
+ *  pulses once the level reaches it and page 0 0x70 reads (and clears)
+ *  bit 0 for that FIFO interrupt;
+ *  page 1 0x10 + 2 * channel LED current code (init 80), 0x3a + slot offset
+ *  DAC code; page 0 0x04 + 6 * channel / 0x07 + 6 * channel the latest LED
+ *  and ambient conversions, read by the driver's LED tuning.
+ * The driver's gain control keeps a slot between 0 and 50000 counts by
+ * stepping the offset DAC 10 / 5 / 2 codes for errors above 230000 /
+ * 100000 / 50000 counts, so the signal here is reflectance times LED
+ * current minus 20000 counts per offset code. The first receivers of the
+ * green channels 0 and 1 carry the pulse, the other slots a weak one (the
+ * heart-rate algorithm locks on the pulse only this way). */
+#define BES_HX7_CLOCK_HZ 32192
+
+static inline unsigned hx7_slots(BesPpg *p)
+{
+    return p->page[0][0x34] | (p->page[0][0x35] & 3) << 8;
+}
+
+static inline int32_t hx7_value(BesSensorHub *h, unsigned slot)
+{
+    BesPpg *p = &h->ppg;
+    unsigned ch = slot & 7;
+    double current = p->page[1][0x10 + 2 * ch];
+    double q = p->beat_phase - floor(p->beat_phase);
+    double v;
+    if (!(h->health_enabled && h->heart_rate)) {
+        v = current * 15;                         /* light leak only */
+    } else if (slot <= 1) {
+        double pulse = exp(-pow((q - 0.15) / 0.07, 2)) +
+                       0.35 * exp(-pow((q - 0.45) / 0.09, 2));
+        v = 1200 * current * (1 - 0.012 * pulse + 0.003 * sin(2 * M_PI * p->t / 9.0));
+    } else {
+        v = (ch == 6 ? 20000 : 1200) * current *
+            (1 - 0.004 * exp(-pow((q - 0.15) / 0.07, 2)));
+    }
+    v += bes_noise(h) * 60 - 20000.0 * p->page[1][0x3a + slot];
+    return (int32_t)MAX(-0x80000, MIN(0x7ffff, v));
+}
+
+static inline void hx7_update(BesSensorHub *h)
+{
+    BesPpg *p = &h->ppg;
+    unsigned slots = hx7_slots(p);
+    unsigned ticks = p->page[0][0x5a] | p->page[0][0x5b] << 8 | p->page[0][0x5c] << 16;
+    if (!slots || ticks < 30) {
+        p->next_sample_ns = 0;
+        return;
+    }
+    int64_t now = h->host.now_ns(h->host.opaque);
+    int64_t period = (int64_t)ticks * 1000000000LL /
+                     (p->clock_hz ? p->clock_hz : BES_HX7_CLOCK_HZ);
+    if (!p->next_sample_ns || p->next_sample_ns > now + period) {
+        p->next_sample_ns = now + period;
+    }
+    if (now - p->next_sample_ns > period * BES_PPG_FIFO_WORDS) {
+        p->next_sample_ns = now - period * BES_PPG_FIFO_WORDS;
+    }
+    while (p->next_sample_ns <= now) {
+        double dt = period / 1e9;
+        p->t += dt;
+        p->beat_phase += h->heart_rate / 60.0 * dt;
+        for (unsigned slot = 0; slot < 10; slot++) {
+            if (!(slots & (1u << slot))) {
+                continue;
+            }
+            int32_t v = hx7_value(h, slot);
+            if (p->fifo_count < BES_PPG_FIFO_WORDS) {
+                p->fifo[(p->fifo_head + p->fifo_count++) % BES_PPG_FIFO_WORDS] =
+                    ((uint32_t)v & 0xfffff) | (slot << 20);
+            }
+            if (slot < 8) {
+                ppg_put24(&p->page[0][0x04 + 6 * slot], (uint32_t)v & 0xffffff);
+                ppg_put24(&p->page[0][0x07 + 6 * slot], BES_PPG_AMBIENT_WORD);
+            }
+        }
+        p->samples++;
+        unsigned wtm = p->page[1][0x0b] | (p->page[1][0x0c] & 3) << 8;
+        if (wtm && p->fifo_count >= wtm && !p->irq_sent) {
+            p->irq_sent = true;               /* re-armed by a status or FIFO read */
+            p->page[0][0x70] |= 1;
+            ppg_pulse(h);
+        }
+        p->next_sample_ns += period;
+    }
+    h->host.schedule(h->host.opaque, p->next_sample_ns);
+}
+
+static inline uint8_t hx7_read(BesSensorHub *h, uint8_t reg)
+{
+    BesPpg *p = &h->ppg;
+    unsigned page = p->page[0][0] & 3;
+    hx7_update(h);
+    if (reg == 0) {
+        return p->page[0][0];
+    }
+    if (page != 0) {
+        return p->page[page][reg];
+    }
+    switch (reg) {
+    case 0x01: return 0x69;
+    case 0x02: return 0x19;
+    case 0x68: return p->fifo_count & 0xff;
+    case 0x69: return (p->fifo_count >> 8) & 3;
+    case 0x70: {
+        uint8_t v = p->page[0][0x70];
+        p->page[0][0x70] = 0;
+        p->irq_sent = false;
+        return v;
+    }
+    case 0x6a: {
+        uint8_t v = 0;
+        p->irq_sent = false;
+        if (p->read_byte < 3) {
+            p->read_byte++;                   /* pipeline word after a reset */
+        } else if (p->fifo_count) {
+            v = p->fifo[p->fifo_head] >> (8 * (p->read_byte - 3));
+            if (++p->read_byte == 6) {
+                p->read_byte = 3;
+                p->fifo_head = (p->fifo_head + 1) % BES_PPG_FIFO_WORDS;
+                p->fifo_count--;
+            }
+        }
+        return v;
+    }
+    default:
+        return p->page[0][reg];
+    }
+}
+
+static inline void hx7_write(BesSensorHub *h, uint8_t reg, uint8_t value)
+{
+    BesPpg *p = &h->ppg;
+    unsigned page = p->page[0][0] & 3;
+    hx7_update(h);
+    if (reg == 0) {
+        p->page[0][0] = value;
+        return;
+    }
+    if (page == 0 && (reg == 0x01 || reg == 0x02 || reg == 0x68 || reg == 0x69 ||
+                      reg == 0x6a || reg == 0x70)) {
+        return;                               /* read-only */
+    }
+    if (page == 1 && reg == 0x08 && !(value & 0x80)) {
+        p->fifo_head = p->fifo_count = p->read_byte = 0;
+        p->irq_sent = false;
+    }
+    p->page[page][reg] = value;
+    if (page == 0 && (reg == 0x34 || reg == 0x35 || (reg >= 0x5a && reg <= 0x5c))) {
+        p->next_sample_ns = 0;
+    }
+    hx7_update(h);
 }
 
 /* ---- dispatch ---------------------------------------------------------- */
@@ -1157,7 +1366,7 @@ static inline bool bes_parse_port(gchar **f, BesSensorPort *port)
 }
 
 /* Entries "imu:<lsm6dso|icm42607>:<bus>:<cs-pin|address>:<irq-pin|-1>[:mount]" and
- * "ppg:<hx3695>:<bus>:...", bus = spi0, spi1 or i2cN, separated by ';'. */
+ * "ppg:<hx3695|hx3697>:<bus>:...", bus = spi0, spi1 or i2cN, separated by ';'. */
 static inline bool bes_sensors_configure(BesSensorHub *h, const char *spec, char **error)
 {
     BesImu imu = {.kind = BES_IMU_NONE, .port = {.irq_pin = -1, .cs_pin = -1}};
@@ -1180,7 +1389,8 @@ static inline bool bes_sensors_configure(BesSensorHub *h, const char *spec, char
                 ok = bes_parse_mount(f[5], imu.mount);
             }
         } else if (!strcmp(f[0], "ppg")) {
-            ppg.kind = !strcmp(f[1], "hx3695") ? BES_PPG_HX3695 : BES_PPG_NONE;
+            ppg.kind = !strcmp(f[1], "hx3695") ? BES_PPG_HX3695 :
+                       !strcmp(f[1], "hx3697") ? BES_PPG_HX3697 : BES_PPG_NONE;
             ok = ppg.kind && bes_parse_port(f, &ppg.port);
             if (ok && n == 6) {
                 /* Tick clock the board's driver programs the sample period
@@ -1237,7 +1447,8 @@ static inline char *bes_sensors_describe(BesSensorHub *h)
         }
     }
     if (h->ppg.kind) {
-        bes_describe_port(out, "ppg", "hx3695", &h->ppg.port);
+        bes_describe_port(out, "ppg", h->ppg.kind == BES_PPG_HX3697 ? "hx3697" : "hx3695",
+                          &h->ppg.port);
         if (h->ppg.clock_hz) {
             g_string_append_printf(out, ":%u", h->ppg.clock_hz);
         }

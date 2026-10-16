@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -319,18 +320,37 @@ def board_hardware(model):
 #   n66 Band 9 3.1.32 / o66 Band 9 Pro 3.1.28: LSM6DSO SPI0 CS53 INT71,
 #     HX3695 SPI0 CS50 INT14 (board_imu_initialize / board_afe_initialize).
 #   n67 Band 10 3.1.187: ICM-42607-P SPI0 CS13 INT10 (driver config byte 10,
-#     axis map 7 = x<->y, -z), HX3695 on SPI1 CS61 INT47.
+#     axis map 7 = x<->y, -z), HX3695 on SPI1 CS61 INT0 (board_hx3695_initialize
+#     0x0c39256e: CS 61, IRQ 0, power 1); its driver programs the sample period
+#     in 1/32000 s ticks (1280 for 25 Hz).
+#   p67 Band 10 Pro 3.101.043: board_sensor_initialize probes BMI220 before
+#     ICM-42607-P (SPI0, CS GPIO13 from the SPI0 pinmux, IRQ 29 at 0x0c40cf9c)
+#     and HX3695 before GH3020 (same wiring as n67); its driver reads the
+#     ambient and LED phase words of each channel (0x1b = 0x90). The IMU
+#     mount is taken from n67: at rest the firmware sees gravity on +Z.
+#   q66 Band 11 4.200.078: LSM6DSO probed before BMI2x0, SPI0 CS53 INT71 (IRQ
+#     0x47 in the driver config at 0x2c9941c0), as on Band 9. Its optical
+#     front end is a TYHX HX3697 on SPI0 CS50 INT14 (driver config
+#     0x2c99416c; paged registers, ID 0x69 0x19).
 HEALTH_SENSORS = {
     "miwear.watch.n66": {"board": "imu:lsm6dso:spi0:53:71;ppg:hx3695:spi0:50:14",
                          "motion": "lsm6dso", "optical": "hx3695", "steps": True, "heartRate": True},
-    # O66: steps verified on the watch face; same optical part and firmware
-    # family as N66, its heart-rate page not yet checked.
+    # O66: steps verified on the watch face, heart rate in the Heart Rate app
+    # (72 -> 74, 100 -> 103).
     "miwear.watch.o66": {"board": "imu:lsm6dso:spi0:53:71;ppg:hx3695:spi0:50:14",
-                         "motion": "lsm6dso", "optical": "hx3695", "steps": True, "heartRate": False},
-    # N67: the pedometer counts the walk (AlgoADE pedo), but the daily summary
-    # the pages show stays 0 and the pulse is not measured yet: not offered.
-    "miwear.watch.n67": {"board": "imu:icm42607:spi0:13:10:+y+x-z;ppg:hx3695:spi1:61:47",
-                         "motion": "icm42607", "optical": "hx3695", "steps": False, "heartRate": False},
+                         "motion": "lsm6dso", "optical": "hx3695", "steps": True, "heartRate": True},
+    # N67: steps verified on the Steps card (walk 150 -> 139) and heart rate
+    # in the Heart Rate app (72 -> 71, 100 -> 103).
+    "miwear.watch.n67": {"board": "imu:icm42607:spi0:13:10:+y+x-z;ppg:hx3695:spi1:61:0:32000",
+                         "motion": "icm42607", "optical": "hx3695", "steps": True, "heartRate": True},
+    # P67: steps verified on the activity card (walk 150 -> 142), heart rate
+    # in the Heart Rate app (72 -> 72, 100 -> 102).
+    "miwear.watch.p67": {"board": "imu:icm42607:spi0:13:29:+y+x-z;ppg:hx3695:spi1:61:0:32000",
+                         "motion": "icm42607", "optical": "hx3695", "steps": True, "heartRate": True},
+    # Q66: steps verified on the activity page (walk 100 -> 92), heart rate in
+    # the Heart Rate app (72 -> 74, 100 -> 102).
+    "miwear.watch.q66": {"board": "imu:lsm6dso:spi0:53:71;ppg:hx3697:spi0:50:14",
+                         "motion": "lsm6dso", "optical": "hx3697", "steps": True, "heartRate": True},
 }
 
 
@@ -348,11 +368,13 @@ def health_sensors(model):
 # firmware code: at boot it restores its state of charge from a persist key and
 # corrects it against the battery voltage it samples on PMU ADC channel 2, so
 # a boot level is the persist value plus the raw sample of the matching open
-# circuit voltage. Band 9 (3.1.32): persist.gauge.cap is SOC x1000; the OCV
-# table (gauge state +0xa4, index 0 = 100 %; the gauge derives it for the
-# battery temperature, here the core's room-temperature thermistor input),
-# adc_mV = 0.051538 * raw - 23.3 and vbat = adc_mV * 7 were read from the
-# running firmware. The charger state is
+# circuit voltage. Band 9 (3.1.32): persist.gauge.cap is the capacity x1000
+# (get_cap_data_init "get cap from kvdb"), kept while it is within 15 % of the
+# capacity the OCV table gives for the voltage; the level shown is capacity
+# x 1.055 (cap_ui). The OCV table (gauge state +0xa4, index 0 = 100 %; the
+# gauge derives it for the battery temperature, here the core's
+# room-temperature thermistor input), adc_mV = 0.051538 * raw - 23.3 and
+# vbat = adc_mV * 7 were read from the running firmware. The charger state is
 # applied only where the firmware finds its charger chip.
 BAND9_OCV_MV = (
     4463.5, 4453.5, 4443.5, 4434.5, 4424.5, 4416.5, 4407.5, 4397.5, 4388.4, 4378.4,
@@ -367,22 +389,80 @@ BAND9_OCV_MV = (
     3700.4, 3699.4, 3697.5, 3696.4, 3691.4, 3685.2, 3663.9, 3629.9, 3588.8, 3538.8,
     3476.4)
 # Band 9 Pro (O66 .28) runs the same gauge: persist.gauge.cap, ADC 2 x7
-# (gauge state 0x20097058: divider 7.0 at +0x58, same OCV table at +0xa4) and
-# a 11000 boot sample reads 30 % on both. Runtime charger state shows on both
+# (gauge state 0x20097058: divider 7.0 at +0x58, same OCV table at +0xa4);
+# a requested 37 % boot level shows 37 % on both. Runtime charger state shows on both
 # (PMU AC_ON edge -> hp4560(x) detect worker -> charge screen / face bolt).
+# Band 10 (N67 3.1.187) runs a BESPOWER soft gauge: at boot it restores the
+# level from persist.charger.per (whole percent); while discharging it steps the
+# level down only when it exceeds the level its OCV table gives for the battery
+# voltage (0x0c0e2fec; table for -10..49 C at 0x2c5e3208, uV, index 0 = 100 %).
+# The voltage is whole ADC millivolts x 4.9 from PMU ADC 4 (0x0c0e2f00), with
+# the Band 9 conversion (raw 21000 reads 5189.1 mV in the gauge log).
+BAND10_OCV_MV = (
+    4415.0, 4405.8, 4397.1, 4388.5, 4379.3, 4370.7, 4360.9, 4351.6, 4342.4, 4331.9,
+    4321.5, 4311.0, 4300.6, 4289.5, 4279.0, 4267.3, 4255.7, 4244.0, 4232.3, 4220.0,
+    4208.3, 4196.6, 4184.9, 4173.2, 4160.9, 4149.2, 4137.5, 4126.5, 4114.8, 4103.7,
+    4092.6, 4081.0, 4069.9, 4058.8, 4048.4, 4037.3, 4026.8, 4016.4, 4005.9, 3994.8,
+    3983.8, 3972.1, 3961.0, 3949.3, 3938.9, 3928.4, 3919.2, 3910.6, 3902.6, 3894.6,
+    3887.8, 3880.4, 3874.3, 3867.5, 3861.3, 3855.2, 3849.7, 3844.1, 3838.6, 3833.0,
+    3827.5, 3822.6, 3817.7, 3813.4, 3808.4, 3804.1, 3799.2, 3795.5, 3791.2, 3786.9,
+    3782.6, 3778.9, 3774.0, 3770.3, 3766.0, 3761.1, 3756.8, 3751.2, 3746.9, 3742.0,
+    3736.5, 3732.8, 3728.5, 3722.9, 3718.0, 3711.2, 3705.7, 3699.6, 3693.4, 3685.4,
+    3679.3, 3676.8, 3675.0, 3672.5, 3670.0, 3665.1, 3658.3, 3639.3, 3603.0, 3557.5,
+    3500.2)
+# Band 10 Pro (P67 3.101.043) runs the same soft gauge with persist.gauge_soc;
+# its table for 12..49 C is at 0x2cd05168 (volttosoc 0x0c3dc460; a factory
+# voltage calibration applies only when one is stored).
+BAND10PRO_OCV_MV = (
+    4438.5, 4428.0, 4419.0, 4411.2, 4403.5, 4395.7, 4388.0, 4379.6, 4371.2, 4362.2,
+    4353.2, 4343.9, 4333.7, 4323.5, 4313.6, 4302.7, 4288.5, 4277.3, 4265.2, 4253.7,
+    4241.3, 4229.6, 4217.1, 4205.1, 4193.0, 4180.9, 4168.5, 4156.4, 4144.0, 4131.9,
+    4120.1, 4108.0, 4096.2, 4086.0, 4074.2, 4062.8, 4051.0, 4039.5, 4028.0, 4017.8,
+    4006.0, 3994.2, 3982.2, 3969.8, 3957.4, 3945.6, 3934.4, 3924.5, 3915.5, 3906.8,
+    3898.8, 3891.3, 3883.6, 3876.4, 3869.6, 3862.8, 3856.3, 3850.1, 3844.2, 3838.0,
+    3832.1, 3826.5, 3821.3, 3815.7, 3810.4, 3805.8, 3800.8, 3796.1, 3791.2, 3786.5,
+    3782.2, 3777.5, 3773.2, 3768.6, 3763.9, 3759.6, 3754.6, 3750.0, 3745.0, 3739.7,
+    3735.1, 3730.4, 3726.1, 3721.1, 3715.2, 3709.0, 3702.2, 3695.7, 3688.6, 3680.2,
+    3671.8, 3665.4, 3660.0, 3655.6, 3650.2, 3645.0, 3640.8, 3630.6, 3605.4, 3554.2,
+    3500.1)
+# Band 11 (Q66 4.200.078) soft gauge: ADC 2 x 7.0 (vol_gain) in whole
+# millivolts. After a cold boot it takes the capacity its OCV table gives for
+# the battery voltage (get_cap_data_init "[sram]get cap from table") and shows
+# capacity x 1.055 (get_cap_init 0x0c6ab650, cap_ui). The table is built at run
+# time for the battery temperature (0x200b408c, read at the core's 26 C
+# thermistor input).
+BAND11_OCV_MV = (
+    4442.9, 4432.8, 4422.6, 4412.6, 4402.6, 4392.5, 4382.5, 4371.5, 4361.6, 4350.6,
+    4340.5, 4329.5, 4318.5, 4307.5, 4294.6, 4283.5, 4270.6, 4259.5, 4246.6, 4234.6,
+    4222.6, 4210.6, 4198.6, 4186.5, 4174.6, 4162.6, 4150.6, 4138.6, 4127.5, 4115.6,
+    4104.5, 4093.6, 4082.6, 4071.6, 4060.6, 4049.6, 4039.6, 4028.6, 4018.6, 4008.6,
+    3998.6, 3988.6, 3976.6, 3964.7, 3952.8, 3940.6, 3928.6, 3919.5, 3911.4, 3903.4,
+    3896.4, 3889.4, 3883.4, 3877.4, 3871.4, 3866.3, 3860.4, 3855.3, 3850.2, 3845.3,
+    3840.3, 3836.2, 3831.3, 3828.2, 3823.2, 3820.2, 3816.2, 3812.2, 3808.2, 3805.1,
+    3801.2, 3797.1, 3793.1, 3788.0, 3782.9, 3778.8, 3773.9, 3768.9, 3763.9, 3759.8,
+    3755.8, 3751.8, 3747.8, 3742.8, 3735.9, 3729.9, 3723.8, 3718.8, 3710.9, 3702.9,
+    3699.7, 3698.6, 3697.6, 3696.6, 3692.8, 3688.8, 3674.1, 3637.6, 3592.0, 3532.5,
+    3453.4)
 BATTERY_INPUTS = {
     "miwear.watch.n66": {"levelKey": "persist.gauge.cap", "levelScale": 1000,
                          "ocvMillivolts": BAND9_OCV_MV, "adcSlope": 0.051538,
-                         "adcOffset": -23.3, "divider": 7.0, "charger": True},
+                         "adcOffset": -23.3, "divider": 7.0, "uiScale": 1.055,
+                         "charger": True},
     "miwear.watch.o66": {"levelKey": "persist.gauge.cap", "levelScale": 1000,
                          "ocvMillivolts": BAND9_OCV_MV, "adcSlope": 0.051538,
-                         "adcOffset": -23.3, "divider": 7.0, "charger": True},
-    # Band 10 / 10 Pro / 11: the charger is found and its runtime state shows on
-    # the watch face; the boot level key (n67 persist.charger.per, p67
-    # persist.gauge_soc, q66 persist.charger.soc) is not verified yet.
-    "miwear.watch.n67": {"charger": True},
-    "miwear.watch.p67": {"charger": True},
-    "miwear.watch.q66": {"charger": True},
+                         "adcOffset": -23.3, "divider": 7.0, "uiScale": 1.055,
+                         "charger": True},
+    "miwear.watch.n67": {"levelKey": "persist.charger.per", "levelScale": 1,
+                         "ocvMillivolts": BAND10_OCV_MV, "adcSlope": 0.051538,
+                         "adcOffset": -23.3, "divider": 4.9, "wholeMillivolts": True,
+                         "charger": True},
+    "miwear.watch.p67": {"levelKey": "persist.gauge_soc", "levelScale": 1,
+                         "ocvMillivolts": BAND10PRO_OCV_MV, "adcSlope": 0.051538,
+                         "adcOffset": -23.3, "divider": 4.9, "wholeMillivolts": True,
+                         "charger": True},
+    "miwear.watch.q66": {"ocvMillivolts": BAND11_OCV_MV, "adcSlope": 0.051538,
+                         "adcOffset": -23.3, "divider": 7.0, "uiScale": 1.055,
+                         "charger": True},
 }
 
 
@@ -396,10 +476,67 @@ def battery_inputs(model):
     return None
 
 
+def _table_capacity(ocv, millivolts):
+    """Capacity (0…100) the gauge interpolates from its OCV table."""
+    if millivolts >= ocv[0]:
+        return 100.0
+    if millivolts <= ocv[100]:
+        return 0.0
+    for index in range(1, 101):
+        if millivolts >= ocv[index]:
+            return 100 - index + (millivolts - ocv[index]) / (ocv[index - 1] - ocv[index])
+    return 0.0
+
+
+def _table_voltage(ocv, capacity):
+    """Open-circuit voltage (mV) the table gives for a capacity (0…100)."""
+    index = 100 - capacity
+    low = min(99, int(index))
+    return ocv[low] + (index - low) * (ocv[low + 1] - ocv[low])
+
+
+def battery_level_capacity(inputs, level):
+    """Capacity a gauge that shows capacity x uiScale restores for a level."""
+    return min(100.0, (level + 0.5) / inputs["uiScale"])
+
+
+def battery_level_value(inputs, level):
+    """Saved state of charge for a boot level (the gauge's own persist value)."""
+    if "uiScale" in inputs:
+        return round(battery_level_capacity(inputs, level) * inputs["levelScale"])
+    return level * inputs["levelScale"]
+
+
 def battery_level_sample(inputs, level):
     """PMU ADC raw count of the open-circuit voltage at a level (0…100 %)."""
-    millivolts = inputs["ocvMillivolts"][100 - level]
-    return round((millivolts / inputs["divider"] - inputs["adcOffset"]) / inputs["adcSlope"])
+    ocv = inputs["ocvMillivolts"]
+    if "uiScale" in inputs and "levelKey" in inputs:
+        # The gauge restores the saved capacity and shows it x uiScale; the
+        # voltage is that capacity's open-circuit voltage.
+        millivolts = _table_voltage(ocv, battery_level_capacity(inputs, level))
+        return round((millivolts / inputs["divider"] - inputs["adcOffset"]) / inputs["adcSlope"])
+    if "uiScale" in inputs:
+        # The gauge shows its table capacity x uiScale (at most 100) from the
+        # whole-millivolt reading: take the reading whose shown level is the
+        # boot level, else the closest one.
+        divider, scale = inputs["divider"], inputs["uiScale"]
+        def shown(adc_mv):
+            return min(100, int(_table_capacity(ocv, adc_mv * divider) * scale))
+        low = math.floor(ocv[100] / divider) - 1
+        high = math.ceil(ocv[0] / divider) + 1
+        adc_mv = min(range(low, high + 1),
+                     key=lambda mv: (abs(shown(mv) - level), abs(shown(mv) + 0.5 - level)))
+        return round((adc_mv + 0.3 - inputs["adcOffset"]) / inputs["adcSlope"])
+    if inputs.get("wholeMillivolts"):
+        # The gauge sees whole ADC millivolts: take the lowest reading above
+        # the next lower level's voltage, so the level the gauge derives from
+        # it is never below the boot level, and aim inside that millivolt.
+        divider = inputs["divider"]
+        floor_mv = ocv[101 - level] if level else ocv[100] - divider
+        adc_mv = math.floor(floor_mv / divider) + 1.3
+    else:
+        adc_mv = ocv[100 - level] / inputs["divider"]
+    return round((adc_mv - inputs["adcOffset"]) / inputs["adcSlope"])
 
 
 def _catalog(project):

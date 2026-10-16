@@ -443,10 +443,12 @@ import UniformTypeIdentifiers
             }
             SimulatorSectionDivider()
             SimulatorSection(title: "硬件输入", icon: "sensor") {
-                Text("电池电压、电量与温度").fontWeight(.medium)
+                SimulatorLiveControlsView(session: session, enabled: controlsAvailable)
+                Divider()
+                Text("电池电压、电量与温度（原始采样）").fontWeight(.medium)
                 Text(adcProfileID == "q66@4.100.177"
-                     ? "此固件已确认电池电压和 NTC 采样用途。按原始计数编辑，电量由固件估算；尚不支持直接输入 mV 或 °C，充电状态尚未接入。"
-                     : "当前固件的通道用途和换算尚未确认，暂不能按 mV、% 或 °C 修改；充电状态尚未接入。")
+                     ? "此固件已确认电池电压和 NTC 采样用途。按原始计数编辑，电量由固件估算；尚不支持直接输入 mV 或 °C。开机电量和开机充电状态在“固件设置”中设置。"
+                     : "当前固件的通道用途和换算尚未确认，暂不能按 mV、% 或 °C 修改。开机电量和开机充电状态在“固件设置”中设置。")
                     .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
                 if adcAvailable {
                     DisclosureGroup("高级：PMU 原始采样输入") {
@@ -504,7 +506,7 @@ import UniformTypeIdentifiers
                     Text(session.isRunning ? "当前核心不支持 ADC 输入" : "运行后可编辑支持的原始输入")
                         .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
                 }
-                Text("心率、血氧、步数与运动传感器暂不支持手动注入。")
+                Text("血氧等其他传感器暂不支持注入。")
                     .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
             }
             SimulatorSectionDivider()

@@ -108,7 +108,9 @@ actor SimulatorSessionConnection {
         let permitted = ["status", "start", "stop", "input", "screenshot", "logs", "inspect-package", "stage-package", "pmu-adc-get", "pmu-adc-set",
                          "guest-status", "guest-connect", "guest-install", "guest-operation", "guest-inventory", "guest-select",
                          "external-open", "external-status", "external-request", "external-result", "external-close", "external-reconnect"]
-        guard permitted.contains(command) else { throw SimulatorError.remote("不受支持的会话命令") }
+        guard permitted.contains(command) || SimulatorLiveCommands.all.contains(command) else {
+            throw SimulatorError.remote("不受支持的会话命令")
+        }
         if command == "stop" { releaseInput() }
         return try exchange(command, arguments: arguments)
     }

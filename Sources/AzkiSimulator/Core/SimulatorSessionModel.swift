@@ -188,6 +188,19 @@ final class SimulatorSessionModel {
         return result
     }
 
+    /// Live board inputs (live-get / live-set). The reply is the core's state
+    /// after the change, including which inputs this session supports.
+    func liveCommand(_ command: String, arguments: [String: SimulatorJSON] = [:]) async throws -> SimulatorJSON {
+        guard let connection, isRunning else { throw SimulatorError.disconnected }
+        guard SimulatorLiveCommands.all.contains(command) else {
+            throw SimulatorError.remote("不受支持的实时输入命令")
+        }
+        let token = generation
+        let result = try await connection.command(command, arguments: arguments)
+        guard generation == token else { throw SimulatorError.disconnected }
+        return result
+    }
+
     func externalBluetooth(_ request: [String: Any]) async throws -> [String: Any] {
         guard let connection, isRunning else { throw SimulatorError.disconnected }
         guard let command = request["command"] as? String,

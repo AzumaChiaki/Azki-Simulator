@@ -675,6 +675,12 @@ class SessionBridge:
     def pmu_adc_set(self, arguments):
         raise BridgeError("unsupported_hardware", "This backend has no verified PMU ADC input")
 
+    def live_get(self, arguments):
+        raise BridgeError("unsupported_hardware", "This backend has no live board inputs")
+
+    def live_set(self, arguments):
+        raise BridgeError("unsupported_hardware", "This backend has no live board inputs")
+
     def dispatch(self, request):
         with self.lock:
             if not isinstance(request, dict) or request.get("version") != 1 or request.get("id") != self.session["id"]:
@@ -696,6 +702,8 @@ class SessionBridge:
                 from .adc_commands import validate_arguments
                 validate_arguments(args, write=command == "pmu-adc-set")
                 return self.pmu_adc_get(args) if command == "pmu-adc-get" else self.pmu_adc_set(args)
+            if command in ("live-get", "live-set"):
+                return self.live_get(args) if command == "live-get" else self.live_set(args)
             if command == "input":
                 if "batch" in args:
                     if set(args) != {"batch"}:

@@ -240,16 +240,57 @@ static BesGpuTarget *gpu_sw_target(BesGpuWork *w, BesGpuRead read)
     return t;
 }
 
+static bool gpu_sw_edge_add(BesGpuWork *w, BesGpuEdge *edges, unsigned *count,
+                            double x0, double y0, double x1, double y1)
+{
+    if (y0 == y1) {
+        return true;
+    }
+    if (*count == BES_GPU_EDGES) {
+        return gpu_sw_fail(w, "path edge limit");
+    }
+    edges[(*count)++] = (BesGpuEdge) {x0, y0, x1, y1};
+    return true;
+}
+
+/* Edges are clipped to the +-65536 box around every target. The parts
+ * above or below it cover no target row; parts left or right of it become
+ * vertical edges on the box side, which keeps the winding of every point
+ * inside the box. */
 static bool gpu_sw_edge(BesGpuWork *w, BesGpuEdge *edges, unsigned *count,
                         double x0, double y0, double x1, double y1)
 {
-    if (!gpu_sw_number(x0) || !gpu_sw_number(y0) ||
-        !gpu_sw_number(x1) || !gpu_sw_number(y1) || *count == BES_GPU_EDGES) {
-        qemu_log_mask(LOG_GUEST_ERROR, "BES GPU path rejected: edges=%u points=%g,%g,%g,%g\n", *count, x0,y0,x1,y1);
-        return gpu_sw_fail(w, "path coordinate or edge limit");
+    const double box = 65536;
+    if (y0 == y1) {
+        return true;
     }
-    if (y0 != y1) {
-        edges[(*count)++] = (BesGpuEdge) {x0, y0, x1, y1};
+    double t0 = (-box - y0) / (y1 - y0), t1 = (box - y0) / (y1 - y0);
+    double ta = MAX(0, MIN(t0, t1)), tb = MIN(1, MAX(t0, t1));
+    if (ta >= tb) {
+        return true;
+    }
+    double ax = x0 + ta * (x1 - x0), ay = y0 + ta * (y1 - y0);
+    double bx = x0 + tb * (x1 - x0), by = y0 + tb * (y1 - y0);
+    /* Split where the edge crosses the box sides, in edge order. */
+    double cut[4] = {0};
+    unsigned cuts = 1;
+    for (int side = -1; side <= 1; side += 2) {
+        double t = bx != ax ? (side * box - ax) / (bx - ax) : -1;
+        if (t > 0 && t < 1) {
+            cut[cuts++] = t;
+        }
+    }
+    if (cuts == 3 && cut[1] > cut[2]) {
+        double t = cut[1]; cut[1] = cut[2]; cut[2] = t;
+    }
+    cut[cuts++] = 1;
+    for (unsigned i = 0; i + 1 < cuts; i++) {
+        double sx = ax + cut[i] * (bx - ax), sy = ay + cut[i] * (by - ay);
+        double ex = ax + cut[i + 1] * (bx - ax), ey = ay + cut[i + 1] * (by - ay);
+        if (!gpu_sw_edge_add(w, edges, count, CLAMP(sx, -box, box), sy,
+                             CLAMP(ex, -box, box), ey)) {
+            return false;
+        }
     }
     return true;
 }
@@ -267,8 +308,8 @@ static bool gpu_sw_path(BesGpuWork *w, const uint8_t *data, unsigned bytes,
     }
     for (unsigned i = 0; i < 6; i++) {
         m[i] = gpu_sw_float(w->regs[0xa40 + i]);
-        if (!gpu_sw_number(m[i])) {
-            return gpu_sw_fail(w, "invalid path transform");
+        if (!isfinite(m[i])) {
+            goto empty;
         }
     }
     x = m[2]; y = m[5];
@@ -303,13 +344,10 @@ static bool gpu_sw_path(BesGpuWork *w, const uint8_t *data, unsigned bytes,
             double b = format == 1 ? (int16_t)lduw_le_p(data + p + unit) :
                 gpu_sw_float(ldl_le_p(data + p + unit));
             p += unit * 2;
-            if (!gpu_sw_number(a) || !gpu_sw_number(b)) {
-                return gpu_sw_fail(w, "invalid path coordinate");
-            }
             v[i] = m[0] * a + m[1] * b + ((op & 1) ? x : m[2]);
             v[i + 1] = m[3] * a + m[4] * b + ((op & 1) ? y : m[5]);
-            if (!gpu_sw_number(v[i]) || !gpu_sw_number(v[i + 1])) {
-                return gpu_sw_fail(w, "invalid transformed path coordinate");
+            if (!isfinite(v[i]) || !isfinite(v[i + 1])) {
+                goto empty;
             }
         }
         if (absolute_op == 2) {
@@ -338,6 +376,13 @@ static bool gpu_sw_path(BesGpuWork *w, const uint8_t *data, unsigned bytes,
         }
     }
     return gpu_sw_fail(w, "missing path END");
+empty:
+    /* The firmware builds some paths from values it has not computed yet
+     * (a chart with no samples hands over NaN corners). Such a path has no
+     * area: it covers no pixel and the rest of the command buffer renders. */
+    qemu_log_mask(LOG_GUEST_ERROR, "BES GPU path with non-finite coordinates drawn empty\n");
+    *count = 0;
+    return true;
 }
 
 static int gpu_sw_cross_compare(const void *a, const void *b)

@@ -113,9 +113,12 @@ import SwiftUI
                     Text("开机电量")
                     Spacer()
                     if let level = settings.battery?.level {
-                        Stepper("\(level)%", value: Binding(get: { level },
-                                                              set: { value in setBattery { $0.level = min(max(value, 0), 100) } }),
-                                in: 0...100, step: 5)
+                        TextField("电量", text: levelBinding).frame(width: 56)
+                            .multilineTextAlignment(.trailing)
+                            .accessibilityLabel("开机电量百分比")
+                        Stepper("%", value: Binding(get: { level },
+                                                    set: { value in setBattery { $0.level = min(max(value, 0), 100) } }),
+                                in: 0...100, step: 1)
                         Button("恢复默认") { setBattery { $0.level = nil } }
                     } else {
                         Text("固件默认").foregroundStyle(.secondary)
@@ -151,7 +154,7 @@ import SwiftUI
     private var batteryFooter: String {
         var lines: [String] = []
         if batteryInputs?.level == true {
-            lines.append("开机电量在下次开机时生效：写入固件自己保存的电量，并把电池电压采样设为对应的开路电压，之后由固件的电量计按自己的算法计算和显示（可能与设定值相差 1–2%）。")
+            lines.append("开机电量在下次开机时生效，之后由固件自己的电量计计算和显示。" + Self.batteryLevelNote(model: runtime.modelConstraint))
         } else {
             lines.append("此型号的开机电量尚未验证能驱动固件的电量计，因此不提供百分比设置，固件显示的电量保持其默认值。")
         }
@@ -160,6 +163,29 @@ import SwiftUI
         }
         lines.append("采样原始值是固件电池电压通路的原始计数，填写后优先于开机电量换算出的值。")
         return lines.joined(separator: "\n")
+    }
+
+    /// How the boot level reaches each preset's gauge (verified per firmware).
+    static func batteryLevelNote(model: String?) -> String {
+        let model = model ?? ""
+        if model.hasPrefix("miwear.watch.n66") || model.hasPrefix("miwear.watch.o66") {
+            return "此型号的电量计恢复保存的容量，并按“容量 × 1.055”显示；设置会按此换算写入保存的容量和对应的电池电压，显示值与设定值一致。"
+        }
+        if model.hasPrefix("miwear.watch.n67") || model.hasPrefix("miwear.watch.p67") {
+            return "此型号的电量计恢复保存的整数百分比，电池电压采样设为该电量对应的开路电压，显示值与设定值一致。"
+        }
+        if model.hasPrefix("miwear.watch.q66") || model == "q66" {
+            return "此型号冷启动时只按电池电压估算电量（不读取保存的电量），电压按 7 mV 一档取整，约 18 个设定值会显示为相差 1%。"
+        }
+        return "电池电压采样设为该电量对应的开路电压。"
+    }
+
+    private var levelBinding: Binding<String> {
+        Binding(get: { settings.battery?.level.map(String.init) ?? "" },
+                set: { text in
+                    guard let value = Int(text.trimmingCharacters(in: .whitespaces)), (0...100).contains(value) else { return }
+                    setBattery { $0.level = value }
+                })
     }
 
     private var healthSection: some View {
@@ -198,7 +224,14 @@ import SwiftUI
         guard let healthInputs, healthInputs.steps || healthInputs.heartRate else {
             return "此型号的运动与光学传感器尚未模拟，固件不会从这里得到步数或心率，因此不提供设置。"
         }
-        return "模拟核心按这里的数值产生运动传感器与光学传感器的原始数据，步数和心率由固件自己的算法计算并显示：开机后佩戴者按设定步频走完设定步数，心率在固件测量时读到设定脉搏。下次开机生效。"
+        var lines = ["模拟核心按这里的数值产生运动传感器与光学传感器的原始数据，步数和心率由固件自己的算法计算并显示；下次开机生效。"]
+        if healthInputs.steps {
+            lines.append("开机步行在开机约 75 秒、固件计步服务就绪后才开始；起步的几步用于识别步行，可能不计入。运行中也可以在“硬件输入”的实时控制里追加步行。")
+        }
+        if healthInputs.heartRate {
+            lines.append("心率在固件测量时读到设定脉搏（固件自身算法可能相差 1–3 次/分）；0 表示未佩戴。")
+        }
+        return lines.joined(separator: "\n")
     }
 
     private func setBattery(_ change: (inout InstanceFirmwareSettings.Battery) -> Void) {
@@ -342,6 +375,10 @@ import SwiftUI
 
     private func save(thenRestart: Bool) {
         var candidate = settings
+        if let bad = candidate.properties.first(where: { !InstanceFirmwareSettings.validKey($0.key)
+            || !($0.value.map(InstanceFirmwareSettings.validValue) ?? true) }) {
+            message = "属性 \(bad.key) 的值不能含换行或制表符，且不超过 1024 个字符。"; return
+        }
         if candidate.clock.mode == .offset {
             let offset = Int(customTime.timeIntervalSinceNow.rounded())
             guard abs(offset) <= InstanceFirmwareSettings.maximumOffsetSeconds else {
