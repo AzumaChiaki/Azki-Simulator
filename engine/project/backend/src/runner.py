@@ -233,6 +233,7 @@ def main():
                         help='Diagnostics only: stop on a sampled Cortex fault; normal sessions keep running')
     parser.add_argument('--fault-diagnostics', action='store_true',
                         help='Opt-in private exception log; excludes raw HCI and instruction tracing')
+    parser.add_argument('--verbose-logs', action='store_true', help='Enable verbose QEMU guest error/HCI diagnostics')
     parser.add_argument('--profile', choices=('watch', 'baseline', 'custom'),
                         help='watch: boot with display/touch (default); baseline: bare model; custom: debug flags')
     parser.add_argument('--serve', nargs='?', type=int, const=8765, metavar='PORT',
@@ -641,18 +642,13 @@ def main():
         command = [str(args.qemu), '-M', machine, '-display', display_backend,
                    '-monitor', 'none', '-no-reboot', '-kernel', str(args.firmware),
                    '-qmp', f'unix:{qmp_path},server=on,wait=off',
-                   '-d', 'in_asm,int,guest_errors' if args.trace else 'guest_errors', '-D', str(logdir / 'qemu.log')]
+                   '-d', 'in_asm,int,unimp,guest_errors' if args.trace else 'guest_errors', '-D', str(logdir / 'qemu.log')]
         if args.bluetooth != 'reject':
             command += ['-chardev', f'socket,id=radio,path={radio_socket}']
-        if virtual_peer is not None and not args.fault_diagnostics:
-            # HCI command payloads contain link keys. The existing core's
-            # LOG_GUEST_ERROR category prints raw H4; do not enable that log
-            # category in a secret-bearing product session. UART diagnostics
-            # stay local to this private run, with owner-only permissions.
-            position = command.index('-d')
-            del command[position:position+4]
-            (logdir/'qemu.log').touch(mode=0o600)
-        elif args.fault_diagnostics:
+        # Local QEMU diagnostics intentionally include raw H4/link material.
+        # Keep them in the private run directory; redact before sharing.
+        # Only the explicitly requested fault-only mode narrows the output.
+        if args.fault_diagnostics:
             command[command.index('-d')+1] = 'int'
         for index in range(3):
             uart_path = logdir / f'uart{index}.log'

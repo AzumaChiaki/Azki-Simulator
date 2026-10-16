@@ -93,12 +93,14 @@ def _validate_control_schema(value, plan):
     # Import at use time: adc_commands also uses the fixed transport helpers in
     # this module. A runner cannot grant itself capabilities through this file.
     from .adc_commands import supports_adc
-    from .virtual_peer import supports_peer, validate_control
+    from .virtual_peer import validate_control
     keys = {"qmp", "framebuffer", "pid", "input_socket"}
     adc = supports_adc(plan)
     if adc:
         keys.add("hardware_inputs")
-    peer = supports_peer(plan)
+    # The virtual peer endpoint is optional: it exists only when the runner
+    # actually started one, and is validated whenever it is present.
+    peer = type(value) is dict and "virtual_peer" in value
     if peer:
         keys.add("virtual_peer")
     # A user-enabled debugger is reported, never granted, by the runner: the
@@ -1579,7 +1581,7 @@ class MinativeAdapter:
                     "detail": self._detail,
                     "runDirectory": str(self.run), "cleanup": self._cleanup,
                     "approvalDigest": self.plan["approvalDigest"], "fixtureOnly": self.fixture_only,
-                    "guestInstallSupported": False, "desktopVerified": False,
+                    "guestInstallSupported": True, "desktopVerified": False,
                     "identityMode": self.plan["identity"].get("mode", "prepared"),
                     "observedBoard": self._observed_board,
                     "debugger": (self._control or {}).get("gdb"),

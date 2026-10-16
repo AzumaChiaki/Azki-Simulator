@@ -159,11 +159,12 @@ class LocalCentral:
             self.deadline = now + self.sar_timeout
             return frames
         if self.state == 'bind_info':
-            from .bind_info import Frames, request
+            from .bind_info import Frames, request, SYNTHETIC_USER_ID
             self.bind_frames = Frames()
             self.session['bindInfo'] = {'requested': True, 'received': False, 'transportAcknowledged': False, 'dynamicCodeCheck': self.bind_dynamic_code}
             frames = []
-            for cid, pdu in self._sar_writes(request(dynamic_code=self.bind_dynamic_code)):
+            user_id = SYNTHETIC_USER_ID if getattr(self, 'profile', {}).get('family') == 'p67' else None
+            for cid, pdu in self._sar_writes(request(dynamic_code=self.bind_dynamic_code, user_id=user_id)):
                 frames += self.link.from_peer(cid, pdu)
             self.state = 'wait_bind_info'
             self.deadline = now + self.connection_timeout

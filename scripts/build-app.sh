@@ -15,8 +15,10 @@ test -x "$engine/python/bin/python3.12"
 test -x "$engine/project/backend/build/qemu-system-arm"
 build="${AZKI_BUILD_DIR:-$root/.build}"
 cd "$root"
-/usr/bin/xcrun swift build --scratch-path "$build" -c release -j "${AZKI_BUILD_JOBS:-2}"
-bin="$(/usr/bin/xcrun swift build --scratch-path "$build" -c release --show-bin-path)"
+configuration="${AZKI_BUILD_CONFIGURATION:-release}"
+case "$configuration" in debug|release) ;; *) echo "Invalid build configuration: $configuration" >&2; exit 2 ;; esac
+/usr/bin/xcrun swift build --scratch-path "$build" -c "$configuration" -j "${AZKI_BUILD_JOBS:-2}"
+bin="$(/usr/bin/xcrun swift build --scratch-path "$build" -c "$configuration" --show-bin-path)"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/Firmware"
 cp "$bin/AzkiSimulator" "$app/Contents/MacOS/AzkiSimulator"
 /usr/bin/ditto "$engine" "$app/Contents/Resources/Engine"
@@ -31,7 +33,7 @@ sys.path.insert(0, str(resources / 'Runtime'))
 from azki_simulator.bundled_runtime import _manifest
 from azki_simulator.firmware_catalog import FirmwareCatalog
 from azki_simulator.instance_storage import checked_capabilities
-info = _manifest(resources / 'Engine')
+info = _manifest(resources / 'Engine', verify=True)
 record = info['files'][info['manifest']['entrypoints']['qemu']]
 checked_capabilities(info['manifest'], record['sha256'])
 catalog = FirmwareCatalog(resources / 'Firmware')

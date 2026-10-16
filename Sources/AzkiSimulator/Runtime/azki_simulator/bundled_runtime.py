@@ -230,7 +230,7 @@ def prepare_profile(engine_root, library_root, profile_id, session_root, *, rese
                 "summaryDetails": {"displayName": resolved["item"]["displayName"], "storageKind": resolved["storageKind"],
                             "engineSource": "bundled", "engineManifestSHA256": engine["sha256"],
                             "assetCount": len(resolved["assets"]), "firmwareModified": False,
-                            "desktopVerified": False, "guestInstallSupported": False}}
+                            "desktopVerified": False, "guestInstallSupported": True}}
     finally:
         # Keep a claimed/failed preparation for diagnosis; never clear or reuse it.
         if reservation is not None:

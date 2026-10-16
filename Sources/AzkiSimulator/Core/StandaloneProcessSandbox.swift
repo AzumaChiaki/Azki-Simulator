@@ -385,8 +385,13 @@ nonisolated enum StandaloneProcessSandbox {
         }
         if command != "prepare" { argv += ["--engine-root", runtime.engine.path, "--library-root", library.path] }
         let trees = try packagedReadTrees(runtime)
+        // Prepare derives an imported firmware's NOR layout by forking the
+        // bundled Python (multi_device --nor-layout); deny-default blocks fork
+        // unless granted, which would silently disable persistent NOR and the
+        // virtual peer for every generated profile.
+        let allowChildren = command == "prepare-bundled" || command == "prepare"
         let text = policy(executables: [runtime.python], readTrees: trees + [library], readFiles: inputs, writeTrees: writes,
-                          extraRules: extraRules)
+                          allowChildren: allowChildren, extraRules: extraRules)
         return StandaloneSandboxLaunch(policyText: text, arguments: [runtime.python.path, "-I", "-S", "-B", runtime.script.path] + argv,
             workingDirectory: temporary, temporaryDirectory: temporary)
     }

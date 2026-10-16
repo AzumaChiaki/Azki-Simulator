@@ -72,9 +72,9 @@ static int write_chunk(struct yaffs_dev *d, int chunk, const u8 *data, int len, 
     return YAFFS_OK;
 }
 
-static int open_image(const char *path, size_t *size)
+static int open_image(const char *path, size_t *size, int writing)
 {
-    int fd = open(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+    int fd = open(path, (writing ? O_RDWR : O_RDONLY) | O_NOFOLLOW | O_CLOEXEC);
     struct stat st;
     check(fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 1 &&
           st.st_uid == geteuid() && !(st.st_mode & 077), "private image open");
@@ -203,14 +203,16 @@ static void apply(unqlite *db, const char *path)
 
 int main(int argc, char **argv)
 {
-    if (!(argc == 4 && !strcmp(argv[3], "get")) && !(argc == 5 && !strcmp(argv[3], "set"))) {
-        fprintf(stderr, "Usage: instance-props DATA SPARE get | set CHANGES\n");
+    int extracting = argc == 6 && !strcmp(argv[3], "extract");
+    if (!(argc == 4 && !strcmp(argv[3], "get")) && !(argc == 5 && !strcmp(argv[3], "set")) && !extracting) {
+        fprintf(stderr, "Usage: instance-props DATA SPARE get | set CHANGES | extract /nand/PATH OUTPUT\n");
         return 2;
     }
     int writing = argc == 5;
+    if (extracting && (strncmp(argv[4], "/nand/", 6) || strstr(argv[4], ".."))) return 2;
     size_t spare_size;
-    int data_fd = open_image(argv[1], &storage_size);
-    int spare_fd = open_image(argv[2], &spare_size);
+    int data_fd = open_image(argv[1], &storage_size, writing);
+    int spare_fd = open_image(argv[2], &spare_size, writing);
     check(storage_size >= 8u << 20 && storage_size <= 512u << 20 && storage_size % BLOCK == 0 &&
           spare_size == storage_size / 2048 * 64, "image geometry");
     storage = malloc(storage_size);
@@ -218,6 +220,12 @@ int main(int argc, char **argv)
     check(storage && dirty, "allocation");
     check(pread(data_fd, storage, storage_size, 0) == (ssize_t)storage_size, "image read");
     mount_image();
+    if (extracting) {
+        int present = extract(argv[4], argv[5]);
+        check(yaffs_unmount("/nand") == 0, "unmount");
+        close(data_fd); close(spare_fd);
+        return present ? 0 : 3;
+    }
 
     /* The sandboxed runner grants only its own TMPDIR. */
     const char *tmp = getenv("TMPDIR");

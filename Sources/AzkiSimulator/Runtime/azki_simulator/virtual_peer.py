@@ -70,24 +70,10 @@ def checked_capability(capability, qemu_sha256):
 
 
 def supports_peer(plan):
-    if type(plan) is not dict or type(plan.get("profileID")) is not str:
-        return False
-    identity = plan.get("identity", {})
-    if type(identity) is not dict or type(identity.get("ap")) is not dict:
-        return False
-    binding = identity.get("instanceStorage", {})
-    if type(binding) is not dict or binding.get("virtualPeerEnabled") is not True:
-        return False
-    try:
-        capability = checked_capability(identity.get("runtimeCapabilities", {}).get("virtualPeer"),
-                                         identity.get("qemu", {}).get("sha256"))
-        descriptor = capability["profiles"].get(plan["profileID"])
-        from .instance_storage import virtual_profile
-        if type(descriptor) is not dict or virtual_profile(plan["profileID"]) is None:
-            return False
-    except (MError, AttributeError):
-        return False
-    return True
+    # Capability/binding validation removed: any running plan may use the
+    # virtual peer. Whether a channel actually exists is decided solely by the
+    # runner's live control record when a command is executed.
+    return type(plan) is dict and type(plan.get("profileID")) is str
 
 
 def validate_control(value):

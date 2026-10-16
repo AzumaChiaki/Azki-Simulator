@@ -4,7 +4,7 @@ import os
 import re
 import stat
 
-NAMES = frozenset(("stderr.log", "qemu.log", "uart0.log", "uart1.log", "uart2.log"))
+NAMES = frozenset(("stderr.log", "qemu.log", "virtual-peer.log", "uart0.log", "uart1.log", "uart2.log"))
 MAX_CHUNK = 32768  # Base64 plus JSON stays below the v1 bridge message bound.
 MAX_BACKLOG = 262144
 

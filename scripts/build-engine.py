@@ -23,7 +23,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 INPUT = ROOT / 'engine'
 QEMU_VERSION = '10.1.0'
-PYTHON_VERSION = '3.12.10'
+PYTHON_VERSION = '3.12.12'
 PACKAGES = {'pillow': '12.3.0', 'littlefs-python': '0.19.0'}
 MAGIC = {bytes.fromhex(v) for v in ('feedface','cefaedfe','feedfacf','cffaedfe','cafebabe','bebafeca','cafebabf','bfbafeca')}
 
@@ -221,7 +221,8 @@ def main():
     pbuild=work/'python-build';pbuild.mkdir(exist_ok=True)
     pyinstall=work/'python-install'
     if not (pbuild/'Makefile').exists():
-        run([psource/'configure','--prefix='+str(pyinstall),'--with-ensurepip=no','--disable-test-modules'],cwd=pbuild,env=env)
+        run([psource/'configure','--prefix='+str(pyinstall),'--with-ensurepip=no','--disable-test-modules',
+             '--with-openssl='+output([brew,'--prefix','openssl@3'])],cwd=pbuild,env=env)
     run(['make','-j',args.jobs],cwd=pbuild,env=env)
     run(['make','install'],cwd=pbuild,env=env)
     wheels=work/'wheels';wheels.mkdir(exist_ok=True)

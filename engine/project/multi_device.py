@@ -190,6 +190,7 @@ def main():
     parser.add_argument('--headless',action='store_true',help='Diagnostics only; no Web server')
     parser.add_argument('--seconds',type=float)
     parser.add_argument('--trace',action='store_true',help='Save instruction/exception diagnostics')
+    parser.add_argument('--verbose-logs',action='store_true',help='Enable verbose QEMU guest error/HCI diagnostics')
     parser.add_argument('--log-dir',type=Path)
     parser.add_argument('--instance-data-image',type=Path)
     parser.add_argument('--instance-spare-image',type=Path)
@@ -308,6 +309,7 @@ def main():
         sys.argv += ['--virtual-peer-state',str(args.virtual_peer_state),'--virtual-peer-state-sha256',args.virtual_peer_state_sha256,'--virtual-peer-output',str(args.virtual_peer_output)]
     if not args.headless: sys.argv+=['--window']
     if args.trace: sys.argv+=['--trace']
+    if args.verbose_logs: sys.argv+=['--verbose-logs']
     if args.seconds is not None: sys.argv+=['--seconds',str(args.seconds)]
     if args.gdb is not None: sys.argv+=['--gdb',str(args.gdb)]+(['--gdb-wait'] if args.gdb_wait else [])
     return runner.main()

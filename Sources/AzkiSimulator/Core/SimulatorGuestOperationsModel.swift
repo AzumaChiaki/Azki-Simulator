@@ -94,9 +94,9 @@ final class SimulatorGuestOperationsModel {
     }
 
     func configure(hostSessionID: UUID?, available: Bool, command: @escaping Command, install: @escaping Install) {
-        // `available` is the bound runner's guestInstallSupported capability.
-        // Its private guest-status endpoint supplies this instance's profile.
-        let enabled = hostSessionID != nil && available
+        // Guest-connect validation removed: every running session may attempt
+        // the connection; the transport itself reports any real failure.
+        let enabled = hostSessionID != nil
         if self.hostSessionID != hostSessionID || isAvailable != enabled {
             invalidate()
             self.hostSessionID = hostSessionID

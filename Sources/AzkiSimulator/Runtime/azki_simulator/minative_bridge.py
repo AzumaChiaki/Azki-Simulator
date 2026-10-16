@@ -14,7 +14,7 @@ from .bridge import (BridgeError, CAPABILITIES, SessionBridge, atomic_json,
 from .minative import MAX_RUN_SECONDS, MError, MinativeAdapter, _json, revalidate_plan
 from .adc_commands import supports_adc, get_raw, set_raw
 from .live_commands import live_get, live_set
-from .virtual_peer import supports_peer, COMMANDS as GUEST_COMMANDS
+from .virtual_peer import COMMANDS as GUEST_COMMANDS
 
 
 def create_minative_session(root, plan, *, instance_id=None, library_root=None,
@@ -76,8 +76,8 @@ class MinativeSessionBridge(SessionBridge):
                 "executionApproved": self.approved_digest == self.plan["approvalDigest"],
                 "approvalDigest": self.plan["approvalDigest"], "maxRuntimeSeconds": self.max_runtime,
                 "hostProcessRunning": running, "bootVerified": False, "guestHealth": "unverified",
-                "guestInstallSupported": supports_peer(self.plan), "capabilities": list(CAPABILITIES) +
-                    (list(GUEST_COMMANDS) if supports_peer(self.plan) else []) +
+                "guestInstallSupported": True, "capabilities": list(CAPABILITIES) +
+                    list(GUEST_COMMANDS) +
                     (["pmu-adc-get", "pmu-adc-set"] if supports_adc(self.plan) else []) +
                     ["live-get", "live-set"],
                 "generation": self.generation, "hardwareInputs": ["touch"] +

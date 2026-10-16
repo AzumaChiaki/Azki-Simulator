@@ -52,7 +52,7 @@ import UniformTypeIdentifiers
     private var allFilesSelected: Bool { runtime.qemuURL != nil && runtime.firmwareURL != nil && runtime.resourceURL != nil }
     private var displayGeometry: SimulatorDisplayGeometry? { session.manifest?.displayGeometry }
     private var logsVisible: Bool { presentation == .controlsAndLogs || showingLogs }
-    private var guestAvailable: Bool { session.isRunning && session.status?["guestInstallSupported"]?.bool == true }
+    private var guestAvailable: Bool { session.isRunning }
     private var guestContext: String { "\(session.manifest?.id.uuidString ?? "none")/\(guestAvailable)" }
     private var sessionRunLimit: Int? {
         guard let value = session.status?["maxRuntimeSeconds"], case .number(let seconds) = value,
@@ -239,51 +239,6 @@ import UniformTypeIdentifiers
         VStack(spacing: 0) {
             firmwareLibrarySection
             SimulatorSectionDivider()
-            if runtime.instanceID != nil {
-                SimulatorSection(title: "设备数据", icon: "sensor") {
-                    SimulatorDeviceDataView(runtime: runtime, session: session, enabled: controlsAvailable) {
-                        editingFirmwareSettings = true
-                    }
-                    SimulatorActionFlow {
-                        action("冷重启", icon: "arrow.clockwise.circle", enabled: controlsAvailable && runtime.isServing) {
-                            Task { await recording.stop(); await runtime.coldRestart() }
-                        }
-                        .accessibilityIdentifier("simulator.cold-restart")
-                    }
-                }
-                SimulatorSectionDivider()
-            }
-            DisclosureGroup(isExpanded: $showingSharing) {
-                SimulatorActionFlow {
-                    action("启用 Studio 连接", icon: "link", enabled: canEnableSharing) {
-                        Task {
-                            guard canEnableSharing else { return }
-                            await sharing.enable()
-                        }
-                    }
-                    .accessibilityIdentifier("simulator.enable-status-sharing")
-                    action("停止共享", icon: "eject", enabled: Self.canStopSharing(sharing)) {
-                        Task { await sharing.disable() }
-                    }
-                    .accessibilityIdentifier("simulator.disable-status-sharing")
-                }
-                Text(sharing.isSharing ? "Studio 可扫描连接并推送表盘" : sharing.sessionURL != nil ? "目录清理待重试" : "启用后，Studio 会自动扫描；扫描失败时可选择共享目录。")
-                    .foregroundStyle(SimulatorTheme.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let url = sharing.sessionURL {
-                    Text(url.path).font(.system(size: 12, design: .monospaced))
-                        .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                        .accessibilityIdentifier("simulator.status-sharing-directory")
-                }
-                Text("支持状态、日志与表盘文件接收；尚不支持客体安装运行。接收文件随共享停止清理。共享期间不能启动核心。")
-                    .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if sharing.isBusy { ProgressView().controlSize(.small).accessibilityLabel("正在更新 Studio 连接") }
-            } label: {
-                Label("Studio 连接", systemImage: "folder").font(.headline)
-            }.padding(SimulatorTheme.inset)
-                .help("只读状态共享不支持虚拟设备发现或配对")
-            SimulatorSectionDivider()
             SimulatorSection(title: "会话", icon: "desktopcomputer") {
                 HStack {
                     Text("连接超时（秒）")
@@ -407,6 +362,119 @@ import UniformTypeIdentifiers
                 }
             }
             SimulatorSectionDivider()
+            SimulatorSection(title: "应用与表盘", icon: "shippingbox") {
+                SimulatorActionFlow {
+                    action("连接虚拟手环", icon: "link", enabled: guestOperations.canConnect) {
+                        Task { await guestOperations.connect() }
+                    }
+                    .help("连接此实例的本机虚拟通信通道")
+                    .accessibilityIdentifier("simulator.guest.connect")
+                    action("安装…", icon: "square.and.arrow.down", enabled: guestOperations.canInstall) {
+                        installSelectionHost = session.manifest?.id
+                        installSelectionPeer = guestOperations.identity
+                        choose(.installGuestPackage)
+                    }
+                        .accessibilityIdentifier("simulator.install")
+                }
+                Text(session.isRunning ? guestOperations.connectionLabel : "运行设备后可连接")
+                    .font(.system(size: 12)).accessibilityIdentifier("simulator.guest.connection-state")
+                    .foregroundStyle(SimulatorTheme.secondary)
+                if guestOperations.isAuthenticated {
+                    HStack {
+                        Picker("表盘", selection: $guestOperations.selectedWatchfaceID) {
+                            Text(guestOperations.inventoryLoaded ? "选择表盘" : "正在读取…").tag(Optional<String>.none)
+                            ForEach(guestOperations.inventory) { face in
+                                Text("\(face.name)\(face.isCurrent ? " · 当前" : "")").tag(Optional(face.id))
+                            }
+                        }.disabled(guestOperations.isBusy)
+                            .accessibilityIdentifier("simulator.guest.watchface-picker")
+                        Button { Task { await guestOperations.loadInventory() } } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }.disabled(!guestOperations.canRefresh).help("刷新设备表盘")
+                            .accessibilityLabel("刷新设备表盘")
+                    }
+                    action("使用表盘", icon: "checkmark.circle", enabled: guestOperations.canSelect) {
+                        Task { await guestOperations.selectWatchface() }
+                    }.accessibilityIdentifier("simulator.guest.select")
+                    applicationInventory
+                }
+                if let progress = guestOperations.progressLabel {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(progress)
+                    }.font(.system(size: 12)).accessibilityIdentifier("simulator.guest.progress")
+                } else if let result = guestOperations.resultMessage {
+                    Text(result).font(.system(size: 12)).accessibilityIdentifier("simulator.guest.result")
+                }
+                if let error = guestOperations.errorMessage {
+                    Text(error).font(.system(size: 12)).foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                        .accessibilityIdentifier("simulator.guest.error")
+                }
+                DisclosureGroup("安装包检查与暂存") {
+                    SimulatorActionFlow {
+                        action("检查安装包", icon: "doc.text.magnifyingglass", enabled: controlsAvailable && session.isAttached) { choose(.inspectPackage) }
+                        action("暂存安装包", icon: "tray.and.arrow.down", enabled: controlsAvailable && session.isAttached) { choose(.stagePackage) }
+                    }
+                    Text("仅处理宿主文件，不会安装到设备。")
+                        .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
+                }
+                if !session.packageReport.isEmpty {
+                    DisclosureGroup("检查与暂存结果", isExpanded: $showingPackageReport) {
+                        Text(session.packageReport)
+                            .font(.system(size: 12, design: .monospaced))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+            SimulatorSectionDivider()
+            if runtime.instanceID != nil {
+                SimulatorSection(title: "设备数据", icon: "sensor") {
+                    SimulatorDeviceDataView(runtime: runtime, session: session, enabled: controlsAvailable) {
+                        editingFirmwareSettings = true
+                    }
+                    SimulatorActionFlow {
+                        action("冷重启", icon: "arrow.clockwise.circle", enabled: controlsAvailable && runtime.isServing) {
+                            Task { await recording.stop(); await runtime.coldRestart() }
+                        }
+                        .accessibilityIdentifier("simulator.cold-restart")
+                    }
+                }
+                SimulatorSectionDivider()
+            }
+            DisclosureGroup(isExpanded: $showingSharing) {
+                SimulatorActionFlow {
+                    action("启用 Studio 连接", icon: "link", enabled: canEnableSharing) {
+                        Task {
+                            guard canEnableSharing else { return }
+                            await sharing.enable()
+                        }
+                    }
+                    .accessibilityIdentifier("simulator.enable-status-sharing")
+                    action("停止共享", icon: "eject", enabled: Self.canStopSharing(sharing)) {
+                        Task { await sharing.disable() }
+                    }
+                    .accessibilityIdentifier("simulator.disable-status-sharing")
+                }
+                Text(sharing.isSharing ? "Studio 可扫描连接并推送表盘" : sharing.sessionURL != nil ? "目录清理待重试" : "启用后，Studio 会自动扫描；扫描失败时可选择共享目录。")
+                    .foregroundStyle(SimulatorTheme.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let url = sharing.sessionURL {
+                    Text(url.path).font(.system(size: 12, design: .monospaced))
+                        .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("simulator.status-sharing-directory")
+                }
+                Text("支持状态、日志与表盘文件接收；尚不支持客体安装运行。接收文件随共享停止清理。共享期间不能启动核心。")
+                    .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if sharing.isBusy { ProgressView().controlSize(.small).accessibilityLabel("正在更新 Studio 连接") }
+            } label: {
+                Label("Studio 连接", systemImage: "folder").font(.headline)
+            }.padding(SimulatorTheme.inset)
+                .help("只读状态共享不支持虚拟设备发现或配对")
+            SimulatorSectionDivider()
             SimulatorSection(title: "高级调试", icon: "slider.horizontal.3") {
                 SimulatorActionFlow {
                     action("采集调试信息", icon: "waveform.path.ecg", enabled: session.isAttached) { captureDebug(export: false) }
@@ -513,73 +581,6 @@ import UniformTypeIdentifiers
                 }
             }
             SimulatorSectionDivider()
-            SimulatorSection(title: "应用与表盘", icon: "shippingbox") {
-                SimulatorActionFlow {
-                    action("连接虚拟手环", icon: "link", enabled: guestOperations.canConnect) {
-                        Task { await guestOperations.connect() }
-                    }
-                    .help("连接此实例的本机虚拟通信通道")
-                    .accessibilityIdentifier("simulator.guest.connect")
-                    action("安装…", icon: "square.and.arrow.down", enabled: guestOperations.canInstall) {
-                        installSelectionHost = session.manifest?.id
-                        installSelectionPeer = guestOperations.identity
-                        choose(.installGuestPackage)
-                    }
-                        .accessibilityIdentifier("simulator.install")
-                }
-                Text(session.isRunning ? guestOperations.connectionLabel : "运行设备后可连接")
-                    .font(.system(size: 12)).accessibilityIdentifier("simulator.guest.connection-state")
-                    .foregroundStyle(SimulatorTheme.secondary)
-                if guestOperations.isAuthenticated {
-                    HStack {
-                        Picker("表盘", selection: $guestOperations.selectedWatchfaceID) {
-                            Text(guestOperations.inventoryLoaded ? "选择表盘" : "正在读取…").tag(Optional<String>.none)
-                            ForEach(guestOperations.inventory) { face in
-                                Text("\(face.name)\(face.isCurrent ? " · 当前" : "")").tag(Optional(face.id))
-                            }
-                        }.disabled(guestOperations.isBusy)
-                            .accessibilityIdentifier("simulator.guest.watchface-picker")
-                        Button { Task { await guestOperations.loadInventory() } } label: {
-                            Image(systemName: "arrow.clockwise")
-                        }.disabled(!guestOperations.canRefresh).help("刷新设备表盘")
-                            .accessibilityLabel("刷新设备表盘")
-                    }
-                    action("使用表盘", icon: "checkmark.circle", enabled: guestOperations.canSelect) {
-                        Task { await guestOperations.selectWatchface() }
-                    }.accessibilityIdentifier("simulator.guest.select")
-                    applicationInventory
-                }
-                if let progress = guestOperations.progressLabel {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text(progress)
-                    }.font(.system(size: 12)).accessibilityIdentifier("simulator.guest.progress")
-                } else if let result = guestOperations.resultMessage {
-                    Text(result).font(.system(size: 12)).accessibilityIdentifier("simulator.guest.result")
-                }
-                if let error = guestOperations.errorMessage {
-                    Text(error).font(.system(size: 12)).foregroundStyle(.red)
-                        .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
-                        .accessibilityIdentifier("simulator.guest.error")
-                }
-                DisclosureGroup("安装包检查与暂存") {
-                    SimulatorActionFlow {
-                        action("检查安装包", icon: "doc.text.magnifyingglass", enabled: controlsAvailable && session.isAttached) { choose(.inspectPackage) }
-                        action("暂存安装包", icon: "tray.and.arrow.down", enabled: controlsAvailable && session.isAttached) { choose(.stagePackage) }
-                    }
-                    Text("仅处理宿主文件，不会安装到设备。")
-                        .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
-                }
-                if !session.packageReport.isEmpty {
-                    DisclosureGroup("检查与暂存结果", isExpanded: $showingPackageReport) {
-                        Text(session.packageReport)
-                            .font(.system(size: 12, design: .monospaced))
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-            }
             if presentation == .full, showingLogs {
                 SimulatorSectionDivider()
                 logPanel.frame(height: 340)
@@ -627,6 +628,7 @@ import UniformTypeIdentifiers
                     Text("UART 1").tag("uart1.log")
                     Text("UART 2").tag("uart2.log")
                     Text("QEMU").tag("qemu.log")
+                    Text("虚拟手环连接").tag("virtual-peer.log")
                     Text("标准错误").tag("stderr.log")
                 }.fixedSize().disabled(!session.isAttached)
                 Toggle("跟随最新日志", isOn: $followLogBottom).toggleStyle(.checkbox)

@@ -9,10 +9,19 @@ import struct
 from .central import crc16
 
 
-def request(random_bytes=secrets.token_bytes, dynamic_code=0):
+SYNTHETIC_USER_ID = b'azki-synthetic-user'
+
+
+def request(random_bytes=secrets.token_bytes, dynamic_code=0, user_id=None):
     if type(dynamic_code) is not int or dynamic_code not in (0, 1):
         raise ValueError('Dynamic-code check flag must be 0 or 1')
-    nonce = random_bytes(16)
+    # P67 compares this optional field with MD5(miwear_user_id). It is
+    # an account selector, not a fresh challenge nonce.
+    if user_id is not None:
+        import hashlib
+        nonce = hashlib.md5(user_id).digest()
+    else:
+        nonce = random_bytes(16)
     if not isinstance(nonce, bytes) or len(nonce) != 16:
         raise ValueError('Fresh synthetic nonce generation failed')
     payload = bytes.fromhex('0101080110111a165a1408') + bytes((dynamic_code,)) + b'\x12\x10' + nonce

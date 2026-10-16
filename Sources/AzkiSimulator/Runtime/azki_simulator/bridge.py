@@ -570,7 +570,7 @@ class SessionBridge:
         if len(os.fsencode(self.run_root / "qmp.sock")) > 103:
             self.stop()
             raise BridgeError("unsafe_session", "Run socket path is too long; use a shorter session path")
-        outputs = [self.run_root / name for name in ("stderr.log", "qemu.log", "uart0.log", "uart1.log", "uart2.log", "qmp.sock")]
+        outputs = [self.run_root / name for name in ("stderr.log", "qemu.log", "virtual-peer.log", "uart0.log", "uart1.log", "uart2.log", "qmp.sock")]
         args = [sys.executable, "-I", "-S", str(Path(__file__).with_name("launch.py")), str(self.max_runtime),
                 str(self.root / "core-process.json"), str(os.getpid()),
                 "/usr/bin/sandbox-exec", "-p", sandbox_profile(self.run_root, paths.values(), self.root / "frame.raw", outputs,
@@ -615,7 +615,7 @@ class SessionBridge:
             if self.max_runtime and time.monotonic() - started >= self.max_runtime:
                 reason = "runtime_limit_reached"
             try:
-                for name in ("stderr.log", "qemu.log", "uart0.log", "uart1.log", "uart2.log"):
+                for name in ("stderr.log", "qemu.log", "virtual-peer.log", "uart0.log", "uart1.log", "uart2.log"):
                     path = run_root / name
                     info = path.lstat() if path.exists() else None
                     if info and (not stat.S_ISREG(info.st_mode) or info.st_size > MAX_LOG):
@@ -731,7 +731,7 @@ class SessionBridge:
                     from .log_stream import read_chunk
                     return read_chunk(self.run_root, args)
                 name = args.get("name", "stderr.log")
-                if name not in ("stderr.log", "qemu.log", "uart0.log", "uart1.log", "uart2.log"):
+                if name not in ("stderr.log", "qemu.log", "virtual-peer.log", "uart0.log", "uart1.log", "uart2.log"):
                     raise BridgeError("invalid_request", "Unknown log")
                 path = self.run_root / name if self.run_root else None
                 if path is None or not path.exists():

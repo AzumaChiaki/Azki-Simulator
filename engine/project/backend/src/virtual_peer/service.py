@@ -158,10 +158,14 @@ class PeerService:
         self.closed = False
         self.last_log_state = None
         self.last_diagnostic = None
+        self.log_path = self.run / 'virtual-peer.log'
+        self.log_path.touch(mode=0o600, exist_ok=True)
+        self.log_path.chmod(0o600)
         self.replay = OrderedDict()
         self.external = None
 
     def _confirmed(self, binding):
+        self._log('authenticated link_encryption_and_smp_verified')
         candidate = {**self.private_state, 'binding':dict(binding),
                      'guestLinkBond':{key:binding[key] for key in ('ltk','random','ediv')}}
         self.output_sha256 = write_pending(self.output,candidate,binding)
@@ -170,6 +174,15 @@ class PeerService:
     def _central(self):
         return AuthenticationCentral(self.controller,self.private_state,self._confirmed,
                                      connection_timeout=self.connection_timeout)
+
+    def _log(self, message):
+        import time
+        line = '[' + str(round(time.monotonic(), 3)) + '] ' + str(message)[:2048] + '\n'
+        try:
+            with self.log_path.open('a', encoding='utf-8') as stream:
+                stream.write(line)
+        except OSError:
+            pass
 
     def state_receipt(self):
         return {'inputStateSHA256':self.input_sha256,'outputStateSHA256':self.output_sha256,
@@ -240,7 +253,7 @@ class PeerService:
         if value is None or value == self.last_diagnostic:return
         # Fixed code/enumeration/integer metadata only, never exception text.
         self.last_diagnostic=dict(value)
-        print('Virtual peer failure: '+json.dumps(value,separators=(',',':')),flush=True)
+        self._log('failure '+json.dumps(value,separators=(',',':')))
         temporary=self.run/('.virtual-peer-diagnostic-'+os.urandom(8).hex()+'.tmp')
         try:
             fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
@@ -395,12 +408,14 @@ class PeerService:
                         self._save_external_bond()
                     else:
                         self._send(self.central.tick(guest_now))
+                        while self.central.auth_events:
+                            self._log('auth ' + json.dumps(self.central.auth_events.popleft(), separators=(',', ':')))
                         self.operations.tick()
                     phase = self._phase()
                     operation = self.operations.status()["operation"]
-                    log_state = (phase, operation.get("kind") if operation else None, operation.get("phase") if operation else None)
+                    log_state = (phase, operation.get("kind") if operation else None, operation.get("phase") if operation else None, self.central.state, self.central.auth_stage, self.controller.generation)
                     if log_state != self.last_log_state:
-                        print("Virtual peer: " + phase + ("; operation="+str(log_state[1])+"; phase="+str(log_state[2]) if operation else ""), flush=True)
+                        self._log('state ' + json.dumps(log_state) + '; authenticated=' + str(self.central.authenticated))
                         self.last_log_state = log_state
                     if self.tx:
                         try:
@@ -420,6 +435,7 @@ class PeerService:
                                 if not self.core_ready.wait(2) or pid != self.core_pid or self.connection is not None:
                                     raise ValueError('Unexpected guest HCI peer')
                                 client.setblocking(False); self.connection = client
+                                self._log('transport connected; awaiting bind info')
                                 self.selector.register(client,selectors.EVENT_READ,'hci')
                             else:
                                 if len(self.clients)>=2: raise ValueError('Peer client bound')

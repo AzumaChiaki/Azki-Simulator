@@ -93,6 +93,9 @@ def native_invocation(arguments):
     # Optional user-requested debugger, appended last by the native parent:
     # --gdb PORT [--gdb-wait]. PORT 0 lets QEMU pick a free loopback port.
     debugger = []
+    verbose_logs = False
+    if arguments and arguments[-1] == "--verbose-logs":
+        verbose_logs = True; arguments = arguments[:-1]
     if arguments and arguments[-1] == "--gdb-wait":
         debugger, arguments = ["--gdb-wait"], arguments[:-1]
     if len(arguments) >= 2 and arguments[-2] == "--gdb":
@@ -159,7 +162,7 @@ def native_invocation(arguments):
         if len(core_arguments) < 16 or settings[1] != str(run.parent / "instance-data/instance-settings.json"):
             raise ValueError("Native instance settings differ from the private session file")
         command += settings
-    return duration, metadata, parent, command + oobe + debugger
+    return duration, metadata, parent, command + oobe + debugger + (["--verbose-logs"] if verbose_logs else [])
 
 
 def await_native_go(parent, stopped, *, descriptor=0, timeout=2):

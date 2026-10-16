@@ -232,6 +232,27 @@ def _create_virtual_state(project, instance_id, *, profile_id=NOR_PROFILE, ap_sh
             sys.modules.pop(name, None)
 
 
+def _capability_profile_id(profiles, profile_id, ap_sha256):
+    """Exact capability key for a profile, or the verified entry pinning its AP.
+
+    An imported OTA runs as a generated profile ID, so a table keyed by
+    catalog profile IDs never matches it. Its AP image, however, is the exact
+    bytes a verified entry pinned: when this profile's model has an entry
+    whose apSHA256 equals the selected AP's digest, that entry's verified
+    layout applies to this firmware too.
+    """
+    if type(profile_id) is str and profile_id in profiles:
+        return profile_id
+    if type(profile_id) is not str or not _hex(ap_sha256, 64):
+        return None
+    model = profile_id.split("@", 1)[0]
+    for key, entry in profiles.items():
+        if (type(key) is str and key.split("@", 1)[0] == model
+                and type(entry) is dict and entry.get("apSHA256") == ap_sha256):
+            return key
+    return None
+
+
 def _nor_capability(capability, profile_id, ap_sha256, qemu_sha256):
     if type(profile_id) is not str or not profile_in_scope(profile_id):
         raise ValueError("NOR capability profile is outside the Mi Band scope")
@@ -923,8 +944,10 @@ def _firmware(plan, capability):
         raise ValueError("Invalid declared NAND format table")
     nor_capability = identity.get("runtimeCapabilities", {}).get("norPersistence")
     nor = None
-    if nor_capability is not None and plan["profileID"] in nor_capability["profiles"]:
-        nor = _nor_capability(nor_capability, plan["profileID"], identity["ap"]["sha256"], identity["qemu"]["sha256"])
+    nor_key = (_capability_profile_id(nor_capability["profiles"], plan["profileID"], identity["ap"]["sha256"])
+               if nor_capability is not None else None)
+    if nor_key is not None:
+        nor = _nor_capability(nor_capability, nor_key, identity["ap"]["sha256"], identity["qemu"]["sha256"])
         ap = data if data is not None else _read(Path(identity["ap"]["path"]), 64 * 1024 * 1024)
         if len(ap) != nor["apBytes"]:
             raise ValueError("NOR AP declared size differs from layout")
@@ -1094,7 +1117,10 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
         if virtual_capability is not None:
             from .virtual_peer import checked_capability
             checked_capability(virtual_capability, plan["identity"]["qemu"]["sha256"])
-            virtual_layout = virtual_capability.get("profiles", {}).get(firmware.profile)
+            virtual_key = _capability_profile_id(virtual_capability.get("profiles", {}),
+                                                 firmware.profile, firmware.nor_ap_sha256)
+            virtual_layout = (virtual_capability.get("profiles", {}).get(virtual_key)
+                              if virtual_key is not None else None)
             virtual_enabled = (virtual_profile(firmware.profile) is not None and bool(firmware.nor_bytes)
                 and type(virtual_layout) is dict
                 and _hex(virtual_layout.get("apSHA256"), 64))
@@ -1203,8 +1229,12 @@ def validate_binding(binding, *, project, profile_id, model, qemu_sha256, capabi
         raise ValueError("Instance storage differs from exact session/core/model")
     nor = None
     if binding["norPersistent"]:
-        nor = _nor_capability(nor_capability, profile_id, ap_sha256, qemu_sha256)
-        source_layout = nor_capability["profiles"][profile_id]
+        nor_key = (_capability_profile_id(nor_capability["profiles"], profile_id, ap_sha256)
+                   if nor_capability is not None else None)
+        if nor_key is None:
+            raise ValueError("NOR capability lacks this exact firmware profile")
+        nor = _nor_capability(nor_capability, nor_key, ap_sha256, qemu_sha256)
+        source_layout = nor_capability["profiles"][nor_key]
         legacy_nor = set(source_layout) == {"apSHA256", "offset", "bytes", "factoryOffset"}
         if (type(binding.get("norInitialize")) is not bool or type(binding.get("norOffset")) is not int
                 or type(binding.get("norBytes")) is not int

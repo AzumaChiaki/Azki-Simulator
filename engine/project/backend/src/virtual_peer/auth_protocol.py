@@ -12,7 +12,7 @@ import stat
 import struct
 from pathlib import Path
 from .auth_crypto import P256, AESModes, hkdf, mac
-from .bind_info import Frames, fields, inspect, encode
+from .bind_info import Frames, fields, inspect, encode, SYNTHETIC_USER_ID
 from .central import LocalCentral
 from .business_session import BusinessChannel
 from .smp import LegacyCentral
@@ -67,7 +67,7 @@ class AuthenticationCentral(LocalCentral):
             self.firmware_models+=('miwear.watch.p67cn',)
         if self.profile['protocol'] not in ('miwear-psk1-q66', 'miwear-psk1-literal16') or self.profile['requiresSMPBond'] is not True:
             raise ValueError('Unsupported synthetic authentication protocol')
-        super().__init__(controller,bind_info=True,connection_timeout=connection_timeout)
+        super().__init__(controller,bind_info=True,bind_dynamic_code=0,connection_timeout=connection_timeout)
         self.reconnect_delay=3.0
         self.private_state=private_state
         self.on_confirm=on_confirm
@@ -111,6 +111,7 @@ class AuthenticationCentral(LocalCentral):
             elif message.startswith('Guest ATT error'):code='guest_att_error'
             elif message == 'Guest DeviceConfirm did not confirm':code='guest_confirm_rejected'
             elif message == 'Guest confirmation lacks verified link encryption and bond':code='link_encryption_missing'
+            elif message.startswith('Guest BindInfo rejected'):code='bind_info_rejected'
             elif message == 'Guest identity differs from its synthetic state':code='synthetic_identity_mismatch'
             elif message == 'Guest verify mode differs from its synthetic profile':code='verify_mode_mismatch'
             elif 'SMP' in message:code='smp_rejected'
@@ -250,6 +251,8 @@ class AuthenticationCentral(LocalCentral):
                 if self.state=='wait_bind_info':
                     address=':'.join(f'{v:02x}' for v in self.controller.address)
                     self.session['bindInfo'].update(inspect(payload,self.private_state['identity']['serial'],address,self.private_state['identity']['did'],model=self.profile['model'],model_aliases=self.firmware_models))
+                    if not self.session['bindInfo'].get('accepted'):
+                        raise ValueError('Guest BindInfo rejected: ' + str(self.session['bindInfo'].get('guestError')))
                     if not all(self.session['bindInfo'].get(k) for k in ('accepted','serialMatchesSyntheticSeed','addressMatchesSyntheticSeed','modelMatchesFirmwareProfile','didMatchesSyntheticSeed')):
                         raise ValueError('Guest identity differs from its synthetic state')
                     info=decode(payload[2:],17,12)
@@ -315,7 +318,7 @@ class AuthenticationCentral(LocalCentral):
                 raise ValueError('Guest binding signature mismatch')
             self.auth_events.append({'stage':'bind_confirm','guestSignatureVerified':True})
             companion=integer(1,self.companion_platform)+blob(3,b'Azki Synthetic Apple BLE Peer')+blob(5,b'CN')
-            record=blob(1,b'azki-synthetic-user')+blob(2,companion)
+            record=blob(1,SYNTHETIC_USER_ID)+blob(2,companion)
             sealed=self.aes.ccm_encrypt(self.device_key,bytes(range(0x10,0x1c)),record,b'bind-data',4)
             self._next('bind_record',envelope(25,29,blob(1,sealed)))
         elif self.auth_stage=='bind_record':
@@ -367,4 +370,3 @@ class AuthenticationCentral(LocalCentral):
                                          self.session['sarConfiguration']['sendTimeoutMilliseconds'])
         self.auth_events.append({'stage':'app_confirm','guestConfirmed':True,'generation':self.controller.generation})
         self.state='authenticated_settle';self.deadline=None;self.next_at=self.now+1.0
-

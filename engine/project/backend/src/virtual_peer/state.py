@@ -292,10 +292,11 @@ def factory_image(state, *, skip_oobe=True):
     from ..factory import littlefs_class
     fs = littlefs_class()(block_size=8192,block_count=16,read_size=2048,
         prog_size=2048,cache_size=2048,lookahead_size=8,name_max=96)
+    firmware_model = 'miwear.watch.p67cn' if descriptor['family'] == 'p67' else identity['model']
     properties = {'persist.screen.auto_screen_timeout':'0','persist.screen.dimmer_timeout':'2147483647',
         'ro.factory.mac_bt':identity['address'],'ro.factory.psn':identity['serial'],
         'ro.factory.did':identity['did'],descriptor['pskProperty']:psk_bytes(state).decode('ascii'),
-        'product.model':identity['model']}
+        'product.model':firmware_model,'ro.factory.model':firmware_model}
     if skip_oobe:
         properties.update({'persist.setup_wizard':'1','persist.locale':'zh_CN'})
     with fs.open(descriptor['factoryPropertyFile'],'w') as stream:
