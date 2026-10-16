@@ -413,7 +413,12 @@ nonisolated enum StandaloneProcessSandbox {
         guard let layouts = try? StandaloneVirtualPeerBinding.validatedLayouts(capabilities: manifest) else {
             return false
         }
+        // Firmware outside the packaged table (another catalog version or an
+        // imported OTA of a supported preset) gets its AP-derived layout from
+        // the helper, which decides whether the identity is enabled.
         return layouts[profile] != nil
+            || profile.range(of: #"^miwear\.watch\.(n66|n67|o66|p67|q66)[a-z]{0,8}@[0-9][0-9.]{0,31}@[0-9a-f]{12}$"#,
+                             options: .regularExpression) != nil
     }
 
     static func makeServe(runtime: StandaloneBundledRuntime, session: URL, approvedIdentity: String,

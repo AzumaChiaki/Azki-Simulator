@@ -35,7 +35,7 @@ LC_NTC_MV = (
 LC_NTC_PREFIXES = ("miwear.watch.n67", "miwear.watch.p67")
 ADC_SLOPE, ADC_OFFSET = 0.051538, -23.3
 
-SET_KEYS = {"addSteps", "cadence", "heartRate", "charger", "batteryLevel", "batteryRaw", "temperatureC"}
+SET_KEYS = {"addSteps", "cadence", "heartRate", "worn", "charger", "batteryLevel", "batteryRaw", "temperatureC"}
 NOTES = {
     "clock": "运行中修改 RTC 固件不会采用（它只在开机时读取时间），请在固件设置中修改并重启实例。",
     "settings": "系统属性、语言、时区和时间格式只在开机时读取，修改后需重启实例。",
@@ -123,6 +123,7 @@ def _report(adapter, snapshot):
         "walked": health["walked"] if supported["steps"] else None,
         "cadence": health["cadence"] if supported["steps"] else None,
         "heartRate": health["heartRate"] if supported["heartRate"] else None,
+        "worn": health.get("worn", True) if supported["heartRate"] else None,
         "charger": snapshot["charger"] if supported["charger"] else None,
         "batteryRaw": battery_raw,
         "temperatureC": _ntc_celsius(adc[ntc_list[0]]) if lc_ntc else None,
@@ -143,7 +144,8 @@ def live_set(adapter, arguments):
     (key, value), = arguments.items()
     report = live_get(adapter, {})
     supported = report["supported"]
-    need = {"addSteps": "steps", "cadence": "steps", "heartRate": "heartRate", "charger": "charger",
+    need = {"addSteps": "steps", "cadence": "steps", "heartRate": "heartRate", "worn": "heartRate",
+            "charger": "charger",
             "batteryLevel": "batteryLevel", "batteryRaw": "batteryRaw", "temperatureC": "temperature"}[key]
     if not supported[need]:
         raise MError("unsupported_hardware", "此会话不支持实时修改该项")
@@ -161,6 +163,10 @@ def live_set(adapter, arguments):
         if not 0 <= value <= 255:
             raise MError("invalid_live", "heartRate must be within 0…255")
         request = {"command": "health.set", "value": {"heartRate": value}}
+    elif key == "worn":
+        if type(value) is not bool:
+            raise MError("invalid_live", "worn must be true or false")
+        request = {"command": "health.set", "value": {"worn": value}}
     elif key == "charger":
         if value not in ("unplugged", "charging", "full"):
             raise MError("invalid_live", "charger must be unplugged, charging or full")

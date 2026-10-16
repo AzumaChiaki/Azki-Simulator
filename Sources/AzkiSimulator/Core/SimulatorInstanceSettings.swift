@@ -42,21 +42,25 @@ nonisolated struct InstanceFirmwareSettings: Codable, Equatable, Sendable {
         var walkSteps: Int?
         var cadence: Int?
         var heartRate: Int?
-        var isEmpty: Bool { walkSteps == nil && cadence == nil && heartRate == nil }
+        /// The band is on the wrist (nil = worn, the helper's default).
+        var worn: Bool?
+        var isEmpty: Bool { walkSteps == nil && cadence == nil && heartRate == nil && worn == nil }
         init() {}
-        private enum CodingKeys: String, CodingKey { case walkSteps, cadence, heartRate, steps }
+        private enum CodingKeys: String, CodingKey { case walkSteps, cadence, heartRate, worn, steps }
         init(from decoder: Decoder) throws {
             let values = try decoder.container(keyedBy: CodingKeys.self)
             walkSteps = try values.decodeIfPresent(Int.self, forKey: .walkSteps)
                 ?? values.decodeIfPresent(Int.self, forKey: .steps)
             cadence = try values.decodeIfPresent(Int.self, forKey: .cadence)
             heartRate = try values.decodeIfPresent(Int.self, forKey: .heartRate)
+            worn = try values.decodeIfPresent(Bool.self, forKey: .worn)
         }
         func encode(to encoder: Encoder) throws {
             var values = encoder.container(keyedBy: CodingKeys.self)
             try values.encodeIfPresent(walkSteps, forKey: .walkSteps)
             try values.encodeIfPresent(cadence, forKey: .cadence)
             try values.encodeIfPresent(heartRate, forKey: .heartRate)
+            try values.encodeIfPresent(worn, forKey: .worn)
         }
     }
     struct HealthInputs: Decodable, Equatable, Sendable {
@@ -75,6 +79,9 @@ nonisolated struct InstanceFirmwareSettings: Codable, Equatable, Sendable {
     static let maximumSampleRaw = 65_535
     static let maximumSteps = 10_000_000
     static let maximumHeartRate = 255
+    /// Pulse of a worn band without a saved value (the helper's default).
+    static let restingHeartRate = 72
+    static let heartRateRange = 30...220
     static let cadenceRange = 40...200
     static func validKey(_ key: String) -> Bool {
         key.hasPrefix("persist.") && key.utf8.count <= 128 && key.count > 8

@@ -117,6 +117,9 @@ struct BesSensorHub {
     uint32_t walk_target;
     uint32_t cadence;            /* steps per minute while walking */
     uint32_t heart_rate;         /* beats per minute, 0 = off wrist */
+    bool off_wrist;              /* the band is taken off (worn by default) */
+    double handling;             /* seconds left of taking off / putting on */
+    double handling_phase;       /* steps moved while putting the band on */
     double walk_phase;           /* completed steps, fractional */
     double step_rate, step_gain; /* per-step gait variation */
     uint32_t noise;
@@ -130,9 +133,37 @@ static inline double bes_noise(BesSensorHub *h)
     return ((h->noise >> 8) & 0xffff) / 65536.0 - 0.5;
 }
 
+/* The optical sensors see skin and a pulse only on a worn band. */
+static inline bool bes_worn(BesSensorHub *h)
+{
+    return h->health_enabled && !h->off_wrist && h->heart_rate;
+}
+
 static inline bool bes_walking(BesSensorHub *h)
 {
     return h->health_enabled && h->cadence && h->walk_phase < h->walk_target;
+}
+
+/* Seconds of taking the band off / putting it on: a 2 s roll, then ~6
+ * steps of arm movement at 110 steps/min when it goes on. */
+#define BES_HANDLING_SECONDS 5.3
+
+/* Walking arm motion at a gait phase (steps): gravity mostly along the
+ * hanging forearm (body Y), a heel-strike jolt each step and a swing every
+ * two steps; k scales the stride's intensity. */
+static inline void bes_gait(double phase, double k, double a[3], double g[3])
+{
+    double p = phase - floor(phase);                 /* step phase */
+    double swing = M_PI * phase;                     /* arm cycle */
+    double tilt = 0.35 * sin(swing);
+    double strike = exp(-pow((p - 0.15) / 0.07, 2)) * 0.9 -
+                    exp(-pow((p - 0.45) / 0.15, 2)) * 0.35;
+    a[0] = 0.25 + 0.30 * sin(swing + 0.4) * k + 0.10 * strike * k;
+    a[1] = -0.85 * cos(tilt) + 0.45 * strike * k;
+    a[2] = 0.45 * sin(tilt) + 0.25 + 0.30 * strike * k;
+    g[0] = 30 * cos(swing + 0.3) * k;
+    g[1] = 80 * cos(swing) * k;
+    g[2] = 15 * sin(swing) * k;
 }
 
 /* One sample, advanced by dt seconds. Units: accel in g, gyro in dps. The
@@ -155,20 +186,24 @@ static inline void bes_motion_sample(BesSensorHub *h, double dt, double a[3], do
         if (h->walk_phase > h->walk_target) {
             h->walk_phase = h->walk_target;
         }
-        double k = h->step_gain;
-        double p = h->walk_phase - floor(h->walk_phase);     /* step phase */
-        double swing = M_PI * h->walk_phase;                   /* arm cycle */
-        /* Arm hanging and swinging: gravity mostly along the forearm (body
-         * Y), a heel-strike jolt each step and a swing every two steps. */
-        double tilt = 0.35 * sin(swing);
-        double strike = exp(-pow((p - 0.15) / 0.07, 2)) * 0.9 -
-                        exp(-pow((p - 0.45) / 0.15, 2)) * 0.35;
-        a[0] = 0.25 + 0.30 * sin(swing + 0.4) * k + 0.10 * strike * k;
-        a[1] = -0.85 * cos(tilt) + 0.45 * strike * k;
-        a[2] = 0.45 * sin(tilt) + 0.25 + 0.30 * strike * k;
-        g[0] = 30 * cos(swing + 0.3) * k;
-        g[1] = 80 * cos(swing) * k;
-        g[2] = 15 * sin(swing) * k;
+        bes_gait(h->walk_phase, h->step_gain, a, g);
+    } else if (h->handling > 0) {
+        /* Taking the band off or putting it on: the forearm rolls the band
+         * over and back within two seconds; putting it on, the wearer then
+         * moves on for a few steps (fewer than a pedometer starts counting).
+         * The firmware's wear detection re-checks an off-wrist band only
+         * after such a movement. */
+        double t = BES_HANDLING_SECONDS - h->handling;
+        if (t < 2.0 || h->off_wrist) {
+            double roll = 1.2 * sin(M_PI * MIN(t, 2.0));
+            a[0] = sin(roll); a[1] = -0.05 + 0.15 * sin(2 * M_PI * t); a[2] = cos(roll);
+            g[1] = t < 2.0 ? 1.2 * M_PI * cos(M_PI * t) * 180 / M_PI : 0;
+            g[0] = t < 2.0 ? 20 * sin(2 * M_PI * t) : 0;
+        } else {
+            h->handling_phase += 110 / 60.0 * dt;
+            bes_gait(h->handling_phase, 1.0, a, g);
+        }
+        h->handling -= dt;
     }
     for (int i = 0; i < 3; i++) {
         a[i] += bes_noise(h) * 0.02;
@@ -757,7 +792,7 @@ static inline double ppg_photo(BesSensorHub *h, unsigned ch)
 {
     BesPpg *p = &h->ppg;
     static const double reflect[4] = {3000, 2500, 1800, 2200};
-    bool worn = h->health_enabled && h->heart_rate;
+    bool worn = bes_worn(h);
     double current = p->slot[(2 * ch + 1) & 7][1];
     if (!worn) {
         return current * 15 + bes_noise(h) * 200;      /* light leak only */
@@ -987,7 +1022,7 @@ static inline int32_t hx7_value(BesSensorHub *h, unsigned slot)
     double current = p->page[1][0x10 + 2 * ch];
     double q = p->beat_phase - floor(p->beat_phase);
     double v;
-    if (!(h->health_enabled && h->heart_rate)) {
+    if (!bes_worn(h)) {
         v = current * 15;                         /* light leak only */
     } else if (slot <= 1) {
         double pulse = exp(-pow((q - 0.15) / 0.07, 2)) +

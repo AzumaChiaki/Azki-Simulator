@@ -184,6 +184,9 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--device',default='q66@4.100.177',help='Exact model@version or catalog ID')
     parser.add_argument('--list',action='store_true')
+    parser.add_argument('--nor-layout',action='store_true',
+        help='Print the AP-derived persistent NOR layout of --device and exit')
+    parser.add_argument('--storage-kind',choices=('romfs','yaffs'),default='romfs')
     parser.add_argument('--headless',action='store_true',help='Diagnostics only; no Web server')
     parser.add_argument('--seconds',type=float)
     parser.add_argument('--trace',action='store_true',help='Save instruction/exception diagnostics')
@@ -214,6 +217,14 @@ def main():
     instance_nor = None
     if args.list:
         for p in load_catalog()['profiles']: print(p['id'],p['ap']['chip'])
+        return 0
+    if args.nor_layout:
+        try:
+            layout=dict(board_profile(select(args.device),0,args.storage_kind)['nor_geometry'])
+        except (ValueError,OSError,KeyError) as error:
+            parser.error(str(error))
+        layout.pop('profileID',None)
+        print(json.dumps(layout,sort_keys=True))
         return 0
     try:
         profile=select(args.device)

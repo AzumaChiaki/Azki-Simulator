@@ -16,7 +16,7 @@ from .bind_info import Frames, fields, inspect, encode
 from .central import LocalCentral
 from .business_session import BusinessChannel
 from .smp import LegacyCentral
-from .state import descriptor_for, validate_state, psk_bytes, PROFILE_DESCRIPTORS
+from .state import descriptor_for, validate_state, psk_bytes
 
 
 def varint(value):
@@ -61,12 +61,10 @@ class AuthenticationCentral(LocalCentral):
         self.profile = descriptor_for(private_state['profileID'], private_state['apSHA256'])
         self.firmware_models=(self.profile['model'],)
         # P67 TC was observed rejecting only its model comparison while serial,
-        # address and DID matched. Its exact catalog AP is shared with P67 CN.
-        # Keep other working profiles literal; do not infer family-wide aliases.
-        if self.profile['profileID']=='miwear.watch.p67tc@3.101.043@a4ce85647786':
-            canonical=PROFILE_DESCRIPTORS['miwear.watch.p67cn@3.101.043@a4ce85647786']
-            if canonical['apSHA256']==self.profile['apSHA256']:
-                self.firmware_models+=(canonical['model'],)
+        # address and DID matched: its firmware compares against the CN model
+        # (the TC and CN builds share one AP), so accept both for P67 TC.
+        if self.profile['model']=='miwear.watch.p67tc':
+            self.firmware_models+=('miwear.watch.p67cn',)
         if self.profile['protocol'] not in ('miwear-psk1-q66', 'miwear-psk1-literal16') or self.profile['requiresSMPBond'] is not True:
             raise ValueError('Unsupported synthetic authentication protocol')
         super().__init__(controller,bind_info=True,connection_timeout=connection_timeout)

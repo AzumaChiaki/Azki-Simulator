@@ -44,6 +44,8 @@ nonisolated struct SimulatorLiveState: Equatable, Sendable {
         return Int(value)
     }
 
+    func bool(_ key: String) -> Bool? { state[key]?.bool }
+
     func number(_ key: String) -> Double? {
         guard case .number(let value)? = state[key], value.isFinite else { return nil }
         return value

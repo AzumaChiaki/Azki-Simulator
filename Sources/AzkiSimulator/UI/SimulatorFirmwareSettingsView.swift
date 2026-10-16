@@ -19,15 +19,13 @@ import SwiftUI
     @State private var newKey = ""
     @State private var newValue = ""
     @State private var filter = ""
-    @State private var batteryInputs: InstanceFirmwareSettings.BatteryInputs?
-    @State private var healthInputs: InstanceFirmwareSettings.HealthInputs?
 
     private enum Choice: Hashable { case keep, value(String), reset }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("固件设置").font(.title2)
-            Text("下次开机时写入固件的系统设置数据库（persist.db），并按以下时钟启动。目录覆盖的手环 9 / 9 Pro / 10 / 10 Pro / 11 与导入固件共用同一套 /data 存储，均按实例的硬件预设生效。")
+            Text("下次开机时写入固件的系统设置数据库（persist.db），并按以下时钟启动；佩戴、心率、步行、电量、充电在工作区“设备数据”中修改。目录覆盖的手环 9 / 9 Pro / 10 / 10 Pro / 11 与导入固件共用同一套 /data 存储，均按实例的硬件预设生效。")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if !loaded {
                 ProgressView().controlSize(.small)
@@ -41,8 +39,6 @@ import SwiftUI
                                      options: [("false", "24 小时制"), ("true", "12 小时制")])
                         timeZonePicker
                     }
-                    batterySection
-                    healthSection
                     propertiesSection
                 }
                 .formStyle(.grouped)
@@ -102,167 +98,6 @@ import SwiftUI
             ForEach(zones, id: \.self) { Text($0).tag(Choice.value($0)) }
             Text("恢复固件默认").tag(Choice.reset)
         }
-    }
-
-    /// Board inputs: the instance hardware preset decides which part exists, so
-    /// every value here is written into the session and applied by the core.
-    private var batterySection: some View {
-        Section {
-            if batteryInputs?.level == true {
-                HStack {
-                    Text("开机电量")
-                    Spacer()
-                    if let level = settings.battery?.level {
-                        TextField("电量", text: levelBinding).frame(width: 56)
-                            .multilineTextAlignment(.trailing)
-                            .accessibilityLabel("开机电量百分比")
-                        Stepper("%", value: Binding(get: { level },
-                                                    set: { value in setBattery { $0.level = min(max(value, 0), 100) } }),
-                                in: 0...100, step: 1)
-                        Button("恢复默认") { setBattery { $0.level = nil } }
-                    } else {
-                        Text("固件默认").foregroundStyle(.secondary)
-                        Button("设置") { setBattery { $0.level = 80 } }
-                    }
-                }
-            }
-            if batteryInputs?.charger == true {
-                Picker("充电状态", selection: Binding(get: { settings.battery?.charger ?? .auto },
-                                                     set: { choice in setBattery { $0.charger = choice } })) {
-                    Text("跟随固件（未接充电器）").tag(InstanceFirmwareSettings.Charger.auto)
-                    Text("未接充电器").tag(InstanceFirmwareSettings.Charger.unplugged)
-                    Text("充电中").tag(InstanceFirmwareSettings.Charger.charging)
-                    Text("已充满").tag(InstanceFirmwareSettings.Charger.full)
-                }
-            }
-            DisclosureGroup("高级：电池电压采样原始值") {
-                HStack {
-                    TextField("电池采样原始值", text: sampleBinding).frame(width: 140)
-                    Text("0…65535").font(.caption).foregroundStyle(.secondary)
-                    Spacer()
-                    Button("恢复默认") { setBattery { $0.sampleRaw = nil } }
-                }
-            }
-        } header: {
-            Text("电池")
-        } footer: {
-            Text(batteryFooter)
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private var batteryFooter: String {
-        var lines: [String] = []
-        if batteryInputs?.level == true {
-            lines.append("开机电量在下次开机时生效，之后由固件自己的电量计计算和显示。" + Self.batteryLevelNote(model: runtime.modelConstraint))
-        } else {
-            lines.append("此型号的开机电量尚未验证能驱动固件的电量计，因此不提供百分比设置，固件显示的电量保持其默认值。")
-        }
-        if batteryInputs?.charger == true {
-            lines.append("充电状态在开机约 8 秒后才接入：开机时就接着充电器会让固件进入充电重启流程。")
-        }
-        lines.append("采样原始值是固件电池电压通路的原始计数，填写后优先于开机电量换算出的值。")
-        return lines.joined(separator: "\n")
-    }
-
-    /// How the boot level reaches each preset's gauge (verified per firmware).
-    static func batteryLevelNote(model: String?) -> String {
-        let model = model ?? ""
-        if model.hasPrefix("miwear.watch.n66") || model.hasPrefix("miwear.watch.o66") {
-            return "此型号的电量计恢复保存的容量，并按“容量 × 1.055”显示；设置会按此换算写入保存的容量和对应的电池电压，显示值与设定值一致。"
-        }
-        if model.hasPrefix("miwear.watch.n67") || model.hasPrefix("miwear.watch.p67") {
-            return "此型号的电量计恢复保存的整数百分比，电池电压采样设为该电量对应的开路电压，显示值与设定值一致。"
-        }
-        if model.hasPrefix("miwear.watch.q66") || model == "q66" {
-            return "此型号冷启动时只按电池电压估算电量（不读取保存的电量），电压按 7 mV 一档取整，约 18 个设定值会显示为相差 1%。"
-        }
-        return "电池电压采样设为该电量对应的开路电压。"
-    }
-
-    private var levelBinding: Binding<String> {
-        Binding(get: { settings.battery?.level.map(String.init) ?? "" },
-                set: { text in
-                    guard let value = Int(text.trimmingCharacters(in: .whitespaces)), (0...100).contains(value) else { return }
-                    setBattery { $0.level = value }
-                })
-    }
-
-    private var healthSection: some View {
-        Section {
-            if healthInputs?.steps == true {
-                HStack {
-                    TextField("开机后步行步数", text: intBinding(\.walkSteps, 0...InstanceFirmwareSettings.maximumSteps))
-                        .frame(width: 160)
-                    Text("步").font(.caption).foregroundStyle(.secondary)
-                    Spacer()
-                    Button("恢复默认") { setHealth { $0.walkSteps = nil; $0.cadence = nil } }
-                }
-                HStack {
-                    TextField("步频", text: intBinding(\.cadence, InstanceFirmwareSettings.cadenceRange)).frame(width: 160)
-                    Text("步/分钟（40…200）").font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            if healthInputs?.heartRate == true {
-                HStack {
-                    TextField("心率", text: intBinding(\.heartRate, 0...InstanceFirmwareSettings.maximumHeartRate))
-                        .frame(width: 160)
-                    Text("次/分（0 = 未佩戴）").font(.caption).foregroundStyle(.secondary)
-                    Spacer()
-                    Button("恢复默认") { setHealth { $0.heartRate = nil } }
-                }
-            }
-        } header: {
-            Text("健康数据")
-        } footer: {
-            Text(healthFooter)
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private var healthFooter: String {
-        guard let healthInputs, healthInputs.steps || healthInputs.heartRate else {
-            return "此型号的运动与光学传感器尚未模拟，固件不会从这里得到步数或心率，因此不提供设置。"
-        }
-        var lines = ["模拟核心按这里的数值产生运动传感器与光学传感器的原始数据，步数和心率由固件自己的算法计算并显示；下次开机生效。"]
-        if healthInputs.steps {
-            lines.append("开机步行在开机约 75 秒、固件计步服务就绪后才开始；起步的几步用于识别步行，可能不计入。运行中也可以在“硬件输入”的实时控制里追加步行。")
-        }
-        if healthInputs.heartRate {
-            lines.append("心率在固件测量时读到设定脉搏（固件自身算法可能相差 1–3 次/分）；0 表示未佩戴。")
-        }
-        return lines.joined(separator: "\n")
-    }
-
-    private func setBattery(_ change: (inout InstanceFirmwareSettings.Battery) -> Void) {
-        var battery = settings.battery ?? InstanceFirmwareSettings.Battery()
-        change(&battery)
-        settings.battery = battery
-    }
-
-    private func setHealth(_ change: (inout InstanceFirmwareSettings.Health) -> Void) {
-        var health = settings.health ?? InstanceFirmwareSettings.Health()
-        change(&health)
-        settings.health = health.isEmpty ? nil : health
-    }
-
-    private var sampleBinding: Binding<String> {
-        Binding(get: { settings.battery?.sampleRaw.map(String.init) ?? "" },
-                set: { text in
-                    let trimmed = text.trimmingCharacters(in: .whitespaces)
-                    let value = trimmed.isEmpty ? nil : Int(trimmed)
-                    setBattery { $0.sampleRaw = value.flatMap { (0...InstanceFirmwareSettings.maximumSampleRaw).contains($0) ? $0 : nil } }
-                })
-    }
-
-    private func intBinding(_ field: WritableKeyPath<InstanceFirmwareSettings.Health, Int?>,
-                            _ range: ClosedRange<Int>) -> Binding<String> {
-        Binding(get: { settings.health?[keyPath: field].map(String.init) ?? "" },
-                set: { text in
-                    let trimmed = text.trimmingCharacters(in: .whitespaces)
-                    let value = trimmed.isEmpty ? nil : Int(trimmed)
-                    setHealth { $0[keyPath: field] = value.flatMap { range.contains($0) ? $0 : nil } }
-                })
     }
 
     private var propertiesSection: some View {
@@ -357,8 +192,6 @@ import SwiftUI
 
     private func apply(_ receipt: InstanceFirmwareSettingsReceipt) {
         settings = receipt.settings
-        batteryInputs = receipt.batteryInputs(for: runtime.modelConstraint)
-        healthInputs = receipt.healthInputs(for: runtime.modelConstraint)
         observed = receipt.observed?.properties ?? [:]
         observedAt = receipt.observed?.recordedAtUnix.map { Date(timeIntervalSince1970: TimeInterval($0)) }
         if settings.clock.mode == .offset, let offset = settings.clock.offsetSeconds {

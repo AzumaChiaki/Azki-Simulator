@@ -67,17 +67,28 @@ PROFILE_DESCRIPTORS = MappingProxyType({identity: _descriptor(identity, ap, mode
     for identity, ap, model, reason in _PROFILE_ROWS})
 
 
-def descriptor_for(profile_id, ap_sha256=None):
-    """Return an exact candidate descriptor, never infer one from a model alias.
+# Any firmware build of these families: "<model>@<version>@<OTA SHA prefix>".
+_FIRMWARE_PROFILE = re.compile(r'(miwear\.watch\.(n66|n67|o66|p67|q66)[a-z]{0,8})@[0-9][0-9.]{0,31}@[0-9a-f]{12}')
 
-    Static identity encodings permit a real guest attempt. They do not confirm
-    that profile's authentication, installation or runner capability.
+
+def descriptor_for(profile_id, ap_sha256=None):
+    """Return the synthetic identity descriptor of a profile.
+
+    The identity encoding follows the hardware family and SKU, so a firmware
+    build outside the measured table (another catalog version or an imported
+    OTA) uses its model's descriptor with its own AP digest. Static identity
+    encodings permit a real guest attempt; the guest decides acceptance.
     """
-    if type(profile_id) is not str or profile_id not in PROFILE_DESCRIPTORS:
-        raise ValueError('Unknown exact synthetic identity profile')
-    descriptor = PROFILE_DESCRIPTORS[profile_id]
     if ap_sha256 is not None and not _hex(ap_sha256, 64):
         raise ValueError('Invalid descriptive firmware digest')
+    if type(profile_id) is str and profile_id not in PROFILE_DESCRIPTORS:
+        match = _FIRMWARE_PROFILE.fullmatch(profile_id)
+        if match is None or ap_sha256 is None:
+            raise ValueError('Unknown synthetic identity profile')
+        return _descriptor(profile_id, ap_sha256, match.group(1), None)
+    if type(profile_id) is not str:
+        raise ValueError('Unknown synthetic identity profile')
+    descriptor = PROFILE_DESCRIPTORS[profile_id]
     if descriptor['unsupportedReason'] is not None:
         raise ValueError('Synthetic identity profile unsupported: ' + descriptor['unsupportedReason'])
     return descriptor
@@ -145,14 +156,14 @@ def validate_state(value):
     return value
 
 
-def create_state(instance_id, identity_version=1, *, private_data=None, profile_id=PROFILE):
+def create_state(instance_id, identity_version=1, *, private_data=None, profile_id=PROFILE, ap_sha256=None):
     """Create only a new synthetic identity, optionally using its host-made key.
 
     The native host supplies a newly generated P-256 X9.63 representation;
     restoring it needs no random-key service from inside the static sandbox.
     macOS Security validates the key representation before state is returned.
     """
-    descriptor = descriptor_for(profile_id)
+    descriptor = descriptor_for(profile_id, ap_sha256)
     from .auth_crypto import P256
     if not canonical_uuid(instance_id) or type(identity_version) is not int or identity_version != 1:
         raise ValueError('Only a new empty virtual instance can create its first identity')

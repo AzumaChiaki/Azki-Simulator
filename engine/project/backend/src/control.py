@@ -436,21 +436,27 @@ class WatchControl:
     def health(self, value=None):
         """Live health input of the session's modeled sensors.
 
-        value: {"walkSteps": int, "cadence": int, "heartRate": int}, any subset.
+        value: {"walkSteps": int, "cadence": int, "heartRate": int, "worn": bool},
+        any subset.
         walkSteps is the number of steps walked since boot (raising it walks the
         difference; the firmware counts them itself). Only fixed fields reach
         the core, never arbitrary QMP arguments."""
         limits = {'walkSteps': ('walk', 0, 10000000), 'cadence': ('cadence', 40, 200),
-                  'heartRate': ('heart-rate', 0, 255)}
+                  'heartRate': ('heart-rate', 0, 255), 'worn': None}
         with self.lock:
             state = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'health-fixture'})
             if not isinstance(state, str) or state == 'off':
                 raise RuntimeError('unsupported_hardware_input: health')
             if value is not None:
                 if type(value) is not dict or not value or set(value) - set(limits):
-                    raise ValueError('health.set requires walkSteps, cadence or heartRate')
+                    raise ValueError('health.set requires walkSteps, cadence, heartRate or worn')
                 fields = []
                 for key, item in value.items():
+                    if key == 'worn':
+                        if type(item) is not bool:
+                            raise ValueError('health.worn must be true or false')
+                        fields.append('worn=%d' % item)
+                        continue
                     name, low, high = limits[key]
                     if type(item) is not int or not low <= item <= high:
                         raise ValueError('health.%s must be an integer in %d..%d' % (key, low, high))
@@ -460,7 +466,8 @@ class WatchControl:
                 state = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'health-fixture'})
             parsed = dict(item.split('=', 1) for item in state.split(';') if '=' in item)
             return {'walkSteps': int(parsed.get('walk', 0)), 'cadence': int(parsed.get('cadence', 0)),
-                    'heartRate': int(parsed.get('heart-rate', 0)), 'walked': int(parsed.get('walked', 0))}
+                    'heartRate': int(parsed.get('heart-rate', 0)), 'worn': parsed.get('worn', '1') == '1',
+                    'walked': int(parsed.get('walked', 0))}
 
     def _shared_frame(self):
         """Read the LCD snapshot published by QEMU, independent of QMP/Web."""

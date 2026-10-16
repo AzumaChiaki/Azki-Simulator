@@ -297,7 +297,8 @@ def validate_board_settings(value):
         # The host resolved the preset's sensor wiring (sensorBoard); the
         # runner only checks its shape and forwards it to the core.
         if (not isinstance(health, dict)
-                or set(health) - {'sensorBoard', 'walkSteps', 'cadence', 'heartRate'}
+                or set(health) - {'sensorBoard', 'walkSteps', 'cadence', 'heartRate', 'worn'}
+                or ('worn' in health and type(health['worn']) is not bool)
                 or not isinstance(health.get('sensorBoard'), str)
                 or not SENSOR_BOARD.fullmatch(health['sensorBoard'])
                 or ('walkSteps' in health and (type(health['walkSteps']) is not int
@@ -313,7 +314,7 @@ def validate_board_settings(value):
 # imu:<chip>:<spi0|spi1|i2cN>:<cs|address>:<irq|-1>[:mount];ppg:<chip>:...[:tick Hz]
 _SENSOR_PORT = r'(spi[01]|i2c[0-7]):(0x[0-9a-f]{1,2}|\d{1,2}):(-1|\d{1,2})'
 _SENSOR_ENTRY = ('(imu:(lsm6dso|icm42607):' + _SENSOR_PORT + '(:([+-]?[xyz]){3})?'
-                 '|ppg:hx369[57]:' + _SENSOR_PORT + '(:\d{4,7})?)')
+                 '|ppg:hx369[57]:' + _SENSOR_PORT + r'(:\d{4,7})?)')
 SENSOR_BOARD = re.compile(_SENSOR_ENTRY + '(;' + _SENSOR_ENTRY + ')?')
 
 
@@ -349,8 +350,9 @@ def instance_settings_options(settings, *, adc_fixture, default_sample=21000, nt
         options.append('sensor-board=' + health['sensorBoard'])
         # The walk starts later (instance_settings_walk): steps taken while
         # the firmware's pedometer service is still starting are not counted.
-        options.append('health-fixture=walk=0;cadence=%d;heart-rate=%d'
-                       % (health.get('cadence', 110), health.get('heartRate', 0)))
+        options.append('health-fixture=walk=0;cadence=%d;heart-rate=%d;worn=%d'
+                       % (health.get('cadence', 110), health.get('heartRate', 72),
+                          health.get('worn', True)))
     return options
 
 

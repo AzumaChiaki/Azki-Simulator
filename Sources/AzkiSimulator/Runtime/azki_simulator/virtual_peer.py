@@ -82,9 +82,8 @@ def supports_peer(plan):
         capability = checked_capability(identity.get("runtimeCapabilities", {}).get("virtualPeer"),
                                          identity.get("qemu", {}).get("sha256"))
         descriptor = capability["profiles"].get(plan["profileID"])
-        from .instance_storage import VIRTUAL_PROFILES
-        expected_ap = VIRTUAL_PROFILES.get(plan["profileID"], (None, None))[0]
-        if type(descriptor) is not dict or expected_ap is None:
+        from .instance_storage import virtual_profile
+        if type(descriptor) is not dict or virtual_profile(plan["profileID"]) is None:
             return False
     except (MError, AttributeError):
         return False

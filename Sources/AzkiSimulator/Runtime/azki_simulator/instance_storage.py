@@ -25,7 +25,7 @@ import struct
 import sys
 import types
 
-from .minative import (INCLUDED_PROFILE_IDS, _directory_fd, _open_file, _path, _pin, _read, _decode,
+from .minative import (profile_in_scope, _directory_fd, _open_file, _path, _pin, _read, _decode,
                       _json as _bounded_json, MError)
 
 BLOCK = 131072
@@ -68,6 +68,54 @@ VIRTUAL_PROFILES = {
     "miwear.watch.p67tc@3.101.043@a4ce85647786":
         ("519307675665e4866d722a8119a98589c397b614ac3294cb87bfc86de45756ec", "miwear.watch.p67tc"),
 }
+
+# Families whose synthetic identity format the virtual peer knows. The format
+# follows the hardware family and SKU, not one firmware build: any firmware of
+# these presets (catalog or imported) gets the virtual connection.
+VIRTUAL_FAMILIES = ("n66", "n67", "o66", "p67", "q66")
+
+
+def derived_nor_layout(project, profile_id, storage_kind):
+    """NOR layout the runner derives from this profile's own AP, or None.
+
+    The packaged capability lists the layouts measured for the bundled
+    profiles; any other firmware of a supported preset (another catalog version
+    or an imported OTA) gets the same AP-derived description the runner checks
+    its board against before it gives NOR storage to QEMU."""
+    import subprocess
+    import sys
+    if storage_kind not in ("yaffs", "romfs"):
+        return None
+    try:
+        # -I keeps the script directory off sys.path; add the project itself.
+        stub = ("import runpy, sys; sys.path.insert(0, sys.argv[1]); sys.argv = sys.argv[1:]; "
+                "sys.argv[0] = sys.argv[0] + '/multi_device.py'; "
+                "runpy.run_path(sys.argv[0], run_name='__main__')")
+        done = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", stub, str(project),
+                               "--device", profile_id, "--nor-layout", "--storage-kind", storage_kind],
+                              cwd=str(project), capture_output=True, timeout=120,
+                              env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    try:
+        layout = json.loads(done.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return layout if type(layout) is dict else None
+
+
+def virtual_profile(profile_id, ap_sha256=None):
+    """(AP SHA-256, identity model) for a profile's virtual peer, or None."""
+    if profile_id in VIRTUAL_PROFILES:
+        return VIRTUAL_PROFILES[profile_id]
+    model = profile_id.split("@", 1)[0] if type(profile_id) is str else ""
+    if (not profile_in_scope(profile_id) or not model.startswith("miwear.watch.")
+            or model[len("miwear.watch."):][:3] not in VIRTUAL_FAMILIES):
+        return None
+    return (ap_sha256 if _hex(ap_sha256, 64) else None), model
+
 VIRTUAL_STATE = "virtual-peer-state.json"
 VIRTUAL_OUTPUT = "virtual-peer-state.pending.json"
 VIRTUAL_SHA = "virtualPeerStateSHA256"
@@ -88,7 +136,7 @@ def _virtual_value(value, *, instance_id=None):
     if type(value) is not dict or set(value) - {"guestLinkBond"} != fields:
         raise ValueError("Invalid synthetic virtual state schema")
     _uuid(value["instanceID"])
-    descriptor = VIRTUAL_PROFILES.get(value["profileID"])
+    descriptor = virtual_profile(value["profileID"], value["apSHA256"])
     if (descriptor is None or type(value["schema"]) is not int or value["schema"] != 1
             or value["origin"] != "synthetic-virtual-instance"
             or not _hex(value["apSHA256"], 64)
@@ -150,7 +198,7 @@ def _virtual_write(path, raw):
         os.close(directory)
 
 
-def _create_virtual_state(project, instance_id, *, profile_id=NOR_PROFILE,
+def _create_virtual_state(project, instance_id, *, profile_id=NOR_PROFILE, ap_sha256=None,
                           virtual_key_file=None, virtual_key_sha256=None):
     private_data = None
     if virtual_key_file is not None or virtual_key_sha256 is not None:
@@ -176,7 +224,8 @@ def _create_virtual_state(project, instance_id, *, profile_id=NOR_PROFILE,
             modules[qualified] = module; sys.modules[qualified] = module
             exec(compile(raw, str(folder / (name + ".py")), "exec"), module.__dict__)
         value = modules[package_name + ".state"].create_state(
-            instance_id, private_data=private_data, profile_id=profile_id)
+            instance_id, private_data=private_data, profile_id=profile_id,
+            **({"ap_sha256": ap_sha256} if ap_sha256 else {}))
         return _virtual_value(value, instance_id=instance_id)
     finally:
         for name in modules:
@@ -184,8 +233,8 @@ def _create_virtual_state(project, instance_id, *, profile_id=NOR_PROFILE,
 
 
 def _nor_capability(capability, profile_id, ap_sha256, qemu_sha256):
-    if type(profile_id) is not str or profile_id not in INCLUDED_PROFILE_IDS:
-        raise ValueError("NOR capability profile is outside the embedded catalog")
+    if type(profile_id) is not str or not profile_in_scope(profile_id):
+        raise ValueError("NOR capability profile is outside the Mi Band scope")
     if (not isinstance(capability, dict) or set(capability) != {"schema", "runnerProtocol", "qemuSHA256", "profiles"}
             or type(capability.get("schema")) is not int or capability["schema"] != 1
             or type(capability.get("runnerProtocol")) is not int or capability["runnerProtocol"] != 1
@@ -628,7 +677,7 @@ class InstanceStorage:
                 dormant_kept = True
             if carry and VIRTUAL_SHA in old[1]:
                 previous_state, raw, digest = _virtual_read(old[0] / VIRTUAL_STATE)
-                target = VIRTUAL_PROFILES.get(firmware.profile)
+                target = virtual_profile(firmware.profile, firmware.nor_ap_sha256)
                 if (previous_state["profileID"] != firmware.profile and target is not None
                         and target[1] == previous_state["identity"]["model"] and firmware.nor_bytes):
                     # Same device identity, keys and pairing; only the firmware
@@ -1025,7 +1074,7 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
     if capability is None:
         return {**base, "reason": "当前核心未声明已绑定身份的 NAND 写回能力；本次使用原临时数据盘"}
     firmware = _firmware(plan, capability)
-    identity_model = VIRTUAL_PROFILES.get(firmware.profile, (None, firmware.model))[1]
+    identity_model = (virtual_profile(firmware.profile) or (None, firmware.model))[1]
     requested_identity = requested_virtual_identity(virtual_serial, virtual_address, identity_model)
     root = _instance_root(library_root, instance_id)
     # An interrupted earlier run (crash, forced quit, lost receipt) is settled
@@ -1046,7 +1095,7 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
             from .virtual_peer import checked_capability
             checked_capability(virtual_capability, plan["identity"]["qemu"]["sha256"])
             virtual_layout = virtual_capability.get("profiles", {}).get(firmware.profile)
-            virtual_enabled = (firmware.profile in VIRTUAL_PROFILES and bool(firmware.nor_bytes)
+            virtual_enabled = (virtual_profile(firmware.profile) is not None and bool(firmware.nor_bytes)
                 and type(virtual_layout) is dict
                 and _hex(virtual_layout.get("apSHA256"), 64))
         virtual_state = None
@@ -1065,7 +1114,7 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
             identity_note = "所选固件没有已核验的虚拟通信支持，本次未写入虚拟序列号和蓝牙地址"
         if virtual_enabled and (not old or rebuild_identity or VIRTUAL_SHA not in old[1]):
             virtual_state = _create_virtual_state(plan["spec"]["project"], instance_id,
-                profile_id=firmware.profile, virtual_key_file=virtual_key_file,
+                profile_id=firmware.profile, ap_sha256=firmware.nor_ap_sha256 or None, virtual_key_file=virtual_key_file,
                 virtual_key_sha256=virtual_key_sha256)
             if requested_identity is not None:
                 virtual_state["identity"].update(requested_identity)
@@ -1216,7 +1265,7 @@ def validate_binding(binding, *, project, profile_id, model, qemu_sha256, capabi
     if enabled:
         from .virtual_peer import checked_capability
         checked_capability(virtual_capability, qemu_sha256)
-        virtual_descriptor = VIRTUAL_PROFILES.get(profile_id)
+        virtual_descriptor = virtual_profile(profile_id)
         if not has_state or nor is None or virtual_descriptor is None:
             raise ValueError("Virtual peer requires exact profile and joint NOR storage")
     if _json(expected / "instance-storage.json") != binding:

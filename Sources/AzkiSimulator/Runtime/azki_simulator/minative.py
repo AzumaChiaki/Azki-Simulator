@@ -822,6 +822,25 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
             if (board.get("data_image_sha256") != seed["sha256"] or board.get("local_ui_seed") != seed
                     or prepared_pins["seed"]["bytes"] != board["geometry"].get("nand-data-bytes")):
                 raise MError("identity_mismatch", "Board/seed geometry or content differs")
+    nor_capability = runtime_capabilities.get("norPersistence")
+    if nor_capability is not None and profile_id not in nor_capability["profiles"]:
+        # Firmware outside the packaged table: persistent NOR and the virtual
+        # peer follow the layout the runner derives from this AP.
+        from .instance_storage import _nor_capability, derived_nor_layout, virtual_profile
+        layout = derived_nor_layout(project, profile_id, storage)
+        if layout is not None and len(nor_capability["profiles"]) < 64:
+            extended = {**nor_capability, "profiles": {**nor_capability["profiles"], profile_id: layout}}
+            qemu_sha = engine["files"][engine["manifest"]["entrypoints"]["qemu"]]["sha256"]
+            try:
+                _nor_capability(extended, profile_id, ap["sha256"], qemu_sha)
+            except ValueError:
+                extended = None
+            peer = runtime_capabilities.get("virtualPeer")
+            if extended is not None and layout.get("apSHA256") == ap["sha256"]:
+                runtime_capabilities["norPersistence"] = extended
+                if peer is not None and virtual_profile(profile_id) is not None:
+                    runtime_capabilities["virtualPeer"] = {
+                        **peer, "profiles": {**peer["profiles"], profile_id: {"apSHA256": ap["sha256"]}}}
     runtime_files = (RUNTIME_FILES[:-1] + ("backend/src/instance_data.py",) + RUNTIME_FILES[-1:]
                      if runtime_capabilities else RUNTIME_FILES)
     if runtime_capabilities.get("virtualPeer"):

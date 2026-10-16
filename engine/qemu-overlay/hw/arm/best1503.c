@@ -5149,9 +5149,9 @@ static char *best1503_get_health_fixture(Object *obj, Error **errp)
     if (!h->health_enabled) {
         return g_strdup("off");
     }
-    return g_strdup_printf("walk=%u;cadence=%u;heart-rate=%u;walked=%u",
+    return g_strdup_printf("walk=%u;cadence=%u;heart-rate=%u;worn=%u;walked=%u",
                            h->walk_target, h->cadence, h->heart_rate,
-                           (unsigned)h->walk_phase);
+                           !h->off_wrist, (unsigned)h->walk_phase);
 }
 
 static void best1503_set_health_fixture(Object *obj, const char *value, Error **errp)
@@ -5164,6 +5164,7 @@ static void best1503_set_health_fixture(Object *obj, const char *value, Error **
     }
     unsigned walk = h->walk_target, cadence = h->cadence ? h->cadence : 110;
     unsigned rate = h->heart_rate;
+    bool off_wrist = h->off_wrist;
     bool ok = true;
     gchar **items = g_strsplit(value, ";", 0);
     for (gchar **i = items; ok && *i; i++) {
@@ -5180,13 +5181,16 @@ static void best1503_set_health_fixture(Object *obj, const char *value, Error **
         } else if (!strcmp(key, "heart-rate")) {
             ok = v <= 255;
             rate = v;
+        } else if (!strcmp(key, "worn")) {
+            ok = v <= 1;
+            off_wrist = !v;
         } else if (strcmp(key, "walked")) {
             ok = false;
         }
     }
     g_strfreev(items);
     if (!ok) {
-        error_setg(errp, "health-fixture must be walk=N;cadence=C;heart-rate=H "
+        error_setg(errp, "health-fixture must be walk=N;cadence=C;heart-rate=H;worn=0|1 "
                    "(walk<=10000000, cadence 40..200 steps/min, rate<=255)");
         return;
     }
@@ -5194,6 +5198,11 @@ static void best1503_set_health_fixture(Object *obj, const char *value, Error **
     h->walk_target = walk;
     h->cadence = cadence;
     h->heart_rate = rate;
+    if (off_wrist != h->off_wrist) {
+        h->handling = BES_HANDLING_SECONDS;  /* taken off / put on */
+        h->handling_phase = 0;
+    }
+    h->off_wrist = off_wrist;
     if (s->sensor_timer) {
         timer_mod(s->sensor_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     }
@@ -5358,7 +5367,7 @@ static void best1503_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "sensor-board",
         "Fitted motion sensor wiring: imu:<chip>:<spi0|i2cN>:<cs-pin|address>:<irq-pin|-1>");
     object_class_property_set_description(oc, "health-fixture",
-        "Health input for the modeled sensors: walk=N;cadence=C;heart-rate=H");
+        "Health input for the modeled sensors: walk=N;cadence=C;heart-rate=H;worn=0|1");
     object_class_property_add(oc, "rtc-seconds", "int",
         best1503_get_rtc_seconds, best1503_set_rtc_seconds, NULL, NULL);
     object_class_property_set_description(oc, "rtc-seconds",

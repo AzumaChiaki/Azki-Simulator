@@ -33,6 +33,8 @@ import UniformTypeIdentifiers
     @State private var adcDraft = PMUADCDraft()
     @State private var connectionTimeoutText = ""
     @State private var editingFirmwareSettings = false
+    @State private var screenshotURL: URL?
+    @State private var screenshotError: String?
     /// Firmware chosen while the device runs; applied by "切换并重新开机".
     @State private var pendingProfileID: String?
 
@@ -238,15 +240,11 @@ import UniformTypeIdentifiers
             firmwareLibrarySection
             SimulatorSectionDivider()
             if runtime.instanceID != nil {
-                SimulatorSection(title: "固件设置", icon: "gearshape.2") {
-                    Text("语言、时区、12/24 小时制、开机时间及全部系统属性，下次开机写入固件。默认跟随 Mac 时间与时区。")
-                        .foregroundStyle(SimulatorTheme.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                SimulatorSection(title: "设备数据", icon: "sensor") {
+                    SimulatorDeviceDataView(runtime: runtime, session: session, enabled: controlsAvailable) {
+                        editingFirmwareSettings = true
+                    }
                     SimulatorActionFlow {
-                        action("编辑固件设置…", icon: "slider.horizontal.3", enabled: controlsAvailable) {
-                            editingFirmwareSettings = true
-                        }
-                        .accessibilityIdentifier("simulator.firmware-settings")
                         action("冷重启", icon: "arrow.clockwise.circle", enabled: controlsAvailable && runtime.isServing) {
                             Task { await recording.stop(); await runtime.coldRestart() }
                         }
@@ -332,7 +330,13 @@ import UniformTypeIdentifiers
                         .help("启动失败或状态异常时使用：停止设备并清除此实例的运行缓存与错误；已保存的数据、固件设置和已导入固件都会保留")
                         .accessibilityIdentifier("simulator.reset-instance")
                     }
-                    action("截图", icon: "camera", enabled: controlsAvailable && session.frame != nil) { session.perform("screenshot") }
+                    action("截图", icon: "camera", enabled: controlsAvailable && session.image != nil) {
+                        guard let image = session.image else { return }
+                        do {
+                            screenshotURL = try SimulatorScreenshot.save(image, instanceName: instanceName ?? "Azki Simulator")
+                            screenshotError = nil
+                        } catch { screenshotError = error.localizedDescription }
+                    }
                     action(recording.isRecording ? "停止录屏" : "录屏", icon: recording.isRecording ? "stop.circle" : "record.circle",
                            enabled: !recording.isFinishing && (recording.isRecording || (session.isRunning && session.image != nil))) {
                         if recording.isRecording { Task { await recording.stop() } }
@@ -374,10 +378,16 @@ import UniformTypeIdentifiers
                         .foregroundStyle(SimulatorTheme.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                if let name = session.screenshotName {
-                    Text("截图已保存至会话目录：\(name)")
-                        .foregroundStyle(SimulatorTheme.secondary)
-                        .textSelection(.enabled)
+                if let url = screenshotURL {
+                    HStack {
+                        Text("截图已保存到桌面：\(url.lastPathComponent)")
+                            .foregroundStyle(SimulatorTheme.secondary)
+                            .textSelection(.enabled)
+                        Button("在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                    }
+                }
+                if let screenshotError {
+                    Text(screenshotError).foregroundStyle(.red)
                 }
                 if recording.isRecording {
                     Label("录制中 \(Int(recording.elapsedTime) / 60):\(String(format: "%02d", Int(recording.elapsedTime) % 60))", systemImage: "record.circle.fill")
@@ -442,16 +452,11 @@ import UniformTypeIdentifiers
                 }
             }
             SimulatorSectionDivider()
-            SimulatorSection(title: "硬件输入", icon: "sensor") {
-                SimulatorLiveControlsView(session: session, enabled: controlsAvailable)
-                Divider()
-                Text("电池电压、电量与温度（原始采样）").fontWeight(.medium)
-                Text(adcProfileID == "q66@4.100.177"
-                     ? "此固件已确认电池电压和 NTC 采样用途。按原始计数编辑，电量由固件估算；尚不支持直接输入 mV 或 °C。开机电量和开机充电状态在“固件设置”中设置。"
-                     : "当前固件的通道用途和换算尚未确认，暂不能按 mV、% 或 °C 修改。开机电量和开机充电状态在“固件设置”中设置。")
+            SimulatorSection(title: "PMU 原始采样（调试）", icon: "waveform.path.ecg") {
+                Text("按原始计数直接改写 PMU 的八路采样，用于调试固件的电压与温度通路。日常修改电量、充电、温度请使用上方“设备数据”。")
                     .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
                 if adcAvailable {
-                    DisclosureGroup("高级：PMU 原始采样输入") {
+                    Group {
                         VStack(alignment: .leading, spacing: 10) {
                             Text("这些输入改变固件从 PMU 读取的原始计数。范围 0…65535，启动默认值 21000；重启后恢复。读取次数可用于确认固件是否取用了输入，不代表电量或温度变化。")
                                 .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
@@ -506,8 +511,6 @@ import UniformTypeIdentifiers
                     Text(session.isRunning ? "当前核心不支持 ADC 输入" : "运行后可编辑支持的原始输入")
                         .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
                 }
-                Text("血氧等其他传感器暂不支持注入。")
-                    .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
             }
             SimulatorSectionDivider()
             SimulatorSection(title: "应用与表盘", icon: "shippingbox") {

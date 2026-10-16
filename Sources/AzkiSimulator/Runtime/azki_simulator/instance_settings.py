@@ -37,6 +37,7 @@ CHARGERS = ("auto", "unplugged", "charging", "full")
 GAUGES = ("auto", "hp4560", "hp4570")
 MAX_STEPS = 10_000_000
 MAX_HEART_RATE = 255
+RESTING_HEART_RATE = 72  # pulse of a worn band without a saved value
 CADENCE_RANGE = (40, 200)
 SETTINGS = "settings.json"
 OBSERVED = "observed.json"
@@ -87,12 +88,13 @@ def _health(value):
 
     walkSteps: steps the wearer walks after each boot, counted by the firmware
     itself from the emulated IMU; cadence: steps per minute while walking;
-    heartRate: pulse the emulated optical sensor sees (0 = not on a wrist).
+    heartRate: pulse the emulated optical sensor sees; worn: whether the band
+    is on the wrist (default true; 0 bpm is also read as off the wrist).
     A legacy "steps" value is read as walkSteps.
     """
     if value is None:
         return {}
-    if not isinstance(value, dict) or set(value) - {"steps", "walkSteps", "cadence", "heartRate"}:
+    if not isinstance(value, dict) or set(value) - {"steps", "walkSteps", "cadence", "heartRate", "worn"}:
         raise SettingsError("健康数据设置格式无效")
     resolved = {}
     steps = value.get("walkSteps", value.get("steps"))
@@ -110,6 +112,11 @@ def _health(value):
         if type(rate) is not int or not 0 <= rate <= MAX_HEART_RATE:
             raise SettingsError("心率必须是 0…%d 的整数" % MAX_HEART_RATE)
         resolved["heartRate"] = rate
+    worn = value.get("worn")
+    if worn is not None:
+        if type(worn) is not bool:
+            raise SettingsError("佩戴状态必须是 true 或 false")
+        resolved["worn"] = worn
     return resolved
 
 
@@ -331,7 +338,7 @@ def _resolve_health(health, hardware):
 
     A preset whose firmware the modeled sensors drive always gets them, so its
     steps and pulse can also change while it runs; without saved values the
-    wearer stands still and the band is off the wrist (heart rate 0). Only
+    wearer stands still with the band on the wrist at a resting pulse. Only
     inputs verified to drive this preset's firmware are kept; the others are
     dropped instead of being passed to a board that would ignore them."""
     inputs = hardware.get("healthInputs") or {}
@@ -343,8 +350,9 @@ def _resolve_health(health, hardware):
         resolved["walkSteps"] = health["walkSteps"]
         if "cadence" in health:
             resolved["cadence"] = health["cadence"]
-    if inputs.get("heartRate") and "heartRate" in health:
-        resolved["heartRate"] = health["heartRate"]
+    if inputs.get("heartRate"):
+        resolved["heartRate"] = health.get("heartRate", RESTING_HEART_RATE)
+        resolved["worn"] = health.get("worn", True)
     resolved["sensorBoard"] = hardware["sensorBoard"]
     return resolved
 
