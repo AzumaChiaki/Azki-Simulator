@@ -106,7 +106,15 @@ def board_profile(profile, resource_bytes, storage_kind='romfs'):
                 'resource-yaffs':1,'pmu-calibration':1,
                 'panel-power0':0,'panel-power1':(1<<14)|(1<<24)|(1<<27),
                 'panel-power2':1<<3,'panel-id':0x270120,'panel-te-pin':47,
-                'touch-i2c':5,'touch-power-pin':52,'touch-reset-pin':77,'touch-irq-pin':76},
+                'touch-i2c':5,'touch-power-pin':52,'touch-reset-pin':77,'touch-irq-pin':76,
+                # .187 bespower_init opens up_i2cinitialize(3) (0x40061000) and
+                # probes SY6103X, HP4560, SC7061 at 0x07; hp4560_initialize
+                # (0x0c0c957a) accepts identity 0xc6 at register 0x60.
+                # 0x48 on I2C5 is the ambient light sensor.
+                'charger-i2c':0x0307,'charger-id':0xc6,'charger-map':1,
+                # [lc ntc] shell/skin thermistors on PMU ADC 2/5 (0x0c0e2dd0,
+                # 0x0c0e2e84); battery voltage is ADC 4 x 4.9 (0x0c0e2f00).
+                'pmu-adc-ntc':(1<<2)|(1<<5)},
             evidence=dict(nand_data=data[0],config=config[0],nv='BES header USER_SEC_SIZE + FACT_SEC_SIZE',
                           touch='N67 .187 table at file 0x6777d4: IRQ76/reset77; power52 at 0x0c0caf84; runtime I2C5=0x40063000',
                           panel='N67 .187 power sequence 0x0c0caef0 and accepted ID in 0x0c0df760; TE47 requires runtime verification'))
@@ -137,7 +145,16 @@ def board_profile(profile, resource_bytes, storage_kind='romfs'):
     if legacy: board['geometry'].update({'resource-yaffs':1,'pmu-calibration':1})
     if profile['model'].startswith('miwear.watch.n66'):
         board['geometry']['touch-health-format']=1
+        # get_bat_temp (.32 0x0c166a34) converts PMU ADC 3; battery is ADC 2.
+        board['geometry']['pmu-adc-ntc']=1<<3
         board['evidence']['touch']='N66 .17/.32 esd_check 0x0c1586ec accepts exact D048 byte 0x20/0xa0'
+    if profile['model'].startswith(('miwear.watch.o66', 'miwear.watch.q66')):
+        # Charger on I2C0 at 0x07: hp4560x_checkid (O66 .28 0x0c39caf8)
+        # accepts only identity 0xe0 at register 0x0a, else probes SC7061.
+        board['geometry'].update({'charger-i2c':0x0007,'charger-id':0xe0})
+        # Battery thermistor: O66 .28 get_bat_temp (0x0c11a8a4) reads ADC 3;
+        # Q66 stops charging as too cold unless ADC 5 is warm.
+        board['geometry']['pmu-adc-ntc']=1<<3 if profile['model'].startswith('miwear.watch.o66') else 1<<5
     if profile['model'].startswith('miwear.watch.o66'):
         # .28 read_chip_id at 0x0c10796e accepts module 0x03660014 or 0x03660012.
         # This is a virtual supported module identity, not a physical measurement.
@@ -150,7 +167,12 @@ def board_profile(profile, resource_bytes, storage_kind='romfs'):
         # 46 (reset), 67, 56, 59. Panel dispatch at 0x0c3e2108 accepts 27:01:20.
         board['geometry'].update({'panel-power0':0,'panel-power1':(1<<14)|(1<<24)|(1<<27),
                                   'panel-power2':1<<3,'panel-id':0x270120,'panel-te-pin':47,
-                                  'touch-i2c':5,'touch-power-pin':52,'touch-reset-pin':78,'touch-irq-pin':76})
+                                  'touch-i2c':5,'touch-power-pin':52,'touch-reset-pin':78,'touch-irq-pin':76,
+                                  # .043 hp4570_initialize (0x0c4044d4): I2C3
+                                  # 0x07, identity 0xc6 at register 0x60.
+                                  'charger-i2c':0x0307,'charger-id':0xc6,'charger-map':1,
+                                  # [lc ntc] shell/skin thermistors as on N67
+                                  'pmu-adc-ntc':(1<<2)|(1<<5)})
         board['evidence']['touch']='P67 .043 Hynitron setup 0x0c3f87e4; file 0xc460a0 config; GPIO IRQ 76/reset 78/power 52'
         board['evidence']['panel']='P67 .043 power sequence 0x0c3dd0a8 and panel dispatch 0x0c3e2108; other P67 versions require runtime verification'
     return _attach_nor_geometry(board, profile, ap_data, factory[0]['count'] * 512)
@@ -171,11 +193,15 @@ def main():
     parser.add_argument('--instance-nor-image', type=Path)
     parser.add_argument('--instance-nor-sha256')
     parser.add_argument('--instance-nor-initialize', action='store_true')
+    parser.add_argument('--instance-settings', type=Path)
     parser.add_argument('--skip-oobe', action=argparse.BooleanOptionalAction, default=True,
         help='Complete first-run setup locally (default); --no-skip-oobe preserves the firmware setup flow. Existing instance settings are kept.')
     parser.add_argument('--virtual-peer-state',type=Path)
     parser.add_argument('--virtual-peer-state-sha256')
     parser.add_argument('--virtual-peer-output',type=Path)
+    parser.add_argument('--gdb',type=int,nargs='?',const=0,metavar='PORT',
+        help='GDB server on 127.0.0.1 (free port when omitted/0); works with the virtual peer')
+    parser.add_argument('--gdb-wait',action='store_true',help='With --gdb: hold the CPU at reset until the debugger continues')
     args=parser.parse_args()
     virtual_requested=any((args.virtual_peer_state,args.virtual_peer_state_sha256,args.virtual_peer_output))
     if virtual_requested and (not all((args.virtual_peer_state,args.virtual_peer_state_sha256,args.virtual_peer_output)) or args.trace):
@@ -256,6 +282,10 @@ def main():
             sys.argv += ['--instance-data-seed', str(data_image)]
     elif data_image:
         sys.argv += ['--data-image',str(data_image)]
+    if args.instance_settings:
+        if not instance_storage:
+            parser.error('Instance settings require instance storage')
+        sys.argv += ['--instance-settings', str(args.instance_settings)]
     if instance_nor:
         sys.argv += ['--instance-nor-image', instance_nor['norImage'],
                      '--instance-nor-sha256', args.instance_nor_sha256]
@@ -266,6 +296,7 @@ def main():
     if not args.headless: sys.argv+=['--window']
     if args.trace: sys.argv+=['--trace']
     if args.seconds is not None: sys.argv+=['--seconds',str(args.seconds)]
+    if args.gdb is not None: sys.argv+=['--gdb',str(args.gdb)]+(['--gdb-wait'] if args.gdb_wait else [])
     return runner.main()
 
 

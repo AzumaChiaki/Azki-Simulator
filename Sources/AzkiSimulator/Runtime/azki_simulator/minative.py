@@ -100,6 +100,14 @@ def _validate_control_schema(value, plan):
     peer = supports_peer(plan)
     if peer:
         keys.add("virtual_peer")
+    # A user-enabled debugger is reported, never granted, by the runner: the
+    # native parent alone decides whether QEMU serves GDB on loopback.
+    if type(value) is dict and "gdb" in value:
+        keys.add("gdb")
+        gdb = value["gdb"]
+        if (type(gdb) is not dict or set(gdb) != {"host", "port", "waitForAttach"} or gdb["host"] != "127.0.0.1"
+                or type(gdb["port"]) is not int or not 0 < gdb["port"] <= 65535 or type(gdb["waitForAttach"]) is not bool):
+            raise MError("unsafe_control", "Runner debugger endpoint is not a loopback port")
     if type(value) is not dict or set(value) != keys or type(value.get("pid")) is not int:
         raise MError("unsafe_control", "Unsupported runner control record")
     if peer:
@@ -267,6 +275,131 @@ def _geometry(model):
     if model == "q66" or model.startswith(("miwear.watch.o66", "miwear.watch.q66")):
         return 212, 520
     raise MError("unsupported_profile", "Model is outside the Mi Band scope")
+
+
+# Board devices an instance's external settings may drive. The instance
+# hardware preset (its model) selects the part; firmware version never does,
+# so an imported OTA keeps the same devices as the bundled profile it runs on.
+# Band 9 / 9 Pro / 10 carry an HP4560 charger; Band 10 Pro / 11 an HP4570 with
+# a CW2218 coulomb counter. The firmware's battery voltage path reads PMU ADC
+# channel 2 (ISPI register 0x58) on Band 9 / 9 Pro / 11; the Band 10 / 10 Pro
+# BESPOWER manager reads it on channel 4 (x4.9; N67 .187 0x0c0e2f00, P67 .043
+# 0x0c3dbf48), where channels 2 and 5 are its shell/skin thermistors.
+BATTERY_ADC_CHANNEL = 2
+BATTERY_ADC_CHANNELS = {"miwear.watch.n67": 4, "miwear.watch.p67": 4}
+BATTERY_GAUGES = {"hp4560": ("miwear.watch.n66", "miwear.watch.n67", "miwear.watch.o66"),
+                  "hp4570": ("miwear.watch.p67", "miwear.watch.q66")}
+
+
+def board_hardware(model):
+    """Devices of one hardware preset, or None when the model is out of scope."""
+    if type(model) is not str or not model:
+        return None
+    for gauge, prefixes in BATTERY_GAUGES.items():
+        if model == "q66" or model.startswith(prefixes):
+            channel = next((c for p, c in BATTERY_ADC_CHANNELS.items() if model.startswith(p)),
+                           BATTERY_ADC_CHANNEL)
+            sensors = health_sensors(model) or {}
+            return {"batteryADCChannel": channel, "batteryGauge": gauge,
+                    "coulombCounter": "cw2218" if gauge == "hp4570" else None,
+                    "motionSensor": sensors.get("motion"), "heartRateSensor": sensors.get("optical"),
+                    "sensorBoard": sensors.get("board"),
+                    "healthInputs": {"steps": bool(sensors.get("steps")),
+                                     "heartRate": bool(sensors.get("heartRate"))}}
+    return None
+
+
+# Motion and optical sensors each preset's firmware probes, with the wiring
+# read from its drivers (chip-select GPIO, interrupt GPIO, SPI controller and,
+# for the IMU, how the part is mounted relative to the band). The core models
+# the chip; the firmware's own drivers and algorithms turn the raw samples
+# into steps and heart rate. Only inputs verified on a preset are offered:
+# steps = the firmware counted walked steps from the IMU, heartRate = the
+# firmware's heart-rate algorithm reported the simulated pulse.
+#   n66 Band 9 3.1.32 / o66 Band 9 Pro 3.1.28: LSM6DSO SPI0 CS53 INT71,
+#     HX3695 SPI0 CS50 INT14 (board_imu_initialize / board_afe_initialize).
+#   n67 Band 10 3.1.187: ICM-42607-P SPI0 CS13 INT10 (driver config byte 10,
+#     axis map 7 = x<->y, -z), HX3695 on SPI1 CS61 INT47.
+HEALTH_SENSORS = {
+    "miwear.watch.n66": {"board": "imu:lsm6dso:spi0:53:71;ppg:hx3695:spi0:50:14",
+                         "motion": "lsm6dso", "optical": "hx3695", "steps": True, "heartRate": True},
+    # O66: steps verified on the watch face; same optical part and firmware
+    # family as N66, its heart-rate page not yet checked.
+    "miwear.watch.o66": {"board": "imu:lsm6dso:spi0:53:71;ppg:hx3695:spi0:50:14",
+                         "motion": "lsm6dso", "optical": "hx3695", "steps": True, "heartRate": False},
+    # N67: the pedometer counts the walk (AlgoADE pedo), but the daily summary
+    # the pages show stays 0 and the pulse is not measured yet: not offered.
+    "miwear.watch.n67": {"board": "imu:icm42607:spi0:13:10:+y+x-z;ppg:hx3695:spi1:61:47",
+                         "motion": "icm42607", "optical": "hx3695", "steps": False, "heartRate": False},
+}
+
+
+def health_sensors(model):
+    """Modeled health sensors of one preset, or None."""
+    if type(model) is not str:
+        return None
+    for prefix, sensors in HEALTH_SENSORS.items():
+        if model.startswith(prefix):
+            return sensors
+    return None
+
+
+# Battery inputs verified to drive a preset's own firmware. The fuel gauge is
+# firmware code: at boot it restores its state of charge from a persist key and
+# corrects it against the battery voltage it samples on PMU ADC channel 2, so
+# a boot level is the persist value plus the raw sample of the matching open
+# circuit voltage. Band 9 (3.1.32): persist.gauge.cap is SOC x1000; the OCV
+# table (gauge state +0xa4, index 0 = 100 %; the gauge derives it for the
+# battery temperature, here the core's room-temperature thermistor input),
+# adc_mV = 0.051538 * raw - 23.3 and vbat = adc_mV * 7 were read from the
+# running firmware. The charger state is
+# applied only where the firmware finds its charger chip.
+BAND9_OCV_MV = (
+    4463.5, 4453.5, 4443.5, 4434.5, 4424.5, 4416.5, 4407.5, 4397.5, 4388.4, 4378.4,
+    4369.4, 4359.4, 4348.4, 4338.3, 4327.3, 4316.2, 4305.2, 4293.3, 4282.2, 4258.9,
+    4247.8, 4234.9, 4223.9, 4210.3, 4199.2, 4188.2, 4175.2, 4164.2, 4152.2, 4141.2,
+    4129.2, 4118.2, 4107.2, 4095.3, 4084.4, 4074.3, 4063.4, 4053.4, 4042.4, 4032.4,
+    4022.4, 4011.4, 4000.4, 3988.4, 3975.4, 3963.4, 3951.4, 3940.6, 3931.6, 3923.6,
+    3915.6, 3907.7, 3900.7, 3894.7, 3888.7, 3881.8, 3871.0, 3866.0, 3860.1, 3855.1,
+    3850.1, 3845.0, 3841.0, 3836.0, 3832.0, 3828.0, 3823.0, 3819.9, 3815.7, 3811.6,
+    3807.6, 3803.4, 3798.3, 3792.4, 3787.3, 3782.3, 3776.3, 3771.4, 3767.2, 3761.4,
+    3758.3, 3754.2, 3749.2, 3744.2, 3738.1, 3732.1, 3726.2, 3721.1, 3713.1, 3706.2,
+    3700.4, 3699.4, 3697.5, 3696.4, 3691.4, 3685.2, 3663.9, 3629.9, 3588.8, 3538.8,
+    3476.4)
+# Band 9 Pro (O66 .28) runs the same gauge: persist.gauge.cap, ADC 2 x7
+# (gauge state 0x20097058: divider 7.0 at +0x58, same OCV table at +0xa4) and
+# a 11000 boot sample reads 30 % on both. Runtime charger state shows on both
+# (PMU AC_ON edge -> hp4560(x) detect worker -> charge screen / face bolt).
+BATTERY_INPUTS = {
+    "miwear.watch.n66": {"levelKey": "persist.gauge.cap", "levelScale": 1000,
+                         "ocvMillivolts": BAND9_OCV_MV, "adcSlope": 0.051538,
+                         "adcOffset": -23.3, "divider": 7.0, "charger": True},
+    "miwear.watch.o66": {"levelKey": "persist.gauge.cap", "levelScale": 1000,
+                         "ocvMillivolts": BAND9_OCV_MV, "adcSlope": 0.051538,
+                         "adcOffset": -23.3, "divider": 7.0, "charger": True},
+    # Band 10 / 10 Pro / 11: the charger is found and its runtime state shows on
+    # the watch face; the boot level key (n67 persist.charger.per, p67
+    # persist.gauge_soc, q66 persist.charger.soc) is not verified yet.
+    "miwear.watch.n67": {"charger": True},
+    "miwear.watch.p67": {"charger": True},
+    "miwear.watch.q66": {"charger": True},
+}
+
+
+def battery_inputs(model):
+    """Verified battery inputs of one preset, or None."""
+    if type(model) is not str:
+        return None
+    for prefix, inputs in BATTERY_INPUTS.items():
+        if model.startswith(prefix):
+            return inputs
+    return None
+
+
+def battery_level_sample(inputs, level):
+    """PMU ADC raw count of the open-circuit voltage at a level (0…100 %)."""
+    millivolts = inputs["ocvMillivolts"][100 - level]
+    return round((millivolts / inputs["divider"] - inputs["adcOffset"]) / inputs["adcSlope"])
 
 
 def _catalog(project):
@@ -601,7 +734,12 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
         identity["bootstrap"] = pin(_path(bootstrap), MAX_JSON)
     if storage == "yaffs":
         identity["builders"] = [pin(project / "backend/build" / name) for name in ("yaffs-image", "legacy-ui-db")]
-        # The seed builder compiles/reads these vendored sources inside the sandbox.
+    # Every supported band keeps /data (persist.db) on a YAFFS NAND partition,
+    # including ROMFS-resource models; the settings tool is pinned for all.
+    if (project / "backend/build/instance-props").is_file():
+        identity.setdefault("builders", []).append(pin(project / "backend/build/instance-props"))
+    if identity.get("builders"):
+        # The builders compile/read these vendored sources inside the sandbox.
         references = project / "references"
         identity["builderSources"] = ([pin(path) for path in sorted(references.rglob("*")) if path.is_file()]
                                       if references.is_dir() else [])
@@ -742,6 +880,9 @@ def classify_result(result, returncode, *, stopped=False):
         reason = "input_rejection"
     elif outcome == "time_limit" and result.get("time_limit_reached") is True and returncode in (0, 2):
         return dict(base, state="completed", reason="time_limit")
+    elif outcome in ("guest_poweroff", "guest_reboot") and returncode in (0, 2):
+        # The firmware itself powered off or restarted; the host mirrors it.
+        return dict(base, state="stopped", reason=outcome)
     elif stopped and outcome in ("interrupted", "window_closed", "qemu_stopped"):
         return dict(base, state="stopped", reason="stopped")
     else:
@@ -1285,4 +1426,5 @@ class MinativeAdapter:
                     "guestInstallSupported": False, "desktopVerified": False,
                     "identityMode": self.plan["identity"].get("mode", "prepared"),
                     "observedBoard": self._observed_board,
+                    "debugger": (self._control or {}).get("gdb"),
                     "maxRunSeconds": self.seconds}

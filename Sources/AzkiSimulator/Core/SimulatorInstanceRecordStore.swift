@@ -198,7 +198,16 @@ nonisolated final class SimulatorInstanceRecordStore: @unchecked Sendable {
         }
         guard fd >= 0 else { throw SimulatorInstanceStoreError.unsafe("无法安全打开目录") }
         var info = stat()
-        let valid = fstat(fd, &info) == 0 && info.st_mode & S_IFMT == S_IFDIR
+        guard fstat(fd, &info) == 0 else { Darwin.close(fd); throw SimulatorInstanceStoreError.unsafe("无法检查目录") }
+        // A restore, a Finder copy or an installer can widen this directory's
+        // mode. Narrow it back instead of refusing to open the instance store;
+        // foreign owners and group/other-writable modes are still rejected.
+        if privateOnly, info.st_mode & S_IFMT == S_IFDIR, info.st_uid == geteuid(),
+           info.st_mode & 0o022 == 0, info.st_mode & 0o7777 != 0o700 {
+            _ = fchmod(fd, 0o700)
+            guard fstat(fd, &info) == 0 else { Darwin.close(fd); throw SimulatorInstanceStoreError.unsafe("无法检查目录") }
+        }
+        let valid = info.st_mode & S_IFMT == S_IFDIR
             && (privateOnly ? info.st_uid == geteuid() && info.st_mode & 0o7777 == 0o700
                 : (info.st_uid == geteuid() || info.st_uid == 0)
                     && (info.st_mode & 0o022 == 0 || (info.st_uid == 0 && info.st_mode & S_ISVTX != 0)))
@@ -224,6 +233,10 @@ nonisolated final class SimulatorInstanceRecordStore: @unchecked Sendable {
         do {
             var info = stat()
             guard fstat(fd, &info) == 0 else { throw Self.io("检查锁") }
+            if info.st_uid == geteuid(), info.st_mode & 0o022 == 0, info.st_mode & 0o7777 != 0o600 {
+                _ = fchmod(fd, 0o600)
+                guard fstat(fd, &info) == 0 else { throw Self.io("检查锁") }
+            }
             try Self.checkFile(info)
             guard info.st_size == 0 else { throw SimulatorInstanceStoreError.unsafe("锁文件含异常内容") }
             guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { throw Self.io("取得独占锁") }
@@ -275,6 +288,17 @@ nonisolated final class SimulatorInstanceRecordStore: @unchecked Sendable {
         guard fstatat(root, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
             if errno == ENOENT { return nil }
             throw io("检查文件")
+        }
+        // The document may have been restored with a wider mode; narrow it back
+        // rather than refusing to read the user's own instance list.
+        if info.st_mode & S_IFMT == S_IFREG, info.st_uid == geteuid(), info.st_nlink == 1,
+           info.st_mode & 0o022 == 0, info.st_mode & 0o7777 != 0o600 {
+            let fd = openat(root, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            if fd >= 0 {
+                _ = fchmod(fd, 0o600)
+                Darwin.close(fd)
+                guard fstatat(root, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else { throw io("检查文件") }
+            }
         }
         try checkFile(info)
         return Stamp(info)

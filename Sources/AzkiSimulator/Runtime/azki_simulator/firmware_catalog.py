@@ -7,11 +7,11 @@ storageKind,assets:{role:sha},recipe:{original non-path catalog fields}}],
 imports:[{sha256,bytes,kind:'ap'|'ota',profileIDs:[exact-id],members:[
 {asset:sha,record:{original ZIP local-header inventory}}]}]}.
 
-Bundled assets and user-imported private objects have separate distribution
-rules. Public distribution never turns a user's local import into a redistributable
-asset. A catalog package is recognized by its exact SHA; any other complete OTA is
-statically inventoried (imports[].generic) and offered on every hardware preset,
-with boot compatibility decided per launch by check_compatibility().
+The bundled catalog supplies hardware presets (product models and their screen
+geometry) and the app's own device metadata. Firmware never comes from it: every
+runnable entry is a complete OTA the user imported, inventoried structurally and
+offered on every hardware preset. Nothing here matches a firmware version or a
+digest against a list, and nothing here refuses to boot the user's own import.
 """
 from __future__ import annotations
 
@@ -35,9 +35,14 @@ from .minative import (INCLUDED_PROFILE_IDS, MError, _canonical, _decode, _direc
 
 SCHEMA = "azki.simulator.firmware.v1"
 MAX_ASSET = 768 * 1024 * 1024
+MAX_JSON_LIBRARY = 8 * 1024 * 1024
 MAX_EXPANDED = 1024 * 1024 * 1024
-MAX_LIBRARY = 6 * 1024 * 1024 * 1024
-MAX_OBJECTS = 512
+# Library bounds only keep the index document reasonable; they are far above
+# realistic use (one OTA is 0.1-0.5 GiB) and never the user's disk policy.
+MAX_LIBRARY = 1024 * 1024 * 1024 * 1024
+MAX_OBJECTS = 512  # Bundled catalog only.
+MAX_LIBRARY_OBJECTS = 8192
+MAX_LIBRARY_IMPORTS = 2048
 EXECUTION_PROFILES = INCLUDED_PROFILE_IDS
 # Profiles whose board/factory/resource are pre-pinned catalog objects keep "prepared" mode;
 # every other profile is "generated": the sandboxed runner derives storage from the pinned AP/OTA.
@@ -70,43 +75,11 @@ def storage_mode(profile):
     return "prepared" if "board" in profile["assets"] else "generated"
 
 
-def check_compatibility(model, recipe, ap_path):
-    """Static launch gate for imported firmware on an instance hardware preset.
+def product_name(model):
+    """Product name of a hardware preset, without any firmware version."""
+    return display_name({"id": model, "model": model, "version": ""}).rstrip(" ·") or model
 
-    Mirrors only what the runner can model: BES1503 boot header, a ROMFS
-    resource package or a YAFFS layout of a supported product family, and
-    the product family named by the AP itself. Everything else boots and
-    reports its own runtime outcome.
-    """
-    name = display_name({"id": model, "model": model, "version": ""}).rstrip(" ·") or model
-    ap = recipe["ap"]
-    def refuse(reason):
-        raise CatalogError("firmware_incompatible", "此固件无法在「" + name + "」硬件预设上启动：" + reason,
-                           {"model": model, "version": recipe.get("version")})
-    if ap.get("chip") != "best1503":
-        refuse("芯片为 " + str(ap.get("chip")) + "，模拟核心只实现了 BES1503")
-    if not all(type(ap.get(key)) is int for key in ("ap_offset", "flash_bytes", "reset_entry", "reset_sp")):
-        refuse("AP 启动头无法识别（" + str(ap.get("backend_requirement", ""))[:160] + "）")
-    names = [record["name"] for record in recipe["partitions"]]
-    if names.count("vela_resource.bin") > 1:
-        refuse("固件包含多个 ROMFS 资源分区")
-    if "vela_resource.bin" not in names:
-        if not model.startswith(("miwear.watch.n66", "miwear.watch.o66", "miwear.watch.n67")):
-            refuse("固件使用多分区 YAFFS 资源，此硬件预设只支持 ROMFS 资源包（vela_resource.bin）")
-        if not model.startswith("miwear.watch.n67") and "ota.json" not in names:
-            refuse("多分区固件缺少 ota.json 资源清单")
-    code = model.rsplit(".", 1)[-1]
-    family = code[:3]
-    declared = set()
-    data = Path(ap_path).read_bytes() if ap_path else b""
-    for match in re.finditer(rb"miwear\.watch\.([a-z0-9]{3,16})(?![a-z0-9])", data):
-        declared.add(match[1].decode("ascii"))
-    if recipe.get("family"):
-        declared.add(str(recipe["family"]))
-    if declared and not any(item[:3] == family for item in declared):
-        families = sorted({item[:3] for item in declared})
-        products = "、".join(PRODUCT_NAMES.get(item, item) for item in families)
-        refuse("固件声明的设备为 " + products + "，与实例的 " + PRODUCT_NAMES.get(family, family) + " 不一致")
+
 ROLES = {"ap", "ota", "resource", "board", "factory", "seed", "seedProof", "resourceProof"}
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -128,6 +101,121 @@ def _need(condition, code, message, **details):
 
 def _sha(value):
     return isinstance(value, str) and SHA.fullmatch(value) is not None
+
+
+# Names the app itself owns in a firmware library root. Anything else is the
+# user's business: an unexpected entry never blocks an import.
+LIBRARY_LAYOUT = {"objects", "index.json", ".import.lock", "instances"}
+
+
+def _owned_directory(path, *, create=False):
+    """Open a directory this app owns, repairing a wider mode.
+
+    The library belongs to the user: a mode changed by a backup, a Finder copy or
+    a different build must not brick imports. Links and foreign owners are still
+    rejected; any wider mode, including group/other-writable, is narrowed back
+    to owner-only.
+    """
+    path = _path(path)
+    try:
+        fd = _directory_fd(path)
+    except FileNotFoundError:
+        _need(create, "library_required", "固件库目录不存在")
+        # Only genuinely missing levels are created, each owner-only; the nearest
+        # existing ancestor is opened without traversing any link.
+        missing, ancestor = [], path
+        while True:
+            try:
+                fd = _directory_fd(ancestor)
+                break
+            except FileNotFoundError:
+                missing.append(ancestor)
+                ancestor = ancestor.parent
+        try:
+            for item in reversed(missing):
+                os.mkdir(item.name, 0o700, dir_fd=fd)
+                os.close(fd)
+                fd = _directory_fd(item)
+        finally:
+            os.close(fd)
+        fd = _directory_fd(path)
+    info = os.fstat(fd)
+    if info.st_uid != os.getuid():
+        os.close(fd)
+        raise CatalogError("unsafe_library", "固件库目录不属于当前用户，请把它移走或修正所有者后重试：" + str(path)[:160])
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        os.fchmod(fd, 0o700)
+    return fd
+
+
+def _owned_file(path, limit=MAX_ASSET):
+    """Open a file in the user's own library, narrowing a wider mode back."""
+    path = _path(path)
+    directory = _owned_directory(path.parent)
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    finally:
+        os.close(directory)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit or info.st_uid != os.getuid():
+            raise CatalogError("unsafe_library", "固件库文件不是当前用户的普通文件：" + path.name[:80])
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            os.fchmod(fd, 0o600)
+            # chmod changes ctime; callers compare the file stamp across a read.
+            info = os.fstat(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, info
+
+
+def _discard_tree(directory, name):
+    """Remove one abandoned staging directory; links are removed, never followed."""
+    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+    try:
+        with os.scandir(child) as entries:
+            for entry in entries:
+                info = entry.stat(follow_symlinks=False)
+                _need(info.st_uid == os.getuid(), "unsafe_library", "未完成的导入含其他用户的文件")
+                if stat.S_ISDIR(info.st_mode):
+                    _discard_tree(child, entry.name)
+                elif stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                    os.unlink(entry.name, dir_fd=child)
+                else:
+                    raise CatalogError("unsafe_library", "未完成的导入含不支持的文件类型")
+    finally:
+        os.close(child)
+    os.rmdir(name, dir_fd=directory)
+
+
+def _recover_library(root_fd):
+    """Ignore unrelated entries and clear staging left by an interrupted import.
+
+    A crash or a forced quit can leave a .txn- staging directory behind, which
+    would otherwise refuse every later import. Unknown entries are left exactly
+    as they are: the library is the user's own directory.
+    """
+    abandoned, cleared = [], 0
+    with os.scandir(root_fd) as entries:
+        for entry in entries:
+            info = entry.stat(follow_symlinks=False)
+            # .index- temporaries are only stale once no writer can still own them.
+            if (entry.name.startswith((".txn-", ".index-")) and info.st_uid == os.getuid()
+                    and (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode))
+                    and (entry.name.startswith(".txn-") or time.time() - info.st_mtime > 600)):
+                abandoned.append((entry.name, stat.S_ISDIR(info.st_mode)))
+    for name, directory in abandoned:
+        # Best effort: a leftover that cannot be cleared never blocks an import.
+        try:
+            if directory:
+                _discard_tree(root_fd, name)
+            else:
+                os.unlink(name, dir_fd=root_fd)
+            cleared += 1
+        except (OSError, CatalogError):
+            continue
+    return cleared
 
 
 def _text(value, maximum=128):
@@ -167,7 +255,7 @@ def _atomic_json(path, value, directory_fd=None):
             pass
 
 
-def _copy(source, target, expected=None, *, directory_fd=None, created=None, hash_content=True):
+def _copy(source, target, *, directory_fd=None, created=None, hash_content=True):
     source_fd, before = _open_file(source, MAX_ASSET)
     target_fd = None
     digest, count = hashlib.sha256(), 0
@@ -191,9 +279,8 @@ def _copy(source, target, expected=None, *, directory_fd=None, created=None, has
               "input_changed", "导入时固件文件发生变化，请重新选择")
         result = {"bytes": count}
         if hash_content:
+            # The digest names the content-addressed object; it never gates a boot.
             result["sha256"] = digest.hexdigest()
-        if expected:
-            _need(result == expected, "asset_hash_mismatch", "固件内容与已识别版本不一致")
         return result
     finally:
         os.close(source_fd)
@@ -219,23 +306,16 @@ def _publish_object(source_fd, name, target_fd):
     return True
 
 
-def _object_pin(directory, name):
+def _object_size(directory, name):
+    """Existing object metadata only: no re-read, no digest gate."""
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
     try:
-        before = os.fstat(fd)
-        _need(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid() and before.st_nlink == 1
-              and stat.S_IMODE(before.st_mode) == 0o600 and before.st_size <= MAX_ASSET,
-              "unsafe_library", "现有固件对象不是私有普通文件")
-        digest, total = hashlib.sha256(), 0
-        while chunk := os.read(fd, 1024 * 1024):
-            total += len(chunk)
-            _need(total <= MAX_ASSET, "input_quota", "现有固件对象超过大小限制")
-            digest.update(chunk)
-        after = os.fstat(fd)
-        _need((before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
-              (after.st_size, after.st_mtime_ns, after.st_ctime_ns) and total == before.st_size,
-              "input_changed", "现有固件对象在导入期间发生变化")
-        return {"sha256": digest.hexdigest(), "bytes": total}
+        info = os.fstat(fd)
+        _need(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_size <= MAX_ASSET,
+              "unsafe_library", "现有固件对象不是当前用户的普通文件，请删除该对象后重新导入")
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            os.fchmod(fd, 0o600)
+        return {"bytes": info.st_size}
     finally:
         os.close(fd)
 
@@ -248,7 +328,9 @@ def _member_record(value, asset):
     _need(_text(name, 512) and not name.startswith(("/", "\\")) and "\\" not in name
           and not any(x in ("", ".", "..") for x in name.split("/")) and ":" not in name,
           "unsafe_archive_path", "固件包包含不安全的成员路径")
-    _need(value.get("sha256") == asset and _sha(asset) and
+    # A member digest is optional: it is descriptive when present and never a
+    # condition for reading or booting the package.
+    _need((value.get("sha256") is None or (value.get("sha256") == asset and _sha(asset))) and
           value["compression_method"] in (0, 8) and 0 < value["size"] <= MAX_ASSET
           and 0 < value["compressed_size"] <= MAX_ASSET
           and value["size"] <= max(4096, value["compressed_size"] * 4096)
@@ -264,11 +346,15 @@ def _extract_member(source_fd, record, target, source_size, *, directory_fd=None
     _need(len(header) == 30, "archive_bounds", "固件包头不完整")
     magic, _, flags, method, _, _, crc, local_packed, local_size, names, extras = struct.unpack("<4s5H3I2H", header)
     data_offset = offset + 30 + names + extras
-    # Bits 1-2 only describe the DEFLATE level; encryption/data descriptors stay rejected.
-    _need(magic == b"PK\x03\x04" and flags & ~0x806 == 0 and method in (0, 8)
+    # Bits 1-2 describe the DEFLATE level. Bit 3 (signed OTAs) moves CRC and
+    # sizes to a trailing descriptor, so the local fields are zero and the
+    # central-directory values are the ones that bound the read below.
+    descriptor = bool(flags & 8)
+    local = (local_packed, local_size, f"{crc:08x}")
+    _need(magic == b"PK\x03\x04" and flags & ~0x80e == 0 and method in (0, 8)
+          and method == record["compression_method"]
           and data_offset == record["data_offset"] and data_offset + packed <= source_size
-          and (local_packed, local_size, method, f"{crc:08x}") ==
-          (packed, size, record["compression_method"], record["crc32"]),
+          and (local == (packed, size, record["crc32"]) or (descriptor and local == (0, 0, "00000000"))),
           "archive_format", "固件包成员与已校验清单不一致")
     name = os.pread(source_fd, names, offset + 30)
     _need(name == record["name"].encode("utf-8"), "archive_format", "固件包成员名称与清单不一致")
@@ -277,7 +363,7 @@ def _extract_member(source_fd, record, target, source_size, *, directory_fd=None
     if created is not None:
         info = os.fstat(descriptor)
         created[str(target)] = (info.st_dev, info.st_ino)
-    digest, checksum, total = hashlib.sha256(), 0, 0
+    total = 0
     decoder = zlib.decompressobj(-15) if method == 8 else None
     try:
         with os.fdopen(descriptor, "wb", closefd=False) as out:
@@ -296,14 +382,13 @@ def _extract_member(source_fd, record, target, source_size, *, directory_fd=None
                     pending = decoder.unconsumed_tail if decoder else b""
                     total += len(block)
                     _need(total <= size, "archive_quota", "固件包展开大小超出清单限制")
-                    digest.update(block)
-                    checksum = zlib.crc32(block, checksum)
                     out.write(block)
                     if decoder:
                         _need(not decoder.unused_data, "archive_format", "固件压缩成员含额外数据")
-            _need((decoder is None or (decoder.eof and not decoder.unconsumed_tail)) and total == size
-                  and checksum == crc and digest.hexdigest() == record["sha256"],
-                  "asset_hash_mismatch", "展开的固件成员未通过大小、CRC 或 SHA-256 校验")
+            # Decoding must land exactly on the recorded size; the bytes are
+            # taken as the user supplied them, not re-identified against a digest.
+            _need((decoder is None or (decoder.eof and not decoder.unconsumed_tail)) and total == size,
+                  "archive_format", "展开的固件成员大小与清单不一致")
             out.flush()
             os.fsync(out.fileno())
     finally:
@@ -390,65 +475,137 @@ class FirmwareCatalog:
                   "archive_quota", "固件包成员重叠或展开大小过大")
             self.imports[item["sha256"]] = item
 
-    def _recheck_catalog(self):
-        _need(_pin(self.bundle_root / "catalog.json")["sha256"] == self.catalog_sha256,
-              "catalog_changed", "固件目录已变化，请重新读取后再操作")
-
     def _index(self, create=False):
         empty = {"version": 1, "generation": 0, "objects": {}, "imports": []}
         if self.library_root is None:
             _need(not create, "library_required", "尚未配置私有固件库")
             return empty
-        if not self.library_root.exists():
-            if not create:
-                return empty
-            parent = _directory_fd(self.library_root.parent)
-            try:
-                os.mkdir(self.library_root.name, 0o700, dir_fd=parent)
-            finally:
-                os.close(parent)
-        root = _directory_fd(self.library_root, private=True)
+        if not self.library_root.exists() and not create:
+            return empty
+        root = _owned_directory(self.library_root, create=create)
         try:
-            if create:
-                try:
-                    os.mkdir("objects", 0o700, dir_fd=root)
-                except FileExistsError:
-                    pass
-                directory = _directory_fd(self.library_root / "objects", private=True)
-                os.close(directory)
+            try:
+                objects = _owned_directory(self.library_root / "objects", create=create)
+            except CatalogError:
+                # No object store yet: nothing has been imported into this library.
+                return empty
+            else:
+                os.close(objects)
+            try:
+                fd, info = _owned_file(self.library_root / "index.json", MAX_JSON_LIBRARY)
+            except FileNotFoundError:
+                return empty
+            try:
+                raw = b""
+                while True:
+                    chunk = os.read(fd, min(1024 * 1024, MAX_JSON_LIBRARY + 1 - len(raw)))
+                    if not chunk:
+                        break
+                    raw += chunk
+                    _need(len(raw) <= MAX_JSON_LIBRARY, "invalid_library", "私有固件库索引过大")
+                after = os.fstat(fd)
+                _need((info.st_size, info.st_mtime_ns, info.st_ctime_ns) ==
+                      (after.st_size, after.st_mtime_ns, after.st_ctime_ns),
+                      "input_changed", "读取索引时固件库发生变化")
+            finally:
+                os.close(fd)
+            try:
+                index = _decode(raw)
+                self._check_index(index)
+                return index
+            except (ValueError, KeyError, TypeError) as error:
+                # A damaged index is recoverable: the objects are the source of
+                # truth. Keep the unreadable document beside it, never overwrite it.
+                return self._rebuild_index(root, raw, error)
         finally:
             os.close(root)
-        try:
-            index = _json(self.library_root / "index.json", private=True)
-        except FileNotFoundError:
-            return empty
-        _need(index.get("version") == 1 and type(index.get("generation")) is int and 0 <= index["generation"] < 2**63
-              and isinstance(index.get("objects"), dict) and len(index["objects"]) <= MAX_OBJECTS
-              and isinstance(index.get("imports"), list) and len(index["imports"]) <= 128,
+
+    @staticmethod
+    def _check_index(index):
+        _need(isinstance(index, dict) and index.get("version") == 1
+              and type(index.get("generation")) is int and 0 <= index["generation"] < 2**63
+              and isinstance(index.get("objects"), dict) and len(index["objects"]) <= MAX_LIBRARY_OBJECTS
+              and isinstance(index.get("imports"), list) and len(index["imports"]) <= MAX_LIBRARY_IMPORTS,
               "invalid_library", "私有固件库索引无效")
         for digest, record in index["objects"].items():
             _need(_sha(digest) and isinstance(record, dict) and type(record.get("bytes")) is int
                   and 0 < record["bytes"] <= MAX_ASSET, "invalid_library", "私有固件资产记录无效")
+
+    def _rebuild_index(self, root, damaged, error):
+        """Rebuild the library index from the objects that are actually present.
+
+        Every full OTA object is inventoried again, so imported firmware stays
+        runnable after a lost or damaged index; extracted members are kept as
+        unnamed objects and re-derived on the next import of their package.
+        """
+        from .firmware_probe import ProbeError, ota_recipe
+        objects_directory = _owned_directory(self.library_root / "objects", create=True)
+        index = {"version": 1, "generation": 0, "objects": {}, "imports": []}
+        names = []
+        try:
+            with os.scandir(objects_directory) as entries:
+                for entry in entries:
+                    info = entry.stat(follow_symlinks=False)
+                    if not _sha(entry.name) or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                        continue
+                    names.append((entry.name, info.st_size))
+            for name, size in sorted(names):
+                if not 0 < size <= MAX_ASSET or len(index["objects"]) >= MAX_LIBRARY_OBJECTS:
+                    continue
+                index["objects"][name] = {"bytes": size}
+                if len(index["imports"]) >= MAX_LIBRARY_IMPORTS:
+                    continue
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=objects_directory)
+                try:
+                    if os.pread(fd, 4, 0) != b"PK\x03\x04":
+                        continue
+                    try:
+                        generic = ota_recipe(fd, size)
+                    except (ProbeError, MError, ValueError, OSError, zlib.error):
+                        continue
+                    ap = next((record for record in generic["partitions"]
+                               if record["name"].rsplit("/", 1)[-1] == "vela_ap.bin"), None)
+                    if ap is None or "sha256" not in ap:
+                        continue
+                    index["objects"].setdefault(ap["sha256"], {"bytes": ap["size"]})
+                    index["imports"].append({"sha256": name, "inputKind": "ota", "profileIDs": [],
+                        "importedAtUnix": int(time.time()),
+                        "generic": {"version": generic["version"], "family": generic["family"],
+                                    "declaredModels": generic["declaredModels"],
+                                    "apSHA256": ap["sha256"], "apBytes": ap["size"],
+                                    "recipe": {"ap": generic["ap"], "partitions": generic["partitions"],
+                                               "family": generic["family"]}}})
+                finally:
+                    os.close(fd)
+        finally:
+            os.close(objects_directory)
+        if damaged is not None:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            try:
+                os.rename("index.json", "index.json.recovered-" + stamp, src_dir_fd=root, dst_dir_fd=root)
+            except OSError:
+                pass
+        _atomic_json(self.library_root / "index.json", index, directory_fd=root)
         return index
 
-    def _asset(self, digest, index, verify=False):
+    def _asset(self, digest, index):
+        """Path of an existing asset; the catalog digest only names the file."""
         item = self.objects[digest]
         options = []
         if self.library_root and digest in index["objects"] and item["localAllowed"]:
-            _need(index["objects"][digest]["bytes"] == item["bytes"], "asset_hash_mismatch", "私有资产大小与目录不一致")
             options.append((self.library_root / "objects" / digest, "imported"))
         allowed = item["localAllowed"] if self.distribution == "local" else item["publicAllowed"]
         if allowed:
             options.append((self.bundle_root / item["path"], "bundled"))
         for path, source in options:
             try:
-                fd, info = _open_file(path, MAX_ASSET, private=source == "imported")
-            except FileNotFoundError:
-                continue
+                if source == "imported":
+                    fd, _ = _owned_file(path, MAX_ASSET)
+                else:
+                    fd, _ = _open_file(path, MAX_ASSET)
+            except (OSError, ValueError):
+                continue  # One unusable object only marks its own entry unavailable.
             os.close(fd)
-            _need(info.st_size == item["bytes"], "asset_hash_mismatch", "固件资产大小发生变化", sha256=digest)
-            if verify:
-                _need(_pin(path)["sha256"] == digest, "asset_hash_mismatch", "固件资产未通过 SHA-256 校验", sha256=digest)
             return path, source
         return None, None
 
@@ -482,20 +639,28 @@ class FirmwareCatalog:
         """Instance hardware presets: every product model the catalog describes."""
         return sorted({profile["model"] for profile in self.profiles.values()})
 
+    def hardware_presets(self):
+        """Instance hardware presets for the UI: model metadata, no firmware version."""
+        rows = {}
+        for profile in self.profiles.values():
+            rows.setdefault(profile["model"], {"model": profile["model"],
+                                               "displayName": product_name(profile["model"]),
+                                               "width": profile["width"], "height": profile["height"]})
+        return [rows[model] for model in sorted(rows)]
+
     def _object_path(self, digest, size, index):
-        """Library (or permitted bundled) object path for an exact size, else None."""
+        """Library (or permitted bundled) object path, else None."""
         if digest in self.objects:
             return self._asset(digest, index)[0]
         record = index["objects"].get(digest)
-        if self.library_root is None or record is None or record.get("bytes") != size:
+        if self.library_root is None or record is None:
             return None
         path = self.library_root / "objects" / digest
         try:
-            fd, info = _open_file(path, MAX_ASSET, private=True)
-        except FileNotFoundError:
-            return None
+            fd, _ = _owned_file(path, MAX_ASSET)
+        except (OSError, ValueError):
+            return None  # Reported as missing on its own entry; the list still loads.
         os.close(fd)
-        _need(info.st_size == size, "asset_hash_mismatch", "导入固件对象大小发生变化", sha256=digest)
         return path
 
     def _generic_sources(self, index):
@@ -537,27 +702,40 @@ class FirmwareCatalog:
                                  "missingRoles": [] if ready else ["ota"], "verification": "checked_at_launch"},
                 "source": "imported"}
 
+    def imported_id(self, profile_id):
+        """True when this ID names firmware the user imported.
+
+        An imported OTA may share its ID with a bundled metadata profile when the
+        bytes are the same release; the user's own import always wins.
+        """
+        parsed = generated_profile(profile_id)
+        if parsed is None:
+            return False
+        model, version, prefix = parsed
+        return any(digest.startswith(prefix) and source["version"] == version
+                   for digest, source in self._generic_sources(self._index()).items())
+
     def _generic_items(self, index, only=None):
         items = []
         for digest, source in sorted(self._generic_sources(index).items()):
             if only is not None and digest != only:
                 continue
             for model in self.hardware_models:
-                item = self._generic_item(model, digest, source, index)
-                if item["id"] not in self.profiles:
-                    items.append(item)
+                items.append(self._generic_item(model, digest, source, index))
         return items
 
     def list_items(self):
-        self._recheck_catalog()
-        index = self._index()
-        return [self._item(self.profiles[key], index) for key in sorted(self.profiles)] + self._generic_items(index)
+        """Every runnable entry is firmware the user imported.
+
+        The bundled catalog is device metadata (models, screen geometry, storage
+        kind); it never contributes a locked firmware version to this list.
+        """
+        return self._generic_items(self._index())
 
     def resolve_generic(self, profile_id):
         """Runner recipe for imported firmware on the profile's hardware preset."""
-        self._recheck_catalog()
         parsed = generated_profile(profile_id)
-        _need(parsed is not None and profile_id not in self.profiles, "unknown_profile", "请选择固件库中的固件")
+        _need(parsed is not None, "unknown_profile", "请选择固件库中的固件")
         model, version, prefix = parsed
         _need(model in self.hardware_models, "unknown_profile", "未知的实例硬件预设", model=model)
         index = self._index()
@@ -582,8 +760,8 @@ class FirmwareCatalog:
                            "ota": {"path": str(ota_path), "sha256": digest, "bytes": ota_bytes, "source": "imported"}},
                 "catalogSHA256": self.catalog_sha256, "executionApproved": False}
 
-    def resolve_profile(self, profile_id, *, verify=True):
-        self._recheck_catalog()
+    def resolve_profile(self, profile_id):
+        """Prepared-catalog resolution; kept for developer-local bundled assets."""
         _need(profile_id in self.profiles, "unknown_profile", "请选择固件目录中的准确型号与版本")
         profile, index = self.profiles[profile_id], self._index()
         item = self._item(profile, index)
@@ -591,7 +769,7 @@ class FirmwareCatalog:
               profileID=profile_id, missingRoles=item["availability"]["missingRoles"])
         assets = {}
         for role, digest in profile["assets"].items():
-            path, source = self._asset(digest, index, verify=verify)
+            path, source = self._asset(digest, index)
             if path is not None:
                 assets[role] = {"path": str(path), "sha256": digest, "bytes": self.objects[digest]["bytes"], "source": source}
         return {"version": 1, "profileID": profile_id, "item": item, "assets": assets,
@@ -600,15 +778,14 @@ class FirmwareCatalog:
                 "executionApproved": False}
 
     def import_file(self, source, profile_id=None):
-        self._recheck_catalog()
         source = _path(source)
         self._index(create=True)
-        root_fd = _directory_fd(self.library_root, private=True)
+        root_fd = _owned_directory(self.library_root, create=True)
         objects_fd = lock = None
         stage_name, stage_fd, created = None, None, {}
         def anchored():
             for path, held in ((self.library_root, root_fd), (self.library_root / "objects", objects_fd)):
-                check = _directory_fd(path, private=True)
+                check = _owned_directory(path)
                 try:
                     before, after = os.fstat(held), os.fstat(check)
                     _need((before.st_dev, before.st_ino) == (after.st_dev, after.st_ino),
@@ -616,31 +793,37 @@ class FirmwareCatalog:
                 finally:
                     os.close(check)
         try:
-            objects_fd = _directory_fd(self.library_root / "objects", private=True)
+            objects_fd = _owned_directory(self.library_root / "objects", create=True)
             lock = os.open(".import.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=root_fd)
             info = os.fstat(lock)
-            _need(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1
-                  and stat.S_IMODE(info.st_mode) == 0o600, "unsafe_library", "私有固件库锁文件不安全")
+            _need(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid(),
+                  "unsafe_library", "私有固件库锁文件不安全")
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                os.fchmod(lock, 0o600)
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
                 raise CatalogError("library_busy", "固件库正在导入，请稍后重试") from error
-            with os.scandir(root_fd) as entries:
-                for number, entry in enumerate(entries):
-                    _need(number < 16 and entry.name in {"objects", "index.json", ".import.lock"},
-                          "library_recovery_required", "固件库有未完成事务，请先恢复或保留后检查")
+            # Abandoned staging from an interrupted import is cleared here; any
+            # other entry is the user's and never blocks an import.
+            _recover_library(root_fd)
             index = self._index()
             anchored()
             existing_total = 0
             existing_names = set()
             with os.scandir(objects_fd) as entries:
-                    count = 0
                     for entry in entries:
-                        count += 1
                         record = entry.stat(follow_symlinks=False)
-                        _need(count <= MAX_OBJECTS and _sha(entry.name) and stat.S_ISREG(record.st_mode)
-                              and record.st_uid == os.getuid() and record.st_nlink == 1 and stat.S_IMODE(record.st_mode) == 0o600,
-                              "unsafe_library", "私有固件库包含异常文件或超过对象数量限制")
+                        # Only content-addressed regular files are firmware objects;
+                        # anything else the user put here is ignored, never touched.
+                        if not _sha(entry.name) or not stat.S_ISREG(record.st_mode) or record.st_uid != os.getuid():
+                            continue
+                        if stat.S_IMODE(record.st_mode) != 0o600:
+                            fd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=objects_fd)
+                            try:
+                                os.fchmod(fd, 0o600)
+                            finally:
+                                os.close(fd)
                         existing_total += record.st_size
                         existing_names.add(entry.name)
             fd, input_info = _open_file(source, MAX_ASSET)
@@ -650,73 +833,64 @@ class FirmwareCatalog:
             os.mkdir(stage_name, 0o700, dir_fd=root_fd)
             stage_fd = os.open(stage_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
             actual = _copy(source, "input", directory_fd=stage_fd, created=created)
-            entry = self.imports.get(actual["sha256"])
-            generic = None
-            if entry is None or entry["bytes"] != actual["bytes"]:
-                # Not a catalog package: any complete OTA is accepted. Whether it
-                # boots is decided per launch against the instance hardware preset.
-                from .firmware_probe import ProbeError, ota_recipe
-                input_fd = os.open("input", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=stage_fd)
+            # The user's own import is the only firmware source. No catalog lookup,
+            # version list or license record decides what may be imported: any
+            # complete OTA is inventoried structurally, and the run itself is what
+            # reports whether the firmware works on the instance hardware preset.
+            from .firmware_probe import ProbeError, ota_recipe
+            input_fd = os.open("input", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=stage_fd)
+            try:
+                _need(os.pread(input_fd, 4, 0) == b"PK\x03\x04", "unknown_firmware",
+                      "请导入完整 OTA 固件包（ZIP，包含 vela_ap.bin 和资源）；单独的 AP 文件缺少启动所需的资源",
+                      sha256=actual["sha256"])
                 try:
-                    _need(os.pread(input_fd, 4, 0) == b"PK\x03\x04", "unknown_firmware",
-                          "请导入完整 OTA 固件包（ZIP，包含 vela_ap.bin 和资源）；单独的 AP 文件缺少启动所需的资源",
-                          sha256=actual["sha256"])
-                    try:
-                        generic = ota_recipe(input_fd, actual["bytes"])
-                    except (ProbeError, MError, ValueError, OSError, zlib.error) as error:
-                        raise CatalogError("unknown_firmware", "固件包结构无法识别：" + str(error)[:240],
-                                           {"sha256": actual["sha256"]}) from error
-                finally:
-                    os.close(input_fd)
-                ap_record = next(r for r in generic["partitions"] if r["name"].rsplit("/", 1)[-1] == "vela_ap.bin")
-                _need(ap_record["sha256"] == generic["ap"]["sha256"], "asset_hash_mismatch", "AP 成员与分析结果不一致")
-                entry = {"kind": "ota", "profileIDs": [], "members": [{"asset": ap_record["sha256"], "record": ap_record}]}
-            generic_ids = [model + "@" + (generic["version"] if generic else
-                                          self.profiles[sorted(entry["profileIDs"])[0]]["version"]) + "@" + actual["sha256"][:12]
-                           for model in self.hardware_models] if entry["kind"] == "ota" else []
-            candidates = sorted(set(entry["profileIDs"]) | {x for x in generic_ids if x not in self.profiles})
+                    generic = ota_recipe(input_fd, actual["bytes"])
+                except (ProbeError, MError, ValueError, OSError, zlib.error) as error:
+                    raise CatalogError("unknown_firmware", "固件包结构无法识别：" + str(error)[:240],
+                                       {"sha256": actual["sha256"]}) from error
+            finally:
+                os.close(input_fd)
+            ap_record = next(r for r in generic["partitions"] if r["name"].rsplit("/", 1)[-1] == "vela_ap.bin")
+            entry = {"kind": "ota", "profileIDs": [], "members": [{"asset": generic["ap"]["sha256"], "record": ap_record}]}
+            candidates = sorted(model + "@" + generic["version"] + "@" + actual["sha256"][:12]
+                                for model in self.hardware_models)
             _need(profile_id is None or profile_id in candidates, "profile_mismatch", "此固件不属于所选配置", candidateIDs=candidates)
-            _need(generic is not None or self.objects[actual["sha256"]]["localAllowed"], "local_use_unavailable", "此固件尚无本地使用许可记录")
             _need(existing_total + actual["bytes"] + sum(member["record"]["size"] for member in entry.get("members", [])) <= MAX_LIBRARY,
                   "library_quota", "固件包的临时展开将超过私有库容量限制")
             os.replace("input", actual["sha256"], src_dir_fd=stage_fd, dst_dir_fd=stage_fd)
             created[actual["sha256"]] = created.pop("input")
             staged = {actual["sha256"]: actual["bytes"]}
-            if entry["kind"] == "ota":
-                source_fd = os.open(actual["sha256"], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=stage_fd)
-                try:
-                    info = os.fstat(source_fd)
-                    _need(stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) == created[actual["sha256"]]
-                          and info.st_size == actual["bytes"], "input_changed", "暂存固件对象发生变化")
-                    for member in entry.get("members", []):
-                        digest, record = member["asset"], member["record"]
-                        if digest not in staged:
-                            _need(generic is not None or self.objects[digest]["localAllowed"], "local_use_unavailable",
-                                  "固件包成员缺少本地使用记录")
-                            _extract_member(source_fd, record, digest, actual["bytes"], directory_fd=stage_fd, created=created)
-                            staged[digest] = record["size"]
-                finally:
-                    os.close(source_fd)
-            _need(len(existing_names | set(staged)) <= MAX_OBJECTS and len(index["imports"]) < 128
+            source_fd = os.open(actual["sha256"], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=stage_fd)
+            try:
+                info = os.fstat(source_fd)
+                _need(stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) == created[actual["sha256"]]
+                      and info.st_size == actual["bytes"], "input_changed", "暂存固件对象发生变化")
+                for member in entry["members"]:
+                    digest, record = member["asset"], member["record"]
+                    if digest not in staged:
+                        _extract_member(source_fd, record, digest, actual["bytes"], directory_fd=stage_fd, created=created)
+                        staged[digest] = record["size"]
+            finally:
+                os.close(source_fd)
+            _need(len(existing_names | set(staged)) <= MAX_LIBRARY_OBJECTS and len(index["imports"]) < MAX_LIBRARY_IMPORTS
                   and existing_total + sum(size for digest, size in staged.items()
                                            if digest not in existing_names) <= MAX_LIBRARY,
                   "library_quota", "导入后将超过私有固件库容量限制")
             anchored()
             for digest, size in staged.items():
                 if digest in existing_names or not _publish_object(stage_fd, digest, objects_fd):
-                    pin = _object_pin(objects_fd, digest)
-                    _need(pin["sha256"] == digest and pin["bytes"] == size, "asset_hash_mismatch", "现有固件对象损坏，已停止导入")
+                    pin = _object_size(objects_fd, digest)
+                    _need(pin["bytes"] == size, "library_changed", "现有固件对象大小与本次导入不一致")
                 index["objects"][digest] = {"bytes": size}
             os.fsync(objects_fd)
             index["generation"] += 1
             record = {"sha256": actual["sha256"], "inputKind": entry["kind"],
-                      "profileIDs": sorted(entry["profileIDs"]), "importedAtUnix": int(time.time())}
-            if generic is not None:
-                record["generic"] = {"version": generic["version"], "family": generic["family"],
-                                     "declaredModels": generic["declaredModels"],
-                                     "apSHA256": generic["ap"]["sha256"], "apBytes": generic["ap"]["size"],
-                                     "recipe": {"ap": generic["ap"], "partitions": generic["partitions"],
-                                                "family": generic["family"]}}
+                      "profileIDs": sorted(entry["profileIDs"]), "importedAtUnix": int(time.time()),
+                      "generic": {"version": generic["version"], "family": generic["family"],
+                                  "declaredModels": generic["declaredModels"],
+                                  "apSHA256": generic["ap"]["sha256"], "apBytes": generic["ap"]["size"],
+                                  "recipe": {"ap": generic["ap"], "partitions": generic["partitions"],
+                                             "family": generic["family"]}}}
             # Re-importing the same bytes replaces, never duplicates, its record.
             index["imports"] = [item for item in index["imports"]
                                 if not (isinstance(item, dict) and item.get("sha256") == actual["sha256"])] + [record]

@@ -18,8 +18,14 @@ def checked_member(data: bytes, record: dict, *, verify_sha=True) -> bytes:
     signature, _, flags, method, _, _, crc, packed, size, names, extra = values
     begin = offset + 30 + names + extra
     end = begin + packed
-    if signature != b'PK\x03\x04' or flags & 9 or end > len(data):
-        raise ValueError('Unsupported or truncated ZIP local member')
+    if signature != b'PK\x03\x04' or flags & 1:
+        raise ValueError('Unsupported ZIP local member')
+    if flags & 8 and (crc, packed, size) == (0, 0, 0):
+        # Data descriptor: CRC and sizes follow the data; use the inventory.
+        crc, packed, size = int(record['crc32'], 16), record['compressed_size'], record['size']
+    end = begin + packed
+    if end > len(data):
+        raise ValueError('Truncated ZIP local member')
     name = data[offset + 30:offset + 30 + names].decode('utf-8')
     expected = (record['name'], record['data_offset'], record['compressed_size'],
                 record['size'], record['compression_method'], record['crc32'])
@@ -37,7 +43,9 @@ def checked_member(data: bytes, record: dict, *, verify_sha=True) -> bytes:
         raise ValueError('Unsupported resource ZIP method')
     if len(output) != size or zlib.crc32(output) != crc:
         raise ValueError('Resource ZIP size/CRC mismatch')
-    if verify_sha and hashlib.sha256(output).hexdigest() != record['sha256']:
+    # A member digest is descriptive metadata: the user's imported package is
+    # read as supplied, and an inventory without a digest is still readable.
+    if verify_sha and record.get('sha256') and hashlib.sha256(output).hexdigest() != record['sha256']:
         raise ValueError('Resource member SHA256 mismatch')
     return output
 

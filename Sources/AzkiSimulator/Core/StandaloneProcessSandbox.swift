@@ -19,7 +19,9 @@ nonisolated struct StandaloneSandboxLaunch: Sendable {
     var executable: URL { URL(fileURLWithPath: "/usr/bin/sandbox-exec") }
     var environment: [String: String] {
         ["PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C", "HOME": temporaryDirectory.path,
-         "TMPDIR": temporaryDirectory.path, "PYTHONDONTWRITEBYTECODE": "1"]
+         "TMPDIR": temporaryDirectory.path, "PYTHONDONTWRITEBYTECODE": "1",
+         // Instance clocks follow the Mac's zone unless the user overrides it.
+         "AZKI_HOST_TIMEZONE": TimeZone.current.identifier]
     }
     func configure(_ process: Process) throws {
         let policyURL = try artifact.publish(policyText, in: temporaryDirectory)
@@ -84,10 +86,23 @@ nonisolated enum StandaloneSandboxFiles {
         }
         _ = try directory(url, privateOnly: true)
     }
+    /// The library and its instance folders are this app's own data. A restore,
+    /// Finder copy or migration can widen their mode; narrow it back to 0700
+    /// instead of refusing to run. Foreign owners, links and group/other-writable
+    /// directories are still rejected by `directory(_:privateOnly:)`.
+    static func narrowPrivate(_ url: URL) {
+        let fd = Darwin.open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC)
+        guard fd >= 0 else { return }
+        defer { Darwin.close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFDIR, info.st_uid == geteuid(),
+              info.st_mode & 0o022 == 0, info.st_mode & 0o7777 != 0o700 else { return }
+        _ = fchmod(fd, 0o700)
+    }
     static func ensureLibrary(_ url: URL) throws {
         // Native host creates missing ancestors; the interpreter is granted only
         // the final private library, never Application Support or its parent.
-        if access(url.path, F_OK) == 0 { _ = try directory(url, privateOnly: true); return }
+        if access(url.path, F_OK) == 0 { narrowPrivate(url); _ = try directory(url, privateOnly: true); return }
         let parent = url.deletingLastPathComponent()
         if access(parent.path, F_OK) != 0 { try ensureLibrary(parent) }
         else { _ = try directory(parent) }
@@ -218,8 +233,11 @@ nonisolated enum StandaloneProcessSandbox {
         let data = try! JSONSerialization.data(withJSONObject: [value], options: [.withoutEscapingSlashes])
         return String(data: data, encoding: .utf8)!.dropFirst().dropLast().description
     }
+    /// `extraRules` carries complete SBPL rules built only from constants in this
+    /// file (e.g. a name-prefix regex that `subpath` cannot express); never user input.
     static func policy(executables: [URL], readTrees: [URL], readFiles: [URL], writeTrees: [URL],
-                       writeFiles: [URL] = [], unixDirectory: URL? = nil, allowChildren: Bool = false) -> String {
+                       writeFiles: [URL] = [], unixDirectory: URL? = nil, allowChildren: Bool = false,
+                       extraRules: [String] = []) -> String {
         var rules = ["(version 1)", "(deny default)", "(allow sysctl-read)",
             // The local dyld libignition bootstrap opens the root as an openat
             // anchor. This grants only the directory itself, not its children.
@@ -246,6 +264,7 @@ nonisolated enum StandaloneProcessSandbox {
         if let unixDirectory {
             rules.append("(allow network-bind network-inbound network-outbound (local unix-socket (subpath \(quote(unixDirectory.path)))))")
         }
+        rules += extraRules
         return rules.prefix(2).joined(separator: "\n") + "\n" + rules.dropFirst(2).sorted().joined(separator: "\n") + "\n"
     }
 
@@ -257,6 +276,7 @@ nonisolated enum StandaloneProcessSandbox {
         var argv = arguments
         var inputs: [URL] = []
         var writes = [temporary]
+        var extraRules: [String] = []
         guard let command = arguments.first else { throw SimulatorError.transport("缺少静态命令") }
         switch command {
         case "library-catalog":
@@ -279,6 +299,8 @@ nonisolated enum StandaloneProcessSandbox {
                 let instance = library.appendingPathComponent("instances/" + arguments[6], isDirectory: true)
                 try StandaloneSandboxFiles.ensureLibrary(instance)
                 writes.append(instance)
+                // Settles an interrupted earlier run of this instance itself.
+                extraRules = preparedSessionRules
             }
             if arguments.count == 11 {
                 guard arguments[7] == "--virtual-serial", arguments[9] == "--virtual-address" else {
@@ -307,6 +329,33 @@ nonisolated enum StandaloneProcessSandbox {
                   let id = UUID(uuidString: arguments[2]), id.uuidString.lowercased() == arguments[2] else {
                 throw SimulatorError.transport("实例身份读取参数无效")
             }
+        case "instance-settings":
+            guard [3, 5].contains(arguments.count), arguments[1] == "--instance-id",
+                  let id = UUID(uuidString: arguments[2]), id.uuidString.lowercased() == arguments[2],
+                  arguments.count == 3 || (arguments[3] == "--set" && arguments[4].utf8.count <= 262_144) else {
+                throw SimulatorError.transport("实例设置参数无效")
+            }
+            let instance = library.appendingPathComponent("instances/" + arguments[2], isDirectory: true)
+            try StandaloneSandboxFiles.ensureLibrary(instance)
+            writes.append(instance)
+        case "instance-reset":
+            // Recovers this instance's interrupted commits/staging and clears its
+            // session caches; it may write only inside the instance's own folder.
+            guard arguments.count == 3, arguments[1] == "--instance-id",
+                  let id = UUID(uuidString: arguments[2]), id.uuidString.lowercased() == arguments[2] else {
+                throw SimulatorError.transport("实例重置参数无效")
+            }
+            let instance = library.appendingPathComponent("instances/" + arguments[2], isDirectory: true)
+            try StandaloneSandboxFiles.ensureLibrary(instance)
+            writes.append(instance)
+            // A stopped run's session can then be committed instead of rolled back.
+            extraRules = preparedSessionRules
+        case "sessions-cleanup":
+            // Removes stale session roots this app created in /private/tmp. SBPL
+            // `subpath` cannot express a name prefix, so the grant is a fixed regex
+            // over our own prefixes; listing the parent reveals names only.
+            guard arguments.count == 1 else { throw SimulatorError.transport("会话清理参数无效") }
+            extraRules = sessionCleanupRules
         case "instance-storage-finish":
             guard arguments.count == 5, arguments[1] == "--session", arguments[3] == "--instance-id",
                   let id = UUID(uuidString: arguments[4]), id.uuidString.lowercased() == arguments[4] else {
@@ -320,6 +369,7 @@ nonisolated enum StandaloneProcessSandbox {
             }
             _ = try StandaloneSandboxFiles.directory(session, privateOnly: true)
             let instance = library.appendingPathComponent("instances/" + arguments[4], isDirectory: true)
+            StandaloneSandboxFiles.narrowPrivate(instance)
             _ = try StandaloneSandboxFiles.directory(instance, privateOnly: true)
             writes += [session, instance]
         case "prepare":
@@ -335,10 +385,25 @@ nonisolated enum StandaloneProcessSandbox {
         }
         if command != "prepare" { argv += ["--engine-root", runtime.engine.path, "--library-root", library.path] }
         let trees = try packagedReadTrees(runtime)
-        let text = policy(executables: [runtime.python], readTrees: trees + [library], readFiles: inputs, writeTrees: writes)
+        let text = policy(executables: [runtime.python], readTrees: trees + [library], readFiles: inputs, writeTrees: writes,
+                          extraRules: extraRules)
         return StandaloneSandboxLaunch(policyText: text, arguments: [runtime.python.path, "-I", "-S", "-B", runtime.script.path] + argv,
             workingDirectory: temporary, temporaryDirectory: temporary)
     }
+
+    /// Prepared sessions only: lets instance recovery commit an earlier stopped run.
+    static let preparedSessionRules = [
+        "(allow file-read-metadata (literal \"/private/tmp\") (literal \"/tmp\") (literal \"/private\"))",
+        "(allow file-read* file-write* (regex #\"^/private/tmp/azki-b-\"))",
+    ]
+
+    /// Session roots created by this app: prepared (`azki-b-`), advanced
+    /// (`azki-sim-`) and inspection temporaries (`azki-cmd-`).
+    static let sessionCleanupRules = [
+        "(allow file-read* (literal \"/private/tmp\"))",
+        "(allow file-read-metadata (literal \"/tmp\") (literal \"/private\"))",
+        "(allow file-read* file-write* (regex #\"^/private/tmp/azki-(b|sim|cmd)-\"))",
+    ]
 
     private static func permitsSyntheticKey(runtime: StandaloneBundledRuntime, profile: String) throws -> Bool {
         // Capabilities are selected by profile and bounded layout. A historical
@@ -352,8 +417,10 @@ nonisolated enum StandaloneProcessSandbox {
     }
 
     static func makeServe(runtime: StandaloneBundledRuntime, session: URL, approvedIdentity: String,
-                          maxRuntime: Int, library: URL, temporary: URL, guestRun: URL? = nil) throws -> StandaloneSandboxLaunch {
-        guard FirmwareLibraryValidation.digest(approvedIdentity), StandaloneRunLimits.isValid(maxRuntime) else {
+                          maxRuntime: Int, library: URL, temporary: URL, guestRun: URL? = nil,
+                          debugger: StandaloneDebugger? = nil) throws -> StandaloneSandboxLaunch {
+        guard FirmwareLibraryValidation.digest(approvedIdentity), StandaloneRunLimits.isValid(maxRuntime),
+              debugger?.isValid ?? true else {
             throw SimulatorError.transport("缺少本次完整运行身份")
         }
         _ = try StandaloneSandboxFiles.directory(session, privateOnly: true)
@@ -440,6 +507,7 @@ nonisolated enum StandaloneProcessSandbox {
             var instanceReads: [URL] = []
             var instanceWrites: [URL] = []
             var instanceArguments: [String] = []
+            var settingsArguments: [String] = []
             if let binding = identity["instanceStorage"] as? [String: Any], binding["available"] as? Bool == true {
                 guard let capabilities = identity["runtimeCapabilities"] as? [String: Any],
                       let capability = capabilities["nandPersistence"] as? [String: Any],
@@ -481,6 +549,19 @@ nonisolated enum StandaloneProcessSandbox {
                     instanceReads.append(peer.readFile)
                     instanceArguments += peer.arguments
                 }
+                if let path = binding["settingsPath"] as? String {
+                    // Host-authored firmware settings, applied by the runner before boot.
+                    let settings = root.appendingPathComponent("instance-settings.json")
+                    var info = stat()
+                    guard path == settings.path,
+                          let digest = binding["settingsSHA256"] as? String, FirmwareLibraryValidation.digest(digest),
+                          lstat(settings.path, &info) == 0, info.st_uid == geteuid(), info.st_mode & 0o777 == 0o600,
+                          info.st_mode & S_IFMT == S_IFREG, info.st_nlink == 1, info.st_size <= 1_048_576 else {
+                        throw SimulatorError.unsafeFile("实例固件设置文件属性无效")
+                    }
+                    settingsArguments = ["--instance-settings", settings.path]
+                    instanceReads.append(settings)
+                }
             }
             if storage == "yaffs" {
                 // The YAFFS image builders run inside the same sandbox and the
@@ -491,6 +572,11 @@ nonisolated enum StandaloneProcessSandbox {
                 }
                 guestExecutables += builders
             }
+            // /data is YAFFS on every model. Older engines lack the settings tool;
+            // it is granted only when pinned.
+            let properties = project.appendingPathComponent("backend/build/instance-props")
+            if pinned(properties) { guestExecutables.append(properties) }
+            else if !settingsArguments.isEmpty { throw SimulatorError.transport("实例设置工具未纳入启动计划") }
             // Every profile derives its storage caches (YAFFS NAND images, ROMFS
             // resources extracted from the OTA) under this session's private project.
             let assets = project.appendingPathComponent("assets", isDirectory: true)
@@ -499,11 +585,11 @@ nonisolated enum StandaloneProcessSandbox {
             guestWrites.append(assets)
             let text = policy(executables: guestExecutables, readTrees: [],
                 readFiles: pins + Array(directories) + instanceReads, writeTrees: guestWrites, writeFiles: instanceWrites,
-                unixDirectory: run, allowChildren: true)
+                unixDirectory: run, allowChildren: true, extraRules: debugger.map { [$0.sandboxRule] } ?? [])
             return StandaloneSandboxLaunch(policyText: text, arguments: [runtime.python.path, "-I", "-S", "-B", supervisor.path,
                 "--native", String(maxRuntime), run.appendingPathComponent("runner-process.json").path,
-                String(getpid()), runtime.engine.path, project.path, profile, run.path] + instanceArguments
-                    + [(plan["skipOOBE"] as? Bool ?? true) ? "--skip-oobe" : "--no-skip-oobe"],
+                String(getpid()), runtime.engine.path, project.path, profile, run.path] + instanceArguments + settingsArguments
+                    + [(plan["skipOOBE"] as? Bool ?? true) ? "--skip-oobe" : "--no-skip-oobe"] + (debugger?.arguments ?? []),
                 workingDirectory: project, temporaryDirectory: guestTemporary)
         }
         // H may inspect peer/process ownership, but never forks or executes G.

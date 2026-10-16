@@ -30,12 +30,22 @@ final class SimulatorInstanceContext: Identifiable {
 @MainActor @Observable
 final class SimulatorInstanceLibrary {
     private(set) var instances: [SimulatorInstanceContext] = []
-    var selectedID: UUID?
+    /// The sidebar selection survives relaunches (a convenience, not state).
+    var selectedID: UUID? {
+        didSet { if oldValue != selectedID { UserDefaults.standard.set(selectedID?.uuidString, forKey: Self.selectionKey) } }
+    }
     var errorMessage: String?
     private(set) var storageAvailable = true
+    /// Set by the New menu command (⌘N); the manager view presents the sheet.
+    var creationRequested = false
     let catalog: StandaloneRuntimeModel
     @ObservationIgnored private let store: SimulatorInstanceRecordStore
     @ObservationIgnored private let maximumRuntimeSeconds: Int
+    @ObservationIgnored private var launchMaintenance: Task<Void, Never>?
+    private static let selectionKey = "AzkiSimulator.selectedInstanceID"
+    /// Upper bound for stopping one instance. The reaper, broker and storage
+    /// commit are each bounded; this guards the sum and any unknown hang.
+    static let stopTimeoutSeconds = 45.0
 
     init(store: SimulatorInstanceRecordStore = SimulatorInstanceRecordStore(),
          maximumRuntimeSeconds: Int = StandaloneRunLimits.unlimited,
@@ -43,21 +53,59 @@ final class SimulatorInstanceLibrary {
         self.store = store
         self.maximumRuntimeSeconds = maximumRuntimeSeconds
         self.catalog = catalog ?? StandaloneRuntimeModel()
+        loadInstances()
+    }
+
+    private func loadInstances() {
         do {
             instances = try store.load().map { SimulatorInstanceContext(record: $0, maximumRuntimeSeconds: maximumRuntimeSeconds) }
-            selectedID = instances.first?.id
+            storageAvailable = true
+            let saved = UserDefaults.standard.string(forKey: Self.selectionKey).flatMap(UUID.init(uuidString:))
+            selectedID = instances.contains { $0.id == saved } ? saved : instances.first?.id
         } catch {
             storageAvailable = false
-            errorMessage = "无法读取设备实例：\(error.localizedDescription)"
+            // Shown inline in the empty state with a retry, not as a modal.
+            storageFailure = "无法读取设备实例：\(error.localizedDescription)"
+        }
+    }
+
+    /// Why the instance list could not be read; nil when storage is usable.
+    private(set) var storageFailure: String?
+
+    /// Retry reading the instance list after a transient failure (e.g. a
+    /// locked or briefly unavailable data folder). Never rewrites the file.
+    func reloadInstances() {
+        guard !storageAvailable else { return }
+        storageFailure = nil
+        loadInstances()
+        if storageAvailable { beginLaunchMaintenance(force: true) }
+    }
+
+    /// Once per launch: remove stale session roots, then let every instance
+    /// repair its own folder. Each step is non-fatal and scoped to its
+    /// instance; a failure never blocks the list or other instances.
+    func beginLaunchMaintenance(force: Bool = false) {
+        guard launchMaintenance == nil || force else { return }
+        if StandaloneRuntimeModel.launchCleanup == nil {
+            let catalog = catalog
+            StandaloneRuntimeModel.launchCleanup = Task { @MainActor in await catalog.cleanupStaleSessions() }
+        }
+        let targets = instances
+        launchMaintenance = Task { @MainActor in
+            await withTaskGroup(of: Void.self) { group in
+                for instance in targets { group.addTask { @MainActor in await instance.runtime.resetAtLaunch() } }
+            }
         }
     }
 
     var runningCount: Int { instances.filter { $0.runtime.isServing || $0.runtime.runtimeSession.isRunning }.count }
     var selected: SimulatorInstanceContext? { instances.first { $0.id == selectedID } }
-    var deviceModels: [BundledFirmwareItem] {
-        var seen = Set<String>()
-        return catalog.firmwareItems.filter { seen.insert($0.model).inserted }
-            .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+    /// Hardware presets come from the built-in device metadata. Firmware is
+    /// always the user's own import, so a preset never implies a version.
+    var deviceModels: [BundledDevicePreset] {
+        catalog.devicePresets.sorted {
+            $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+        }
     }
 
     @discardableResult func create(model: String, name: String) -> SimulatorInstanceContext? {
@@ -95,6 +143,54 @@ final class SimulatorInstanceLibrary {
         candidate[index].name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         try store.save(candidate)
         instances[index].record = candidate[index]
+    }
+
+    /// Delete one instance: stop it, drop its record, then remove its own data.
+    /// Imported firmware belongs to the library and is never touched here.
+    @discardableResult func delete(_ id: UUID) async -> Bool {
+        guard storageAvailable else { errorMessage = "实例存储不可用"; return false }
+        guard let instance = instances.first(where: { $0.id == id }) else { return false }
+        // A starting, checking or running instance is stopped first; stop()
+        // also cancels its in-flight helper commands.
+        if instance.runtime.isBusy || instance.runtime.isServing || instance.runtime.runtimeSession.isAttached
+            || instance.sharing.isSharing {
+            guard await Self.stopInstance(instance) else {
+                errorMessage = "未能确认「\(instance.record.name)」已停止，实例未删除。请稍后重试，或先对它使用「重置实例」。"
+                return false
+            }
+        }
+        // The record goes first: a failed cleanup must not leave a record that
+        // points at data which is already gone.
+        do { try store.save(instances.filter { $0.id != id }.map(\.record)) }
+        catch { errorMessage = "无法删除实例：\(error.localizedDescription)"; return false }
+        instances.removeAll { $0.id == id }
+        if selectedID == id { selectedID = instances.first?.id }
+        if !(await instance.runtime.discardInstanceData()) { errorMessage = instance.runtime.errorMessage }
+        return true
+    }
+
+    /// Recovery for one instance: stop it and reset its runtime state. Errors
+    /// stay on that instance; the list and other instances are unaffected.
+    func resetInstance(_ id: UUID) async {
+        guard let instance = instances.first(where: { $0.id == id }) else { return }
+        instance.bluetooth.stop()
+        await instance.recording.stop()
+        _ = await instance.sharing.disable()
+        _ = await SimulatorDeadline.bounded(Self.stopTimeoutSeconds + 30, fallback: false) {
+            await instance.runtime.resetInstance()
+        }
+    }
+
+    /// Stop one instance's external connections and core, bounded in time.
+    static func stopInstance(_ instance: SimulatorInstanceContext) async -> Bool {
+        await SimulatorDeadline.bounded(stopTimeoutSeconds, fallback: false) {
+            instance.bluetooth.stop()
+            await instance.recording.stop()
+            guard await instance.sharing.disable() else { return false }
+            let stopped = await instance.runtime.stop()
+            if stopped { instance.runtime.runtimeSession.detach() }
+            return stopped
+        }
     }
 
     func defaultName(for model: String) -> String {
@@ -137,28 +233,22 @@ final class SimulatorInstanceLibrary {
         instance.runtime.skipOOBE = enabled
     }
 
-    func stopAll() async -> Bool {
-        // Concurrent cleanup: a slow guest must not postpone stopping its peers.
-        let values = await withTaskGroup(of: Bool.self, returning: [Bool].self) { group in
+    /// Names of instances whose stop could not be confirmed (empty on success).
+    /// Concurrent and individually bounded: a slow or stuck guest neither
+    /// postpones its peers nor holds Quit forever.
+    func stopAll() async -> [String] {
+        await withTaskGroup(of: String?.self, returning: [String].self) { group in
             for instance in instances {
-                group.addTask { @MainActor in
-                    instance.bluetooth.stop()
-                    await instance.recording.stop()
-                    guard await instance.sharing.disable() else { return false }
-                    let stopped = await instance.runtime.stop()
-                    if stopped { instance.runtime.runtimeSession.detach() }
-                    return stopped
-                }
+                group.addTask { @MainActor in await Self.stopInstance(instance) ? nil : instance.record.name }
             }
-            var values: [Bool] = []
-            for await value in group { values.append(value) }
-            return values
+            var failed: [String] = []
+            for await name in group { if let name { failed.append(name) } }
+            return failed
         }
-        return values.allSatisfy { $0 }
     }
 
-    static func deviceName(_ item: BundledFirmwareItem) -> String {
-        item.displayName.components(separatedBy: " · ").first ?? item.model
+    static func deviceName(_ preset: BundledDevicePreset) -> String {
+        preset.displayName.components(separatedBy: " · ").first ?? preset.model
     }
 }
 

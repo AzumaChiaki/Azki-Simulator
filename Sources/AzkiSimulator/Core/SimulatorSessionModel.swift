@@ -11,7 +11,12 @@ final class SimulatorSessionModel {
         didSet {
             // A guest that exits on its own (e.g. firmware incompatible with the
             // instance hardware preset) must not look like an idle connection.
-            guard status?["state"]?.string == "crashed", oldValue?["state"]?.string != "crashed" else { return }
+            let state = status?["state"]?.string, reason = status?["stopReason"]?.string
+            if state == "stopped", let reason, ["guest_poweroff", "guest_reboot"].contains(reason),
+               oldValue?["state"]?.string != "stopped" || oldValue?["stopReason"]?.string != reason {
+                onGuestPower?(reason)
+            }
+            guard state == "crashed", oldValue?["state"]?.string != "crashed" else { return }
             errorMessage = Self.failureDescription(status)
         }
     }
@@ -22,6 +27,13 @@ final class SimulatorSessionModel {
     private(set) var isConnecting = false
     private(set) var isCommandInFlight = false
     var errorMessage: String?
+    /// Recoverable, self-clearing trouble (slow control replies, a frame read
+    /// that keeps failing). Shown inline instead of re-raising a modal alert.
+    private(set) var transientIssue: String? { didSet { if transientIssue == nil { frameIssue = false } } }
+    @ObservationIgnored private var frameIssue = false
+    /// Called once when the firmware itself powers off ("guest_poweroff") or
+    /// restarts ("guest_reboot"); the owner mirrors it on the host.
+    @ObservationIgnored var onGuestPower: ((String) -> Void)?
 
     @ObservationIgnored private var connection: SimulatorSessionConnection?
     @ObservationIgnored private var frameReader: SimulatorFrameReader?
@@ -77,7 +89,7 @@ final class SimulatorSessionModel {
                     do { current = try await candidate.command("status") }
                     catch is SimulatorConnectionTimeout {
                         current = nil
-                        self.errorMessage = SimulatorConnectionTimeout().localizedDescription
+                        self.transientIssue = SimulatorConnectionTimeout().localizedDescription
                     }
                     guard self.generation == token, !Task.isCancelled else { await candidate.close(); return }
                     let reader = try await candidate.makeFrameReader()
@@ -118,7 +130,7 @@ final class SimulatorSessionModel {
         frameReader = nil
         manifest = nil; frame = nil; image = nil; status = nil
         logs = ""; packageReport = ""; screenshotName = nil; adcState = nil
-        isConnecting = false; isCommandInFlight = false
+        isConnecting = false; isCommandInFlight = false; transientIssue = nil
     }
 
     func fetchLogs(_ name: String) {
@@ -273,7 +285,7 @@ final class SimulatorSessionModel {
                         self.image = next.image
                         sequence = next.frame.sequence
                     }
-                    failureSince = nil
+                    if failureSince != nil { failureSince = nil; self.transientIssue = nil }
                 } catch SimulatorError.frameBeingWritten {
                     // An in-progress seqlock is retried at the next deadline.
                 } catch {
@@ -284,8 +296,8 @@ final class SimulatorSessionModel {
                     }
                     if failureSince == nil { failureSince = clock.now }
                     if self.isRunning, let since = failureSince, since.duration(to: clock.now) >= .seconds(1) {
-                        self.errorMessage = error.localizedDescription
-                        failureSince = clock.now
+                        self.transientIssue = "画面读取异常：" + error.localizedDescription
+                        self.frameIssue = true
                     }
                 }
                 try? await clock.sleep(until: cadence.next(after: clock.now), tolerance: .milliseconds(1))
@@ -305,6 +317,8 @@ final class SimulatorSessionModel {
                     let current = try await connection.command("status")
                     guard self.generation == token, !Task.isCancelled else { return }
                     if revision == self.statusRevision, self.status != current { self.status = current }
+                    // A successful reply clears a slow-reply notice, not a frame issue.
+                    if self.transientIssue != nil, !self.frameIssue { self.transientIssue = nil }
                 } catch {
                     guard self.generation == token, !Task.isCancelled else { return }
                     self.handleConnectionFailure(error, disconnectOnFailure: true)
@@ -317,8 +331,8 @@ final class SimulatorSessionModel {
     private func handleConnectionFailure(_ error: Error, disconnectOnFailure: Bool = false) {
         if error is SimulatorConnectionTimeout {
             // A slow control reply says nothing about guest liveness. Keep the
-            // independent frame reader and let status polling recover.
-            errorMessage = error.localizedDescription
+            // independent frame reader and let status polling recover; no modal.
+            transientIssue = error.localizedDescription
         } else if error as? SimulatorError == .disconnected {
             detach()
             errorMessage = nil

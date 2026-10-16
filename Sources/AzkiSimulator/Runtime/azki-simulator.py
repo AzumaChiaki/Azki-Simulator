@@ -13,10 +13,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from azki_simulator.bridge import SessionBridge, create_session, request, private_root, regular_bytes, MAX_MESSAGE
 
 
+BUNDLED_ACTIONS = ("library-catalog", "library-import", "library-probe", "prepare-bundled", "instance-storage-finish",
+                   "instance-identity", "instance-settings", "instance-delete", "instance-reset", "sessions-cleanup")
+ACTION_FAILURES = {
+    "library-catalog": "读取固件库失败，请稍后重试",
+    "library-import": "导入固件失败，请确认所选文件是完整的 OTA 固件包后重试",
+    "library-probe": "无法识别所选固件文件",
+    "prepare-bundled": "准备启动实例失败；可在实例管理中重置该实例后重试，已保存的数据不受影响",
+    "instance-storage-finish": "保存本次运行的数据失败；已保存的快照保持不变，下次启动会自动整理",
+    "instance-identity": "读取实例身份失败",
+    "instance-settings": "读取或保存实例设置失败",
+    "instance-delete": "删除实例数据失败",
+    "instance-reset": "整理实例数据失败；已保存的数据未被删除",
+    "sessions-cleanup": "清理临时会话失败",
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    for action in ("library-catalog", "library-import", "library-probe", "prepare-bundled", "instance-storage-finish", "instance-identity"):
+    for action in BUNDLED_ACTIONS:
         library = commands.add_parser(action, help="Firmware library and private instance preparation")
         library.add_argument("--engine-root", type=Path, required=True)
         library.add_argument("--library-root", type=Path, required=True)
@@ -35,8 +51,14 @@ def main():
             library.add_argument("--virtual-address", help="Requested six-byte virtual Bluetooth address")
             library.add_argument("--skip-oobe", action=argparse.BooleanOptionalAction, default=True,
                                  help="Complete initial setup for new device storage")
-        if action == "instance-identity":
+        if action in ("instance-identity", "instance-delete", "instance-reset"):
             library.add_argument("--instance-id", required=True)
+        if action == "sessions-cleanup":
+            # Tests point this at a scratch folder; the app always uses /private/tmp.
+            library.add_argument("--tmp-root", type=Path, default=Path("/private/tmp"), help=argparse.SUPPRESS)
+        if action == "instance-settings":
+            library.add_argument("--instance-id", required=True)
+            library.add_argument("--set", help="Replace the instance settings with this JSON document")
         if action == "instance-storage-finish":
             library.add_argument("--session", type=Path, required=True)
             library.add_argument("--instance-id", required=True)
@@ -81,12 +103,11 @@ def main():
                                           "inspect-package", "stage-package", "install", "uninstall"])
     call.add_argument("--arguments", default="{}", help="JSON object")
     args = parser.parse_args()
-    if args.action in ("library-catalog", "library-import", "library-probe", "prepare-bundled", "instance-storage-finish", "instance-identity"):
+    if args.action in BUNDLED_ACTIONS:
         try:
             result = bundled_action(args)
-        except (OSError, ValueError, KeyError) as error:
-            result = {"ok": False, "version": 1, "error": {"code": getattr(error, "code", "bundled_input_error"),
-                       "message": str(error)[:1024]}}
+        except Exception as error:  # Every failure is one JSON answer, never a trace.
+            result = failure(args.action, error)
     elif args.action == "power":
         from azki_simulator.power import power_transaction
         result = power_transaction(args.session, args.operation, args.target)
@@ -148,10 +169,39 @@ def main():
     return 0 if result.get("ok", True) else 1
 
 
+def failure(action, error):
+    """Actionable Chinese error JSON; English internals become the detail."""
+    message = str(error).strip()
+    if isinstance(error, OSError) and error.strerror:
+        message = error.strerror + ((": " + str(error.filename)) if error.filename else "")
+    if not any("\u4e00" <= char <= "\u9fff" for char in message):
+        summary = ACTION_FAILURES.get(action, "操作失败")
+        detail = (type(error).__name__ + ": " + message) if message else type(error).__name__
+        message = summary + "（详细信息：" + detail[:600] + "）"
+    return {"ok": False, "version": 1, "error": {"code": getattr(error, "code", None) or "bundled_input_error",
+                                                 "message": message[:1024]}}
+
+
 def bundled_action(args):
+    if args.action == "instance-reset":
+        from azki_simulator.maintenance import reset_instance
+        return reset_instance(args.library_root, args.instance_id)
+    if args.action == "sessions-cleanup":
+        from azki_simulator.maintenance import cleanup_sessions
+        return cleanup_sessions(args.library_root, args.tmp_root)
     if args.action == "instance-identity":
         from azki_simulator.instance_storage import public_instance_identity
         return public_instance_identity(args.library_root, args.instance_id)
+    if args.action == "instance-settings":
+        from azki_simulator import instance_settings
+        if args.set is not None:
+            if len(args.set.encode("utf-8")) > 262144:
+                raise instance_settings.SettingsError("设置内容过大")
+            instance_settings.save(args.library_root, args.instance_id, json.loads(args.set))
+        return instance_settings.describe(args.library_root, args.instance_id)
+    if args.action == "instance-delete":
+        from azki_simulator import instance_settings
+        return instance_settings.discard(args.library_root, args.instance_id)
     if args.action == "instance-storage-finish":
         from azki_simulator.instance_storage import finish_session_storage
         return finish_session_storage(args.library_root, args.session, args.instance_id)
@@ -167,8 +217,10 @@ def bundled_action(args):
     catalog = FirmwareCatalog(engine.parent / "Firmware", args.library_root,
                               distribution="public" if runtime.get("profile") == "public" else None)
     if args.action == "library-catalog":
+        # items: firmware the user imported. presets: instance hardware presets,
+        # which are device metadata and never a locked firmware version list.
         return {"ok": True, "version": 1, "items": catalog.list_items(),
-                "runtime": runtime}
+                "presets": catalog.hardware_presets(), "runtime": runtime}
     if args.action == "library-import":
         return {"ok": True, "version": 1, **catalog.import_file(args.input, profile_id=args.profile_id)}
     return prepare_profile(engine, args.library_root, args.profile_id, args.session_root,

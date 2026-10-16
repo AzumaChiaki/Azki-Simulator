@@ -25,6 +25,38 @@ MAX_REQUEST = 2048
 MAX_RESPONSE = 65536
 
 
+class GuestClock:
+    """Monotonic seconds that stand still while the guest CPU is halted.
+
+    A debugger may stop the guest at a breakpoint for any length of time. The
+    peer's protocol deadlines describe guest progress, so they are measured on
+    this clock; a halted guest never looks like an unresponsive device.
+    """
+    def __init__(self, source=time.monotonic):
+        self.source = source
+        self.lock = threading.Lock()
+        self.paused_total = 0.0
+        self.paused_since = None
+
+    def __call__(self):
+        with self.lock:
+            now = self.source()
+            paused = self.paused_total + (now - self.paused_since if self.paused_since is not None else 0.0)
+            return now - paused
+
+    @property
+    def running(self):
+        with self.lock: return self.paused_since is None
+
+    def set_running(self, running):
+        with self.lock:
+            now = self.source()
+            if running and self.paused_since is not None:
+                self.paused_total += now - self.paused_since; self.paused_since = None
+            elif not running and self.paused_since is None:
+                self.paused_since = now
+
+
 def peer_identity(connection):
     if sys.platform != 'darwin' or os.getuid() != os.geteuid():
         raise ValueError('Kernel peer identity unavailable')
@@ -105,10 +137,11 @@ class PeerService:
         self.controller = SecureLinkController(private_state['identity']['address'])
         self.controller.encryption_events = deque(maxlen=128)
         self.connection_timeout = 30
+        self.clock = GuestClock()
         self.central = self._central()
         self.protocol = H4Link(self.controller,self.central.consume,max_packets=None)
         self.central.link = self.protocol
-        self.operations = GuestOperations(self.central.api, instance_id=private_state['instanceID'],profile_id=private_state['profileID'])
+        self.operations = GuestOperations(self.central.api, instance_id=private_state['instanceID'],profile_id=private_state['profileID'],clock=self.clock)
         self.hci_path = self.root/'hci.sock'
         self.peer_path = self.root/'peer.sock'
         self.selector = selectors.DefaultSelector()
@@ -159,6 +192,10 @@ class PeerService:
         except BaseException:
             self.close(); raise
         return self
+
+    def set_guest_running(self, running):
+        """Runner-observed vCPU run state (debugger halt, -S prelaunch)."""
+        self.clock.set_running(bool(running))
 
     def attach_core(self,pid):
         if type(pid) is not int or pid <= 0 or self.core_pid is not None:
@@ -222,7 +259,7 @@ class PeerService:
             self.operations.close()
             if self.controller.connected: self._send(self.controller.disconnect_local())
             self.central.business.invalidate(self.controller.generation)
-            self.external = ExternalCentral(self.controller, value.get('connectionTimeoutSeconds', self.connection_timeout))
+            self.external = ExternalCentral(self.controller, value.get('connectionTimeoutSeconds', self.connection_timeout), clock=self.clock)
             bond = self.private_state.get('guestLinkBond') or self.private_state['binding']
             if bond:
                 self.external.smp.bond = (bytes.fromhex(bond['ltk']), bytes.fromhex(bond['random']), bond['ediv'])
@@ -235,7 +272,7 @@ class PeerService:
         if command == 'external-reconnect':
             self._save_external_bond()
             if self.controller.connected: self._send(self.controller.disconnect_local())
-            bridge.reconnect(time.monotonic())
+            bridge.reconnect(self.clock())
             return {'reconnecting': True}
         if command == 'external-request':
             return bridge.submit(value['operation'], value['key'], value['value'], value['offset'], value['enabled'])
@@ -247,7 +284,7 @@ class PeerService:
             self.central = self._central()
             self.central.link = self.protocol
             self.protocol.on_l2cap = self.central.consume
-            self.operations = GuestOperations(self.central.api, instance_id=self.private_state['instanceID'], profile_id=self.private_state['profileID'])
+            self.operations = GuestOperations(self.central.api, instance_id=self.private_state['instanceID'], profile_id=self.private_state['profileID'], clock=self.clock)
             self.external = None
             return {'closed':True}
         raise ValueError('Unknown external command')
@@ -289,8 +326,8 @@ class PeerService:
                 old.p256.close()
                 self.protocol.on_l2cap = self.central.consume
                 self.central.link = self.protocol
-                self.operations = GuestOperations(self.central.api,instance_id=self.private_state['instanceID'],profile_id=self.private_state['profileID'])
-            self.central.state = 'idle'; self.central.next_at = time.monotonic()
+                self.operations = GuestOperations(self.central.api,instance_id=self.private_state['instanceID'],profile_id=self.private_state['profileID'],clock=self.clock)
+            self.central.state = 'idle'; self.central.next_at = self.clock()
             return self.status()
         expected = dict(expected_session_id=value['sessionID'],expected_generation=value['generation'])
         if command == 'inventory':
@@ -351,12 +388,13 @@ class PeerService:
         try:
             while not self.stop.is_set():
                 now = time.monotonic()
+                guest_now = self.clock()
                 if self.connection:
                     if self.external is not None:
-                        self._send(self.external.tick(now))
+                        self._send(self.external.tick(guest_now))
                         self._save_external_bond()
                     else:
-                        self._send(self.central.tick(now))
+                        self._send(self.central.tick(guest_now))
                         self.operations.tick()
                     phase = self._phase()
                     operation = self.operations.status()["operation"]

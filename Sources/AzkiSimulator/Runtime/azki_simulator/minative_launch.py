@@ -90,9 +90,23 @@ def terminate_group(child):
 
 def native_invocation(arguments):
     """Only the native parent constructs these eight fixed positional values."""
+    # Optional user-requested debugger, appended last by the native parent:
+    # --gdb PORT [--gdb-wait]. PORT 0 lets QEMU pick a free loopback port.
+    debugger = []
+    if arguments and arguments[-1] == "--gdb-wait":
+        debugger, arguments = ["--gdb-wait"], arguments[:-1]
+    if len(arguments) >= 2 and arguments[-2] == "--gdb":
+        if re.fullmatch(r"0|[1-9][0-9]{0,4}", arguments[-1]) is None or int(arguments[-1]) > 65535:
+            raise ValueError("Invalid native debugger port")
+        debugger, arguments = ["--gdb", arguments[-1]] + debugger, arguments[:-2]
+    elif debugger:
+        raise ValueError("Debugger wait requires a debugger port")
     oobe = arguments[-1:] if arguments and arguments[-1] in ("--skip-oobe", "--no-skip-oobe") else []
     if oobe:
         arguments = arguments[:-1]
+    settings = arguments[-2:] if len(arguments) >= 2 and arguments[-2] == "--instance-settings" else []
+    if settings:
+        arguments = arguments[:-2]
     if len(arguments) not in (8, 16, 20, 21, 26, 27) or arguments[0] != "--native":
         raise ValueError("Invalid native guest invocation")
     virtual = arguments[-6:] if len(arguments) in (26, 27) else []
@@ -141,7 +155,11 @@ def native_invocation(arguments):
                 or virtual[5] != str(run / "virtual-peer-state.pending.json")):
             raise ValueError("Native virtual peer arguments differ from the private instance and owned run")
         command += virtual
-    return duration, metadata, parent, command + oobe
+    if settings:
+        if len(core_arguments) < 16 or settings[1] != str(run.parent / "instance-data/instance-settings.json"):
+            raise ValueError("Native instance settings differ from the private session file")
+        command += settings
+    return duration, metadata, parent, command + oobe + debugger
 
 
 def await_native_go(parent, stopped, *, descriptor=0, timeout=2):

@@ -14,7 +14,7 @@ final class StandaloneRuntimeModel {
     private(set) var isStopping = false
     var isBusy: Bool { operationCount > 0 || isStopping }
     private(set) var isServing = false
-    private(set) var statusMessage = "选择内置固件，或导入自己的固件"
+    private(set) var statusMessage = "导入自己的固件，然后按实例的硬件预设开机"
     var errorMessage: String?
     private(set) var selectedSummary = "尚未准备运行文件"
     let runtimeSession = SimulatorSessionModel()
@@ -35,8 +35,34 @@ final class StandaloneRuntimeModel {
             }
         }
     }
+    /// User-requested GDB server for the next launch, remembered per instance.
+    /// It runs alongside the virtual Bluetooth peer and takes effect at the
+    /// next start; a running device keeps the choice it was started with.
+    var debuggerEnabled = false { didSet { saveDebuggerPreference() } }
+    /// Hold the CPU at reset until the debugger continues it.
+    var debuggerWaitForAttach = false { didSet { saveDebuggerPreference() } }
+    /// Loopback TCP port; 0 lets the core pick a free port each launch.
+    var debuggerPort = 0 { didSet { saveDebuggerPreference() } }
+    var debuggerRequest: StandaloneDebugger? {
+        debuggerEnabled ? StandaloneDebugger(port: (0...65_535).contains(debuggerPort) ? debuggerPort : 0,
+                                             waitForAttach: debuggerWaitForAttach) : nil
+    }
+    /// The GDB endpoint the running core reported, e.g. port chosen by QEMU.
+    var debuggerEndpoint: (port: Int, waitForAttach: Bool)? {
+        guard let value = runtimeSession.status?["debugger"], case .number(let port)? = value["port"],
+              port >= 1, port <= 65_535 else { return nil }
+        return (Int(port), value["waitForAttach"]?.bool ?? false)
+    }
+    private var debuggerDefaultsKey: String? { instanceID.map { "AzkiDebugger." + $0.uuidString.lowercased() } }
+    private func saveDebuggerPreference() {
+        guard let key = debuggerDefaultsKey else { return }
+        UserDefaults.standard.set(["enabled": debuggerEnabled, "waitForAttach": debuggerWaitForAttach,
+                                   "port": debuggerPort], forKey: key)
+    }
     private(set) var firmwareItems: [BundledFirmwareItem] = []
-    private(set) var libraryStatus = "正在读取内置固件目录"
+    /// Instance hardware presets: device metadata, never a firmware version list.
+    private(set) var devicePresets: [BundledDevicePreset] = []
+    private(set) var libraryStatus = "正在读取固件库"
     private(set) var libraryAvailable = false
     private(set) var libraryRuntimeReady = false
     private(set) var hasLoadedCatalog = false
@@ -48,6 +74,15 @@ final class StandaloneRuntimeModel {
     let instanceID: UUID?
     private(set) var instanceStorageMessage = "用户数据盘尚未启用"
     @ObservationIgnored private var storageSession: URL?
+    /// Bumped whenever this instance's runtime caches are reset. Views clear
+    /// their own per-instance caches (debug text, guest inventory, drafts) on it.
+    private(set) var resetEpoch = 0
+    /// The identity the user already confirmed to run. A cold restart of the
+    /// same prepared identity does not ask again.
+    @ObservationIgnored private var confirmedIdentity: String?
+    /// One launch-wide cleanup of stale session roots. Helper commands wait for
+    /// it (bounded) so it never races a fresh session's temporary directory.
+    static var launchCleanup: Task<Void, Never>?
     var selectedProfileID: String? { didSet {
         guard oldValue != selectedProfileID else { return }
         revision &+= 1
@@ -77,12 +112,85 @@ final class StandaloneRuntimeModel {
         self.maximumRuntimeSeconds = maximumRuntimeSeconds
         self.modelConstraint = modelConstraint
         self.instanceID = instanceID
+        if let instanceID, let saved = UserDefaults.standard.dictionary(forKey: "AzkiDebugger." + instanceID.uuidString.lowercased()) {
+            debuggerEnabled = saved["enabled"] as? Bool ?? false
+            debuggerWaitForAttach = saved["waitForAttach"] as? Bool ?? false
+            debuggerPort = (saved["port"] as? Int).flatMap { (0...65_535).contains($0) ? $0 : nil } ?? 0
+        }
         self.helper = ownedHelper
         self.startingHelper = helperIsStarting ? ownedHelper : nil
         self.helperOutput = helperOutput
         self.isServing = ownedHelper != nil
         self.firmwareService = firmwareService
         if let ownedHelper { observeTermination(of: ownedHelper) }
+        runtimeSession.onGuestPower = { [weak self] reason in self?.mirrorGuestPower(reason) }
+    }
+
+    /// The firmware powered off or restarted itself. Stop the core (committing
+    /// instance storage like a normal stop); a restart then cold-boots the same
+    /// firmware with the committed data, as the hardware would.
+    private func mirrorGuestPower(_ reason: String) {
+        guard isServing, !isStopping else { return }
+        Task { @MainActor [weak self] in
+            guard let self, await self.stop() else { return }
+            await self.continueAfterGuestPower(reason)
+        }
+    }
+
+    /// Any imported firmware of this model may run on this instance; the data
+    /// disk is carried across versions. Stopped: just select. Running (owned
+    /// core): stop (committing the data disk), select, then cold-boot.
+    func switchFirmware(to profileID: String) async {
+        guard profileID != selectedProfileID,
+              selectableFirmwareItems.contains(where: { $0.id == profileID }) else { return }
+        if !isServing && !runtimeSession.isAttached {
+            selectedProfileID = profileID
+            statusMessage = "已切换固件；切换固件会保留数据盘"
+            return
+        }
+        guard isServing, !isStopping, await stop() else { return }
+        selectedProfileID = profileID
+        statusMessage = "正在切换固件并重新开机…"
+        await continueAfterGuestPower("guest_reboot")
+        if isServing { statusMessage = "已切换固件并重新开机，数据盘已保留" }
+    }
+
+    /// Host-initiated cold restart, e.g. to apply firmware settings now.
+    func coldRestart() async {
+        guard isServing, !isStopping, await stop() else { return }
+        await continueAfterGuestPower("guest_reboot")
+    }
+
+    private func continueAfterGuestPower(_ reason: String) async {
+        guard reason == "guest_reboot" else {
+            statusMessage = "设备已由固件关机；点击运行可重新开机"
+            return
+        }
+        statusMessage = "正在冷启动…"
+        guard await prepareSelectedFirmware() else {
+            statusMessage = "冷启动未完成；可点击运行重试，或使用「重置实例」后再运行"
+            return
+        }
+        guard !preparedNeedsReview else {
+            statusMessage = "设备已停止；此固件需要确认后才能开机，请点击运行"
+            return
+        }
+        await startApproved()
+        if isServing { statusMessage = "固件已重启（冷启动），实例数据已保留" }
+    }
+
+    /// The broker retires the helper shortly after the guest exits, so the
+    /// final status may never be polled. The run's own result is authoritative.
+    nonisolated static func guestPowerOutcome(session: URL) -> String? {
+        let broker = session.appendingPathComponent("native-broker/config.json")
+        guard let config = try? StandaloneSandboxFiles.regular(broker, limit: 4_096, privateOnly: true),
+              let run = (try? JSONSerialization.jsonObject(with: config) as? [String: Any])?["run"] as? String,
+              StandaloneBrokerConfiguration.validRun(run),
+              let data = try? StandaloneSandboxFiles.regular(session.appendingPathComponent(run + "/result.json"),
+                                                             limit: 1_048_576, privateOnly: true),
+              let outcome = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["outcome"] as? String,
+              ["guest_poweroff", "guest_reboot"].contains(outcome) else { return nil }
+        return outcome
     }
 
     var canStartPrepared: Bool { (prepared != nil || bundledPrepared != nil) && !isBusy && !isServing && !runtimeSession.isAttached }
@@ -91,6 +199,25 @@ final class StandaloneRuntimeModel {
         StandaloneRunLimits.effective(bundledPrepared?.runLimitSeconds ?? StandaloneRunLimits.unlimited, maximumRuntimeSeconds)
     }
     var preparedExecutionApproved: Bool { bundledPrepared?.executionApproved == true }
+    /// A confirmation the user already gave for this exact identity covers
+    /// later boots; only a new identity asks again.
+    var preparedNeedsReview: Bool {
+        guard let bundledPrepared else { return true }
+        return !bundledPrepared.executionApproved && bundledPrepared.identityDigest != confirmedIdentity
+    }
+    /// Why Run is unavailable, for the button's help text.
+    var runUnavailableReason: String? {
+        if isStopping { return "正在停止设备" }
+        if isBusy { return "正在处理上一项操作" }
+        if isServing || runtimeSession.isAttached { return "设备正在运行；先停止再重新运行" }
+        if !libraryRuntimeReady { return hasLoadedCatalog ? libraryStatus : "正在读取固件库" }
+        guard let selectedFirmware else { return "请先选择要启动的固件" }
+        if !selectedFirmware.availability.ready {
+            return selectedFirmware.availability.reason.isEmpty ? "此固件尚缺少完整运行资源" : selectedFirmware.availability.reason
+        }
+        if let modelConstraint, selectedFirmware.model != modelConstraint { return "此固件不属于本实例的硬件预设" }
+        return nil
+    }
     var selectedFirmware: BundledFirmwareItem? { firmwareItems.first { $0.id == selectedProfileID } }
     var selectableFirmwareItems: [BundledFirmwareItem] {
         firmwareItems.filter { modelConstraint == nil || $0.model == modelConstraint }
@@ -103,17 +230,20 @@ final class StandaloneRuntimeModel {
 
     func loadCatalog() async {
         guard !isBusy else { return }
+        await Self.waitForLaunchCleanup()
+        guard !isBusy else { return }
         let token = revision
         operationCount += 1
         defer { operationCount -= 1; if token == revision { hasLoadedCatalog = true } }
         do {
-            let catalog = try BundledFirmwareCatalog.decode(await firmwareService.run(["library-catalog"]))
+            let catalog = try BundledFirmwareCatalog.decode(await runHelper(["library-catalog"]))
             guard token == revision, !Task.isCancelled, !isStopping else { return }
             applyCatalog(catalog)
         }
         catch {
             guard token == revision, !Task.isCancelled else { return }
             firmwareItems = []
+            devicePresets = []
             libraryAvailable = false
             libraryRuntimeReady = false
             libraryStatus = error.localizedDescription
@@ -122,9 +252,10 @@ final class StandaloneRuntimeModel {
 
     private func applyCatalog(_ catalog: BundledFirmwareCatalog) {
         firmwareItems = catalog.items
+        devicePresets = catalog.presets
         libraryAvailable = true
         libraryRuntimeReady = catalog.runtime.ready
-        libraryStatus = catalog.runtime.reason.isEmpty ? "固件目录已就绪" : catalog.runtime.reason
+        libraryStatus = catalog.runtime.reason.isEmpty ? "固件库已就绪" : catalog.runtime.reason
         if let selectedProfileID, !selectableFirmwareItems.contains(where: { $0.id == selectedProfileID }) {
             self.selectedProfileID = nil
         }
@@ -143,12 +274,12 @@ final class StandaloneRuntimeModel {
         defer { operationCount -= 1 }
         let receipt: FirmwareImportReceipt
         do {
-            receipt = try FirmwareImportReceipt.decode(await firmwareService.run(["library-import", "--input", url.path]))
+            receipt = try FirmwareImportReceipt.decode(await runHelper(["library-import", "--input", url.path]))
         } catch {
             guard token == revision, !Task.isCancelled, !isStopping else { return }
             let importFailure = error.localizedDescription
             do {
-                let diagnostic = try FirmwareDiagnostic.decode(await firmwareService.run(["library-probe", "--input", url.path]))
+                let diagnostic = try FirmwareDiagnostic.decode(await runHelper(["library-probe", "--input", url.path]))
                 guard token == revision, !Task.isCancelled, !isStopping else { return }
                 importFailureMessage = importFailure
                 importDiagnostic = diagnostic
@@ -168,18 +299,18 @@ final class StandaloneRuntimeModel {
         }
         guard token == revision, !Task.isCancelled, !isStopping else { return }
         do {
-            let catalog = try BundledFirmwareCatalog.decode(await firmwareService.run(["library-catalog"]))
+            let catalog = try BundledFirmwareCatalog.decode(await runHelper(["library-catalog"]))
             guard token == revision, !Task.isCancelled, !isStopping else { return }
             applyCatalog(catalog)
             importCandidateIDs = receipt.candidateIDs
             let candidates = receipt.candidateIDs.filter { id in selectableFirmwareItems.contains { $0.id == id } }
             selectedProfileID = candidates.count == 1 ? candidates.first : nil
             if candidates.isEmpty {
-                statusMessage = "固件已导入，但不属于本窗口的型号；请在对应型号窗口选择。"
+                statusMessage = "固件已导入；请在本实例对应的硬件预设里选择它。"
             } else {
                 statusMessage = candidates.count > 1
-                    ? "固件已导入；相同文件对应多个型号，请明确选择目标型号。"
-                    : "固件已导入，将按本实例的硬件预设启动；不兼容时会提示原因。"
+                    ? "固件已导入；请选择要在哪个硬件预设上开机。"
+                    : "固件已导入，将按本实例的硬件预设开机。"
             }
         } catch {
             guard token == revision, !Task.isCancelled else { return }
@@ -196,11 +327,17 @@ final class StandaloneRuntimeModel {
         errorMessage = nil
         let token = revision
         defer { operationCount -= 1 }
+        // Every boot starts clean: no earlier receipt, frame, status or error.
+        clearRuntimeCaches()
         do {
             guard await finishInstanceStorage() else {
                 errorMessage = instanceStorageMessage
+                    + "\n可再次点击运行重试；或使用「重置实例」放弃这次未提交的数据（保留上一快照）。"
                 return false
             }
+            // Repair interrupted on-disk state before preparing (non-fatal).
+            await resetInstanceOnDisk()
+            guard token == revision, profileID == selectedProfileID else { return false }
             let root = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
                 .appendingPathComponent("azki-b-" + UUID().uuidString.lowercased().prefix(12), isDirectory: true)
             var arguments = ["prepare-bundled", "--profile-id", profileID, "--session-root", root.path]
@@ -209,7 +346,7 @@ final class StandaloneRuntimeModel {
                 arguments += ["--virtual-serial", virtualIdentity.serial, "--virtual-address", virtualIdentity.address]
             }
             arguments += [skipOOBE ? "--skip-oobe" : "--no-skip-oobe"]
-            let output = try await firmwareService.run(arguments)
+            let output = try await runHelper(arguments)
             let receipt = try BundledPreparedSession.decode(output, requestedRoot: root, profileID: profileID)
             guard token == revision, profileID == selectedProfileID else { return false }
             prepared = nil
@@ -218,7 +355,7 @@ final class StandaloneRuntimeModel {
             if receipt.instanceStorage?["available"]?.bool == true {
                 storageSession = receipt.root
                 instanceStorageMessage = receipt.instanceStorage?["norPersistent"]?.bool == true
-                    ? "独立数据盘和设备配置已启用；版本切换保留上一快照。"
+                    ? "独立数据盘和设备配置已启用；切换固件会保留数据盘。"
                     : "独立 NAND 数据盘已启用；NOR 配置尚未持久化。"
             } else {
                 instanceStorageMessage = receipt.instanceStorage?["reason"]?.string ?? "此核心未提供用户数据写回；重启恢复初始数据。"
@@ -238,9 +375,130 @@ final class StandaloneRuntimeModel {
         if !isServing { statusMessage = "文件选择已更新，请重新检查" }
     }
 
+    /// Settings take effect at the next boot of this instance.
+    func firmwareSettings() async throws -> InstanceFirmwareSettingsReceipt {
+        guard let instanceID else { throw SimulatorError.invalidSession("固件设置只适用于设备实例") }
+        return try InstanceFirmwareSettingsReceipt.decode(await runHelper(
+            ["instance-settings", "--instance-id", instanceID.uuidString.lowercased()]))
+    }
+
+    func saveFirmwareSettings(_ settings: InstanceFirmwareSettings) async throws -> InstanceFirmwareSettingsReceipt {
+        guard let instanceID else { throw SimulatorError.invalidSession("固件设置只适用于设备实例") }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let json = String(data: try encoder.encode(settings), encoding: .utf8), json.utf8.count <= 262_144 else {
+            throw SimulatorError.invalidSession("固件设置内容过大")
+        }
+        return try InstanceFirmwareSettingsReceipt.decode(await runHelper(
+            ["instance-settings", "--instance-id", instanceID.uuidString.lowercased(), "--set", json]))
+    }
+
+    /// Wait (bounded) for the launch-wide stale-session cleanup.
+    static func waitForLaunchCleanup() async {
+        guard let gate = launchCleanup else { return }
+        _ = await SimulatorDeadline.bounded(20, fallback: false) { await gate.value; return true }
+    }
+
+    private func runHelper(_ arguments: [String]) async throws -> Data {
+        await Self.waitForLaunchCleanup()
+        return try await firmwareService.run(arguments)
+    }
+
+    /// Once per app launch: remove session roots an earlier run left behind.
+    /// An engine without the action keeps working; failures are only logged.
+    func cleanupStaleSessions() async {
+        struct Receipt: Decodable { let removed: [String]?; let kept: [String]? }
+        do {
+            let receipt = try JSONDecoder().decode(Receipt.self, from: await firmwareService.run(["sessions-cleanup"]))
+            NSLog("[AzkiReset] sessions-cleanup removed=%ld kept=%ld", receipt.removed?.count ?? 0, receipt.kept?.count ?? 0)
+        } catch {
+            NSLog("[AzkiReset] sessions-cleanup skipped: %@", error.localizedDescription)
+        }
+    }
+
+    /// Drop every in-memory runtime cache of this instance. Never touches a
+    /// live core; callers stop it first.
+    private func clearRuntimeCaches() {
+        prepared = nil
+        bundledPrepared = nil
+        errorMessage = nil
+        importFailureMessage = nil
+        importDiagnostic = nil
+        importDiagnosticError = nil
+        runtimeSession.detach()
+        runtimeSession.errorMessage = nil
+        resetEpoch &+= 1
+    }
+
+    /// Ask the helper to recover this instance's interrupted on-disk state
+    /// (staging, half-written commits, stale per-run files). Older engines lack
+    /// the action, so every failure is logged and treated as non-fatal.
+    @discardableResult private func resetInstanceOnDisk() async -> Bool {
+        guard let instanceID, helper == nil, !isServing else { return false }
+        let id = instanceID.uuidString.lowercased()
+        struct Receipt: Decodable { let ok: Bool; let recovered: Bool?; let removed: [String]? }
+        do {
+            let receipt = try JSONDecoder().decode(Receipt.self, from: await runHelper(["instance-reset", "--instance-id", id]))
+            if receipt.recovered == true { instanceStorageMessage = "已恢复上次异常退出时未完成的实例数据。" }
+            NSLog("[AzkiReset] instance-reset %@ recovered=%d removed=%ld", id, receipt.recovered == true ? 1 : 0,
+                  receipt.removed?.count ?? 0)
+            return receipt.ok
+        } catch {
+            NSLog("[AzkiReset] instance-reset %@ skipped: %@", id, error.localizedDescription)
+            return false
+        }
+    }
+
+    /// App launch: repair this instance's folder before anything runs.
+    func resetAtLaunch() async {
+        await Self.waitForLaunchCleanup()
+        // The view may be loading this instance's catalog; wait (bounded)
+        // for it rather than skipping the reset or racing the helper.
+        let deadline = ContinuousClock.now + .seconds(30)
+        while isBusy, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(100)) }
+        if !isBusy, !isServing, !runtimeSession.isAttached {
+            operationCount += 1
+            await resetInstanceOnDisk()
+            operationCount -= 1
+        }
+        // A catalog load skipped while the reset held this instance busy.
+        if !hasLoadedCatalog, !isBusy { await loadCatalog() }
+    }
+
+    /// User recovery for a stuck or failed instance: stop it, drop all
+    /// in-memory state (including a data binding whose commit keeps failing)
+    /// and let the helper repair the instance folder. Saved snapshots,
+    /// firmware settings and imported firmware are kept.
+    @discardableResult func resetInstance() async -> Bool {
+        guard await stop() else {
+            statusMessage = "重置未完成：设备进程尚未确认退出，请稍后重试"
+            return false
+        }
+        storageSession = nil
+        operationCount += 1
+        defer { operationCount -= 1 }
+        clearRuntimeCaches()
+        await resetInstanceOnDisk()
+        statusMessage = "实例已重置；已保存的数据与固件设置保留，可重新运行"
+        return true
+    }
+
+    /// Remove this instance's private settings and storage. The record is
+    /// already gone when this runs; failure is reported without reviving it.
+    @discardableResult func discardInstanceData() async -> Bool {
+        guard let instanceID else { return true }
+        do {
+            _ = try await runHelper(["instance-delete", "--instance-id", instanceID.uuidString.lowercased()])
+            return true
+        } catch {
+            errorMessage = "实例记录已删除，但未能清理它的数据：" + error.localizedDescription
+            return false
+        }
+    }
+
     func savedVirtualIdentity() async throws -> SimulatorVirtualIdentity? {
         guard let instanceID else { return nil }
-        let data = try await firmwareService.run(["instance-identity", "--instance-id", instanceID.uuidString.lowercased()])
+        let data = try await runHelper(["instance-identity", "--instance-id", instanceID.uuidString.lowercased()])
         struct Receipt: Decodable { let identity: SimulatorVirtualIdentity? }
         return try JSONDecoder().decode(Receipt.self, from: data).identity
     }
@@ -257,7 +515,7 @@ final class StandaloneRuntimeModel {
         do {
             let root = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
                 .appendingPathComponent("azki-sim-" + UUID().uuidString.lowercased().prefix(12), isDirectory: true)
-            let output = try await firmwareService.run(["prepare", root.path,
+            let output = try await runHelper(["prepare", root.path,
                 "--qemu", qemuURL.path, "--firmware", firmwareURL.path, "--resource", resourceURL.path])
             let result = try StandalonePreparedSession.decode(output, root: root)
             guard token == revision else { return }
@@ -291,6 +549,7 @@ final class StandaloneRuntimeModel {
         errorMessage = nil
         let token = revision
         var launchedProcess: Process?
+        let debugger = debuggerRequest
         defer { operationCount -= 1 }
         do {
             // H (session helper) and G (guest core) run under separate OS policies;
@@ -298,7 +557,7 @@ final class StandaloneRuntimeModel {
             let native = try await Task.detached(priority: .userInitiated) {
                 let runtime = try StandaloneBundledRuntime.resolve()
                 return try StandaloneNativeLaunch.prepare(runtime: runtime, session: preparedRoot,
-                    digest: identity, seconds: runLimit)
+                    digest: identity, seconds: runLimit, debugger: debugger)
             }.value
             let launch = native.helper
             try Task.checkCancellation()
@@ -350,6 +609,7 @@ final class StandaloneRuntimeModel {
                     throw error
                 }
                 startingHelper = nil
+                confirmedIdentity = identity
                 runtimeSession.attach(preparedRoot)
                 statusMessage = runLimit == StandaloneRunLimits.unlimited
                     ? "独立核心已启动，可随时停止"
@@ -367,9 +627,10 @@ final class StandaloneRuntimeModel {
                 // The start request may already have launched the guest. A
                 // missing reply is not authority to tear that instance down.
                 startingHelper = nil
+                confirmedIdentity = identity
                 runtimeSession.attach(preparedRoot)
-                errorMessage = error.localizedDescription
-                statusMessage = "连接超时；实例保留，正在重新连接"
+                // Not modal: the instance keeps running and reconnects by itself.
+                statusMessage = "连接超时；设备保留运行，正在重新连接"
                 return
             }
             // The termination callback and this catch may arrive in either
@@ -385,7 +646,8 @@ final class StandaloneRuntimeModel {
             // A cancelled/older attempt must not overwrite a later session's UI.
             guard token == revision else { return }
             errorMessage = message
-            statusMessage = stopped ? "启动失败，核心已停止；原文件保持不变" : "启动失败；停止仍未确认，请重试停止"
+            statusMessage = stopped ? "启动失败，核心已停止；原文件保持不变。可修正后重新运行"
+                : "启动失败；设备进程尚未确认退出，请重试停止或使用「重置实例」"
         }
     }
 
@@ -409,8 +671,8 @@ final class StandaloneRuntimeModel {
         await firmwareService.cancelAll()
         let stopped = await stopOwnedHelper()
         if stopped { await finishInstanceStorage() }
-        statusMessage = stopped ? "已断开；本应用创建的核心和 helper 已结束" : "停止尚未确认，请重试停止"
-        if !stopped { errorMessage = "本应用的客体进程组或会话 helper 尚未确认退出" }
+        statusMessage = stopped ? "已停止；本应用创建的核心和 helper 已结束" : "停止尚未确认，请重试停止"
+        if !stopped { errorMessage = "设备进程尚未确认退出。可再次点击「停止模拟器」重试；仍失败时请使用「重置实例」。" }
         return stopped
     }
 
@@ -418,13 +680,18 @@ final class StandaloneRuntimeModel {
         process.terminationHandler = { [weak self] completed in
             Task { @MainActor [weak self] in
                 guard let self, self.helper === completed, !self.isStopping else { return }
-                let failure = Self.helperFailureMessage(completed, output: self.helperOutput,
+                let guestPower = self.sessionURL.flatMap(Self.guestPowerOutcome(session:))
+                let failure = guestPower != nil ? nil : Self.helperFailureMessage(completed, output: self.helperOutput,
                     duringStartup: self.startingHelper === completed)
                 self.revision &+= 1
                 let token = self.revision
                 let stopped = await self.stopOwnedHelper(expected: completed)
                 if stopped { await self.finishInstanceStorage() }
                 guard token == self.revision else { return }
+                if stopped, let guestPower {
+                    await self.continueAfterGuestPower(guestPower)
+                    return
+                }
                 self.statusMessage = stopped
                     ? (failure == nil ? "会话已结束，本应用创建的进程已回收" : "会话 helper 意外退出，本应用创建的进程已回收")
                     : "会话已结束，但客体回收尚未确认；请重试停止"
@@ -465,7 +732,7 @@ final class StandaloneRuntimeModel {
         operationCount += 1
         defer { operationCount -= 1 }
         do {
-            let data = try await firmwareService.run(["instance-storage-finish", "--session", directory.path,
+            let data = try await runHelper(["instance-storage-finish", "--session", directory.path,
                 "--instance-id", instanceID.uuidString.lowercased()])
             let result = try JSONDecoder().decode(SimulatorJSON.self, from: data)
             instanceStorageMessage = result["committed"]?.bool == true
@@ -563,7 +830,8 @@ nonisolated enum StandalonePython {
         }
         // Importing an arbitrary full OTA hashes and validates every member.
         let timeout = command == "library-import" ? 300.0
-            : ["prepare", "prepare-bundled", "library-probe"].contains(command) ? 45.0 : 15.0
+            : command == "sessions-cleanup" ? 90.0
+            : ["prepare", "prepare-bundled", "library-probe", "instance-reset"].contains(command) ? 45.0 : 15.0
         let deadline = StandaloneCommandDeadline()
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
             if process.isRunning {

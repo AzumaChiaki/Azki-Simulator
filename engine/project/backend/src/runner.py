@@ -5,6 +5,7 @@ from contextlib import ExitStack
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import resource
@@ -19,11 +20,34 @@ from .control import WatchControl, NativeWindow
 
 from .qmp import QMP
 from .instance_data import (validate_instance_images, instance_machine_options, initialize_instance_data, validate_instance_nor,
+                            load_instance_settings, apply_instance_settings, read_instance_properties,
+                            instance_settings_options,
+                            instance_settings_runtime,
                             initialize_instance_nor, instance_nor_machine_options, validate_nor_geometry,
                             instance_nor_result_geometry)
 
 
 QMP_START_SECONDS = 60
+# Seconds after the control socket opens before host battery/charger state is
+# applied; the guest must already be past its power-on charger check.
+RUNTIME_SETTINGS_DELAY = 8
+# How often the runner samples the vCPU run state while a debugger may hold it.
+GDB_STATE_POLL_SECONDS = .25
+GDB_CHARDEV = re.compile(r'tcp:127\.0\.0\.1:([0-9]{1,5})(?:,|$)')
+POWER_EVENT = re.compile(rb'^AZKI-POWER-EVENT (poweroff|reboot|panic)$', re.M)
+
+
+def guest_power_event(path):
+    """The core prints one line when the guest powers off or resets itself."""
+    try:
+        with open(path, 'rb') as stream:
+            stream.seek(0, 2)
+            stream.seek(max(0, stream.tell() - 65536))
+            events = POWER_EVENT.findall(stream.read())
+    except OSError:
+        return None
+    event = events[-1].decode() if events else None
+    return event if event in ('poweroff', 'reboot') else None
 WATCH_FLAGS = ('bt_peer', 'bt_tx_capture', 'bt_hci_reset_fixture', 'panel_id_fixture',
                'lcd_frame_capture', 'panel_te_fixture', 'spi0_unconnected',
                'gpu_probe', 'gpu_id_fixture', 'gpu_software_renderer', 'touch',
@@ -242,6 +266,8 @@ def main():
     parser.add_argument('--instance-nor-image', type=Path)
     parser.add_argument('--instance-nor-sha256')
     parser.add_argument('--instance-nor-initialize', action='store_true')
+    parser.add_argument('--instance-settings', type=Path,
+                        help='Host settings applied to the instance persist.db before boot')
     parser.add_argument('--skip-oobe', action=argparse.BooleanOptionalAction, default=True,
                         help='Complete first-run setup locally; --no-skip-oobe keeps firmware setup. Never resets an existing instance.')
     parser.add_argument('--skip-binding', action='store_true',
@@ -250,10 +276,13 @@ def main():
     parser.add_argument('--board-profile', type=Path,
                         help='Validated product-specific BES1503 memory geometry JSON')
     parser.add_argument('--seconds', type=float,
-                        help='Wall-clock limit (watch/--serve/window modes: unlimited; --gdb: 120 s)')
+                        help='Wall-clock limit (watch/--serve/window modes: unlimited)')
     parser.add_argument('--log-dir', type=Path, default=here / 'logs/watch')
-    parser.add_argument('--gdb', action='store_true',
-                        help='Pause at reset; serve GDB on 127.0.0.1:1234')
+    parser.add_argument('--gdb', type=int, nargs='?', const=0, metavar='PORT',
+                        help='Serve the GDB remote protocol on 127.0.0.1 (PORT, or a free port when omitted/0); '
+                             'the chosen port is printed and published in control.json')
+    parser.add_argument('--gdb-wait', action='store_true',
+                        help='With --gdb: hold the CPU at reset until the debugger continues it')
     parser.add_argument('--bt-peer', action='store_true',
                         help='Enable experimental BT wake and ideal IQ fixture; no controller ROM/HCI')
     parser.add_argument('--bt-tx-capture', action='store_true',
@@ -307,7 +336,7 @@ def main():
     firmware_sha256 = None  # No startup AP content scan; profile geometry is checked below.
     virtual_requested = any((args.virtual_peer_state,args.virtual_peer_state_sha256,args.virtual_peer_output))
     if args.bluetooth == 'virtual':
-        if not all((args.virtual_peer_state,args.virtual_peer_state_sha256,args.virtual_peer_output)) or args.factory_image or args.trace or args.gdb or args.tap or args.serve is not None:
+        if not all((args.virtual_peer_state,args.virtual_peer_state_sha256,args.virtual_peer_output)) or args.factory_image or args.trace or args.tap or args.serve is not None:
             parser.error('Virtual mode requires private state and excludes raw diagnostic, automatic touch, radio and external factory inputs')
         from .virtual_peer.state import load_state
         virtual_state = load_state(args.virtual_peer_state,args.virtual_peer_state_sha256)
@@ -326,8 +355,8 @@ def main():
                    'nv-offset', 'nand-data-offset'}
         optional = {'panel-power0','panel-power1','panel-power2','panel-id','resource-yaffs',
                     'pmu-calibration','panel-te-pin','touch-i2c','touch-power-pin',
-                    'touch-reset-pin','touch-irq-pin','touch-module-id','touch-health-format',
-                    'config-offset','config-bytes','nand-data-bytes'}
+                    'touch-reset-pin','touch-irq-pin','touch-module-id','touch-health-format','charger-i2c',
+                    'charger-id','charger-map','pmu-adc-ntc','config-offset','config-bytes','nand-data-bytes'}
         geometry = board['geometry']
         if board.get('chip') != 'best1503' or not allowed <= set(geometry) or set(geometry)-allowed-optional or any(
                 type(v) is not int or not 0 <= v <= 0xffffffff for v in geometry.values()):
@@ -447,7 +476,13 @@ def main():
     if args.gh3x2x_reg0724 is not None:
         if not args.gh3x2x_fixture or not 0 <= args.gh3x2x_reg0724 <= 0xffff:
             parser.error('--gh3x2x-reg0724 requires --gh3x2x-fixture and a 16-bit value')
-    duration = (args.seconds if args.seconds is not None else 120 if args.gdb else
+    if args.gdb is not None and not 0 <= args.gdb <= 65535:
+        parser.error('--gdb port must be between 0 and 65535')
+    if args.gdb_wait and args.gdb is None:
+        parser.error('--gdb-wait requires --gdb')
+    # A debugger session has no implicit lifetime: halted time is the user's.
+    duration = (args.seconds if args.seconds is not None else
+                None if args.gdb is not None else
                 None if (args.serve is not None or args.window or args.python_window or args.profile == 'watch') else 3)
     if duration is not None and (not duration > 0 or not math.isfinite(duration)):
         parser.error('--seconds must be positive')
@@ -507,6 +542,16 @@ def main():
         except (OSError, ValueError, RuntimeError) as error:
             parser.error('Instance UI initialization failed: ' + str(error))
         print('First local UI data initialized.' if seeded else 'Existing instance UI data preserved.', flush=True)
+    instance_settings = None
+    boot_clock = None
+    if args.instance_settings:
+        try:
+            instance_settings = load_instance_settings(args.instance_settings, instance_storage)
+            clock = boot_clock = apply_instance_settings(instance_storage, instance_settings, here / 'build/instance-props',
+                                                         logdir / 'tmp' if (logdir / 'tmp').is_dir() else tempfile.gettempdir())
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            parser.error('Instance settings failed: ' + str(error))
+        print('Instance settings applied' + (f'; boot clock {clock}.' if clock is not None else '.'), flush=True)
     # Remove snapshots from previous runs so absent evidence cannot look current.
     for name in ('registers.txt', 'scb.txt', 'result.json', 'qemu.log',
                  'uart0.log', 'uart1.log', 'uart2.log', 'hci-tx.json', 'panel-spi.json',
@@ -550,6 +595,9 @@ def main():
             radio_socket = args.hci_socket.resolve()
             machine += ',bt-hci-chardev=radio'
             print('Real Bluetooth H4: ' + str(radio_socket), flush=True)
+        if boot_clock is not None:
+            # The PMU RTC (read directly by some firmware) starts at the same wall time.
+            machine += f',rtc-seconds={boot_clock}'
         if args.resource:
             machine += ',resource-image=' + str(args.resource.resolve()).replace(',', ',,')
         if instance_storage:
@@ -573,6 +621,16 @@ def main():
                 machine += f',revision-id={value}'
             elif value:
                 machine += ',' + name.replace('_', '-') + '=on'
+        if instance_settings is not None:
+            # Host-authored board inputs resolved against this instance's
+            # hardware preset; a rejected value stops the boot instead of
+            # silently running with a different device.
+            try:
+                for option in instance_settings_options(instance_settings, adc_fixture=args.power_adc_fixture,
+                                                        ntc_channels=geometry.get('pmu-adc-ntc', 0)):
+                    machine += ',' + option
+            except ValueError as error:
+                parser.error('Instance settings failed: ' + str(error))
         if args.lcd_frame_capture:
             machine += ',lcd-frame-file=' + str(frame_file).replace(',', ',,')
         command = [str(args.qemu), '-M', machine, '-display', display_backend,
@@ -596,8 +654,13 @@ def main():
             uart_path.touch(mode=0o600)
             uart_path.chmod(0o600)
             command += ['-serial', f'file:{uart_path}']
-        if args.gdb:
-            command += ['-S', '-gdb', 'tcp:127.0.0.1:1234']
+        if args.gdb is not None:
+            # Loopback only. The debugger is a local tool the user asked for; it
+            # coexists with the virtual Bluetooth peer, whose protocol clocks
+            # stand still while the CPU is halted (see GDB_STATE_POLL_SECONDS).
+            command += ['-gdb', f'tcp:127.0.0.1:{args.gdb}']
+            if args.gdb_wait:
+                command.append('-S')
         if args.trace:
             print(shlex.join(command), flush=True)
         else:
@@ -629,6 +692,17 @@ def main():
                     has_input = args.touch or adc_raw
                     if has_input:
                         control.serve_input(input_socket)
+                    gdb_endpoint = None
+                    if args.gdb is not None:
+                        gdb_endpoint = {'host': '127.0.0.1', 'port': args.gdb, 'waitForAttach': bool(args.gdb_wait)}
+                        for chardev in control.execute('query-chardev'):
+                            match = GDB_CHARDEV.search(chardev.get('filename', '')) if chardev.get('label') == 'gdb' else None
+                            if match:
+                                gdb_endpoint['port'] = int(match[1])
+                        if not 0 < gdb_endpoint['port'] <= 65535:
+                            raise RuntimeError('GDB server port could not be determined')
+                        print(f"GDB server: target remote 127.0.0.1:{gdb_endpoint['port']}"
+                              + ('; CPU held at reset until the debugger continues.' if args.gdb_wait else ''), flush=True)
                     (logdir / 'control.json').write_text(json.dumps(dict(
                         qmp=str(qmp_path), framebuffer=str(frame_file), pid=proc.pid,
                         input_socket=str(input_socket) if has_input else None,
@@ -637,7 +711,8 @@ def main():
                             'minimum': 0, 'maximum': 65535,
                             'unit': 'uncalibrated-raw',
                             'readEvidence': 'guest-ispi-fifo-dequeue'}},
-                        **({'virtual_peer':virtual_peer.descriptor()} if virtual_peer is not None else {})), indent=2) + '\n')
+                        **({'virtual_peer':virtual_peer.descriptor()} if virtual_peer is not None else {}),
+                        **({'gdb': gdb_endpoint} if gdb_endpoint is not None else {})), indent=2) + '\n')
                     if args.lcd_frame_capture:
                         print('LCD framebuffer: ' + str(frame_file), flush=True)
                     if args.serve is not None:
@@ -648,6 +723,13 @@ def main():
                         native_window = NativeWindow(control)
                         native_window.start()
                         print('Python window started (direct QEMU LCD; 30 FPS refresh).', flush=True)
+                    runtime_settings = instance_settings_runtime(instance_settings) if instance_settings is not None else []
+                    # Guest-progress seconds: wall time minus time the CPU was
+                    # held by a debugger (or -S). Without --gdb this is wall time.
+                    halted_total, halted_since, state_check_due = 0.0, None, 0
+                    def guest_seconds(now):
+                        return now - halted_total - (now - halted_since if halted_since is not None else 0)
+                    runtime_settings_due = guest_seconds(time.monotonic()) + RUNTIME_SETTINGS_DELAY
                     tap_index, pressed, due = 0, False, 0
                     fault_check_due = 0
                     fault_records = []
@@ -659,12 +741,35 @@ def main():
                             now = time.monotonic()
                             if virtual_peer is not None and virtual_peer.failure:
                                 raise RuntimeError('Virtual peer service failed')
+                            if args.gdb is not None and now >= state_check_due:
+                                state_check_due = now + GDB_STATE_POLL_SECONDS
+                                run_state = control.execute('query-status')
+                                running = run_state.get('running', True) is True
+                                if not running and run_state.get('status') in ('debug', 'paused') and not any(
+                                        chardev.get('label') == 'gdb' and not chardev.get('filename', '').startswith('disconnected:')
+                                        for chardev in control.execute('query-chardev')):
+                                    # The debugger left without detaching (crash, closed
+                                    # terminal). Do not leave the device frozen with nobody
+                                    # able to continue it; an attached client keeps control.
+                                    control.execute('cont')
+                                    running = True
+                                    print('GDB client disconnected; guest resumed.', flush=True)
+                                if running and halted_since is not None:
+                                    halted_total += now - halted_since; halted_since = None
+                                elif not running and halted_since is None:
+                                    halted_since = now
+                                if virtual_peer is not None:
+                                    virtual_peer.set_guest_running(running)
                             if duration is not None and now - started >= duration:
                                 raise subprocess.TimeoutExpired(command, duration)
                             if native_window is not None and not native_window.pump():
                                 window_closed = True
                                 break
                             tail = (tail + live_trace.read())[-65536:]
+                            if runtime_settings and guest_seconds(now) >= runtime_settings_due:
+                                for name, value in runtime_settings:
+                                    control.execute('qom-set', {'path': '/machine', 'property': name, 'value': value})
+                                runtime_settings = []
                             if now >= fault_check_due:
                                 fault_check_due = now + 1
                                 fault_status = control.execute('human-monitor-command',
@@ -825,7 +930,12 @@ def main():
     # The original power-off path ends here even without a CPU exception.
     # A bounded run that reaches this halt must not look like healthy waiting.
     halted = bool(registers and re.search(r'R15=00274a(?:26|46)\b', registers))
-    if proc.returncode != 0 or qmp_error:
+    guest_power = guest_power_event(logdir / 'stderr.log')
+    if guest_power and proc.returncode == 0 and not deadline_reached and not interrupted:
+        # The guest itself powered off or requested a reset (PMU SOFT_POWER_OFF,
+        # AON global reset, watchdog); the host mirrors it instead of failing.
+        outcome = 'guest_poweroff' if guest_power == 'poweroff' else 'guest_reboot'
+    elif proc.returncode != 0 or qmp_error:
         outcome = 'host_error'
     elif faults or guest_faults:
         outcome = 'guest_fault'
@@ -1019,6 +1129,7 @@ def main():
               'fault_addresses': faults, 'guest_status_before_stop': guest_status,
               'guest_exceptions': exceptions, 'guest_faults': guest_faults,
               'guest_halt_loop_reached': halted,
+              'guest_power_event': guest_power,
               'registers': registers, 'scb': scb, 'qmp_error': qmp_error,
               'diagnostic_errors': diagnostic_errors,
               'cortex_fault_status': cfsr,
@@ -1105,6 +1216,18 @@ def main():
               'boot_rom': 'synthetic reset vectors: SP=0x%08x, PC=0x%08x' % (
                   geometry.get('reset-sp', 0x2015fec0),
                   0x0c000011 + geometry.get('ap-offset', 0xc0000))}
+    if (instance_settings is not None and instance_storage is not None and proc.returncode == 0
+            and outcome in ('time_limit', 'interrupted', 'window_closed', 'qemu_stopped', 'guest_poweroff', 'guest_reboot')):
+        # Informational snapshot of the firmware's own settings; never a health input.
+        try:
+            properties = read_instance_properties(instance_storage, here / 'build/instance-props',
+                                                  logdir / 'tmp' if (logdir / 'tmp').is_dir() else tempfile.gettempdir())
+            observed = logdir / 'instance-props-observed.json'
+            fd = os.open(observed, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'w') as stream:
+                json.dump({'properties': properties}, stream, ensure_ascii=False)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
     (logdir / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
     print(f'Outcome: {outcome}; QEMU exit: {proc.returncode}; boot not verified')
     print(f'Runtime: {runtime_seconds:.2f} s; LCD frames: {result["display_frame_count"]}')

@@ -262,6 +262,11 @@ def main():
          INPUT/'project/backend/src/yaffs_image.c',*sorted((y/'core').glob('*.c')),
          *[y/'direct'/n for n in ('yaffsfs.c','yaffs_attribs.c','yaffs_error.c','yaffs_hweight.c')],'-o',build/'yaffs-image'],env=env)
     run(['cc','-O2','-I'+str(u),INPUT/'project/backend/src/legacy_ui_db.c',u/'unqlite.c','-o',build/'legacy-ui-db'],env=env)
+    # Reads/updates persist.db inside an instance YAFFS image (settings and boot clock).
+    run(['cc','-O2',*['-D'+x for x in definitions],'-Dloff_t=int64_t','-I'+str(y/'core'),'-I'+str(y/'direct'),'-I'+str(u),
+         INPUT/'project/backend/src/instance_props.c',*sorted((y/'core').glob('*.c')),
+         *[y/'direct'/n for n in ('yaffsfs.c','yaffs_attribs.c','yaffs_error.c','yaffs_hweight.c')],u/'unqlite.c',
+         '-o',build/'instance-props'],env=env)
     shutil.copy2(INPUT/'bootstrap.py',engine/'bootstrap.py')
     copytree(INPUT/'licenses',engine/'licenses')
     shutil.copy2(INPUT/'THIRD_PARTY.md',engine/'licenses/THIRD_PARTY.md')

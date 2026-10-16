@@ -31,3 +31,28 @@ nonisolated enum StandaloneProcessReaper {
         return Darwin.kill(-group, 0) == 0 || errno != ESRCH
     }
 }
+
+/// Waits for a main-actor operation at most `seconds`. The operation itself
+/// keeps running; a timeout only means "not confirmed", so one stuck instance
+/// cannot hold app-wide work (quit, launch cleanup) forever.
+@MainActor enum SimulatorDeadline {
+    private final class Once { var done = false }
+    static func bounded<T: Sendable>(_ seconds: Double, fallback: T,
+                                     _ operation: @escaping @MainActor () async -> T) async -> T {
+        await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
+            let once = Once()
+            Task { @MainActor in
+                let value = await operation()
+                guard !once.done else { return }
+                once.done = true
+                continuation.resume(returning: value)
+            }
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(seconds))
+                guard !once.done else { return }
+                once.done = true
+                continuation.resume(returning: fallback)
+            }
+        }
+    }
+}

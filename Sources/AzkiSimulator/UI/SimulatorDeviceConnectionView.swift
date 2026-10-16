@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 @MainActor struct SimulatorDeviceConnectionView: View {
     let library: SimulatorInstanceLibrary
@@ -39,9 +40,53 @@ import SwiftUI
             if let error = bluetooth.lastError {
                 Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
             }
+            Divider()
+            debuggerSection
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.quaternary.opacity(0.25))
+    }
+
+    /// GDB remote server on loopback. It coexists with the virtual Bluetooth
+    /// peer: protocol timers pause while the debugger holds the CPU.
+    @ViewBuilder private var debuggerSection: some View {
+        let runtime = instance.runtime
+        Toggle("启用 GDB 调试", isOn: Binding(get: { runtime.debuggerEnabled }, set: { runtime.debuggerEnabled = $0 }))
+            .accessibilityIdentifier("simulator.gdb.enabled")
+        if runtime.debuggerEnabled {
+            Toggle("开机时暂停等待调试器", isOn: Binding(get: { runtime.debuggerWaitForAttach },
+                                                set: { runtime.debuggerWaitForAttach = $0 }))
+                .accessibilityIdentifier("simulator.gdb.wait")
+            HStack(spacing: 6) {
+                Text("端口")
+                TextField("自动", value: Binding<Int?>(
+                    get: { runtime.debuggerPort == 0 ? nil : runtime.debuggerPort },
+                    set: { runtime.debuggerPort = min(max($0 ?? 0, 0), 65_535) }),
+                    format: .number.grouping(.never))
+                    .frame(width: 72)
+                    .accessibilityIdentifier("simulator.gdb.port")
+                Text("留空自动分配空闲端口").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        if let endpoint = runtime.debuggerEndpoint {
+            let command = "target remote 127.0.0.1:\(endpoint.port)"
+            HStack(spacing: 6) {
+                Text("GDB：" + command).font(.caption.monospaced()).textSelection(.enabled)
+                    .accessibilityIdentifier("simulator.gdb.endpoint")
+                Button("拷贝") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(command, forType: .string)
+                }
+                .controlSize(.small)
+            }
+            if endpoint.waitForAttach {
+                Text("CPU 停在复位处，调试器执行 continue 后开机。").font(.caption).foregroundStyle(.secondary)
+            }
+        } else if runtime.isServing && runtime.debuggerEnabled {
+            Text("本次运行未启用 GDB 或端口尚未就绪；更改在下次启动时生效。").font(.caption).foregroundStyle(.secondary)
+        }
+        Text("仅监听本机 127.0.0.1，可与虚拟蓝牙同时使用；断点暂停期间蓝牙会话的超时计时随之暂停。调试器异常断开时设备自动继续运行。")
+            .font(.caption).foregroundStyle(.secondary)
     }
 }

@@ -32,12 +32,20 @@ import UniformTypeIdentifiers
     @State private var exportingDebug = false
     @State private var adcDraft = PMUADCDraft()
     @State private var connectionTimeoutText = ""
+    @State private var editingFirmwareSettings = false
+    /// Firmware chosen while the device runs; applied by "切换并重新开机".
+    @State private var pendingProfileID: String?
 
     private var session: SimulatorSessionModel { runtime.runtimeSession }
     private var recording: SimulatorRecordingModel { instanceRecording ?? localRecording }
     private var controlsAvailable: Bool { Self.coreControlsAvailable(runtime: runtime, sharing: sharing) }
     private var canEnableSharing: Bool {
         Self.canEnableSharing(runtime: runtime, sharing: sharing)
+    }
+    /// Stop stays available while starting or checking: it cancels that work
+    /// instead of making the user wait for a stuck start to time out.
+    private var canStop: Bool {
+        !runtime.isStopping && (runtime.isServing || runtime.isBusy || (session.isRunning && !session.isCommandInFlight))
     }
     private var allFilesSelected: Bool { runtime.qemuURL != nil && runtime.firmwareURL != nil && runtime.resourceURL != nil }
     private var displayGeometry: SimulatorDisplayGeometry? { session.manifest?.displayGeometry }
@@ -136,12 +144,27 @@ import UniformTypeIdentifiers
                 Task { await runtime.startApproved() }
             }
         }
+        .sheet(isPresented: Binding(get: { isActive && editingFirmwareSettings }, set: { if isActive { editingFirmwareSettings = $0 } })) {
+            SimulatorFirmwareSettingsSheet(runtime: runtime, restartAvailable: runtime.isServing) {
+                Task { await recording.stop(); await runtime.coldRestart() }
+            }
+        }
         .task {
             connectionTimeoutText = String(runtime.connectionSettings.timeoutSeconds)
             if !runtime.hasLoadedCatalog && controlsAvailable { await runtime.loadCatalog() }
         }
         .onChange(of: runtime.connectionSettings.timeoutSeconds) { _, seconds in
             connectionTimeoutText = String(seconds)
+        }
+        .onChange(of: runtime.isServing) { _, serving in if !serving { pendingProfileID = nil } }
+        .onChange(of: runtime.resetEpoch) { _, _ in
+            // The instance was reset or is booting again: drop this view's
+            // per-instance caches so nothing from the previous run lingers.
+            debugText = ""; uiError = nil; review = nil; pendingProfileID = nil
+            adcDraft = PMUADCDraft()
+            guestOperations.invalidate()
+            logStream.clear()
+            showingPackageReport = true
         }
         .task(id: guestContext) {
             guestOperations.configure(hostSessionID: session.manifest?.id, available: guestAvailable,
@@ -214,6 +237,24 @@ import UniformTypeIdentifiers
         VStack(spacing: 0) {
             firmwareLibrarySection
             SimulatorSectionDivider()
+            if runtime.instanceID != nil {
+                SimulatorSection(title: "固件设置", icon: "gearshape.2") {
+                    Text("语言、时区、12/24 小时制、开机时间及全部系统属性，下次开机写入固件。默认跟随 Mac 时间与时区。")
+                        .foregroundStyle(SimulatorTheme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    SimulatorActionFlow {
+                        action("编辑固件设置…", icon: "slider.horizontal.3", enabled: controlsAvailable) {
+                            editingFirmwareSettings = true
+                        }
+                        .accessibilityIdentifier("simulator.firmware-settings")
+                        action("冷重启", icon: "arrow.clockwise.circle", enabled: controlsAvailable && runtime.isServing) {
+                            Task { await recording.stop(); await runtime.coldRestart() }
+                        }
+                        .accessibilityIdentifier("simulator.cold-restart")
+                    }
+                }
+                SimulatorSectionDivider()
+            }
             DisclosureGroup(isExpanded: $showingSharing) {
                 SimulatorActionFlow {
                     action("启用 Studio 连接", icon: "link", enabled: canEnableSharing) {
@@ -270,14 +311,27 @@ import UniformTypeIdentifiers
                     if !runtime.isServing {
                         action("断开", icon: "eject", enabled: session.isAttached && controlsAvailable) { session.detach() }
                     }
-                    action("停止模拟器", icon: "stop.fill", enabled: controlsAvailable && (runtime.isServing || session.isRunning)) {
+                    action("停止模拟器", icon: "stop.fill", enabled: canStop) {
                         Task {
                             await recording.stop()
-                            if runtime.isServing { await runtime.stop() }
+                            if runtime.isServing || runtime.isBusy { await runtime.stop() }
                             else { session.perform("stop") }
                         }
                     }
+                    .keyboardShortcut(".", modifiers: .command)
+                    .help(runtime.isStopping ? "正在停止…" : "停止设备（⌘.）；启动或检查进行中时会取消该操作")
                     .accessibilityIdentifier("simulator.stop")
+                    if runtime.instanceID != nil {
+                        action("重置实例", icon: "arrow.counterclockwise.circle", enabled: !runtime.isStopping) {
+                            Task {
+                                await recording.stop()
+                                _ = await sharing.disable()
+                                await runtime.resetInstance()
+                            }
+                        }
+                        .help("启动失败或状态异常时使用：停止设备并清除此实例的运行缓存与错误；已保存的数据、固件设置和已导入固件都会保留")
+                        .accessibilityIdentifier("simulator.reset-instance")
+                    }
                     action("截图", icon: "camera", enabled: controlsAvailable && session.frame != nil) { session.perform("screenshot") }
                     action(recording.isRecording ? "停止录屏" : "录屏", icon: recording.isRecording ? "stop.circle" : "record.circle",
                            enabled: !recording.isFinishing && (recording.isRecording || (session.isRunning && session.image != nil))) {
@@ -298,10 +352,18 @@ import UniformTypeIdentifiers
                         action(presentation == .full ? "画面回到主窗口" : "关闭独立窗口", icon: "rectangle.inset.filled", enabled: true) { displayWindow.close() }
                     }
                 }
-                if !session.isRunning && !runtime.statusMessage.isEmpty && runtime.sessionURL != nil {
+                if runtime.isStopping {
+                    ProgressView("正在停止设备…").controlSize(.small)
+                } else if !session.isRunning && !runtime.statusMessage.isEmpty {
                     Text(runtime.statusMessage)
                         .foregroundStyle(SimulatorTheme.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+                if let issue = session.transientIssue {
+                    Label(issue, systemImage: "exclamationmark.triangle")
+                        .font(.system(size: 12)).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("simulator.transient-issue")
                 }
                 if let seconds = sessionRunLimit {
                     Text("运行上限：\(StandaloneRunLimits.describe(seconds))")
@@ -584,18 +646,45 @@ import UniformTypeIdentifiers
     private var firmwareLibrarySection: some View {
         SimulatorSection(title: "固件", icon: "applewatch") {
             if runtime.selectableFirmwareItems.isEmpty {
-                Text(runtime.hasLoadedCatalog ? "暂无可选固件" : "正在读取固件目录")
+                Text(runtime.hasLoadedCatalog ? "尚未导入固件；点击「导入固件…」选择完整 OTA 包" : "正在读取固件库")
                     .fontWeight(.medium)
             } else {
-                Picker(runtime.modelConstraint == nil ? "设备与固件" : "版本", selection: $runtime.selectedProfileID) {
+                Picker("已导入固件", selection: Binding(get: { pendingProfileID ?? runtime.selectedProfileID }, set: { id in
+                    if runtime.isServing {
+                        pendingProfileID = id == runtime.selectedProfileID ? nil : id
+                    } else if let id {
+                        Task { await runtime.switchFirmware(to: id) }
+                    } else { runtime.selectedProfileID = nil }
+                })) {
                     Text("选择启动固件…").tag(Optional<String>.none)
                     ForEach(runtime.selectableFirmwareItems) { item in
                         Text("\(item.displayName)\(item.source == .imported ? " · 已导入" : "")")
                             .tag(Optional(item.id))
                     }
                 }
-                .disabled(!controlsAvailable || runtime.isServing || session.isAttached)
+                // Switching is free whenever this app owns or has stopped the
+                // core; only an externally attached session cannot be switched.
+                .disabled(!controlsAvailable || (session.isAttached && !runtime.isServing))
+                .help(session.isAttached && !runtime.isServing ? "已连接外部会话；断开后可切换固件"
+                    : "可切换本型号的任意已导入固件；切换固件会保留数据盘")
                 .accessibilityIdentifier("simulator.firmware-picker")
+                if let pending = pendingProfileID, runtime.isServing {
+                    SimulatorActionFlow {
+                        action("切换并重新开机", icon: "arrow.triangle.2.circlepath", enabled: controlsAvailable) {
+                            pendingProfileID = nil
+                            Task { await recording.stop(); await runtime.switchFirmware(to: pending) }
+                        }
+                        .accessibilityIdentifier("simulator.switch-firmware")
+                        action("取消", icon: "xmark", enabled: true) { pendingProfileID = nil }
+                    }
+                    Text("将停止设备、保存数据盘，然后用所选固件冷启动；切换固件会保留数据盘。")
+                        .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if runtime.selectableFirmwareItems.count > 1 {
+                    Text("可随时切换本型号的其他已导入固件；切换固件会保留数据盘。")
+                        .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             if let item = runtime.selectedFirmware {
                 Text("\(item.model) · \(item.width) × \(item.height)")
@@ -615,12 +704,17 @@ import UniformTypeIdentifiers
                 action("运行", icon: "play.fill", enabled: controlsAvailable && runtime.canRunSelectedFirmware) {
                     Task {
                         guard controlsAvailable, await runtime.prepareSelectedFirmware(), controlsAvailable else { return }
-                        if runtime.preparedExecutionApproved { await runtime.startApproved() }
+                        if !runtime.preparedNeedsReview { await runtime.startApproved() }
                         else { review = SimulatorRunReview(summary: runtime.selectedSummary, runLimitSeconds: runtime.preparedRunLimitSeconds) }
                     }
                 }
+                .keyboardShortcut("r", modifiers: .command)
+                .help(runtime.runUnavailableReason ?? (sharing.isSharing || sharing.sessionURL != nil
+                    ? "请先停止 Studio 连接共享" : "按本实例的硬件预设开机（⌘R）"))
                 .accessibilityIdentifier("simulator.run-firmware")
                 action("导入固件…", icon: "square.and.arrow.down", enabled: controlsAvailable && runtime.libraryAvailable && !runtime.isServing && !session.isAttached) { choose(.importFirmware) }
+                    .help(runtime.isServing || session.isAttached ? "停止设备后可导入固件"
+                        : runtime.libraryAvailable ? "选择完整 OTA 包导入到固件库" : "固件库暂不可用；请先点击「刷新目录」")
                     .accessibilityIdentifier("simulator.import-firmware")
                 action("刷新目录", icon: "arrow.clockwise", enabled: controlsAvailable && !runtime.isServing && !session.isAttached) {
                     Task { await runtime.loadCatalog() }
@@ -649,7 +743,7 @@ import UniformTypeIdentifiers
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            if !runtime.libraryStatus.isEmpty && runtime.libraryStatus != "固件目录已就绪" {
+            if !runtime.libraryStatus.isEmpty && runtime.libraryStatus != "固件库已就绪" {
                 Text(runtime.libraryStatus).font(.system(size: 12))
                     .foregroundStyle(SimulatorTheme.secondary)
                     .fixedSize(horizontal: false, vertical: true)

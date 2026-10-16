@@ -33,21 +33,55 @@ nonisolated struct BundledFirmwareItem: Codable, Identifiable, Equatable, Sendab
     }
 }
 
+/// An instance hardware preset: a product model the simulator models, with no
+/// firmware version attached. Firmware always comes from the user's import.
+nonisolated struct BundledDevicePreset: Decodable, Identifiable, Equatable, Sendable {
+    let model: String
+    let displayName: String
+    let width: Int
+    let height: Int
+
+    var id: String { model }
+
+    func validate() throws {
+        guard FirmwareLibraryValidation.identifier(model),
+              FirmwareLibraryValidation.text(displayName, limit: 240),
+              [(192, 490), (212, 520), (336, 480)].contains(where: { $0 == (width, height) }) else {
+            throw SimulatorError.invalidSession("硬件预设包含无效的型号或尺寸")
+        }
+    }
+}
+
 nonisolated struct BundledFirmwareCatalog: Decodable, Sendable {
     struct Runtime: Decodable, Sendable { let ready: Bool; let reason: String }
     let version: Int
     let items: [BundledFirmwareItem]
+    let presets: [BundledDevicePreset]
     let runtime: Runtime
+
+    private enum CodingKeys: String, CodingKey { case version, items, presets, runtime }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(Int.self, forKey: .version)
+        items = try container.decode([BundledFirmwareItem].self, forKey: .items)
+        // Older runtimes report no presets; instance creation then stays disabled
+        // instead of failing to read the whole catalog.
+        presets = try container.decodeIfPresent([BundledDevicePreset].self, forKey: .presets) ?? []
+        runtime = try container.decode(Runtime.self, forKey: .runtime)
+    }
 
     static func decode(_ data: Data) throws -> Self {
         let value: Self = try FirmwareLibraryValidation.decode(data)
-        // Each imported full OTA is listed once per hardware preset.
+        // Items are the user's imported firmware, listed once per hardware preset.
         guard value.version == 1, value.items.count <= 4_096,
+              value.presets.count <= 256, Set(value.presets.map(\.model)).count == value.presets.count,
               Set(value.items.map(\.id)).count == value.items.count,
               FirmwareLibraryValidation.text(value.runtime.reason, limit: 1_024, empty: true) else {
             throw SimulatorError.invalidSession("固件目录版本或内容无效")
         }
         try value.items.forEach { try $0.validate() }
+        try value.presets.forEach { try $0.validate() }
         return value
     }
 }
@@ -104,7 +138,6 @@ nonisolated struct FirmwareDiagnostic: Decodable, Sendable {
         let members: Int
         let expandedBytes: Int
         let resourceLayout: String
-        let allMemberCRCChecked: Bool
     }
     let version: Int
     let sha256: String
@@ -121,14 +154,14 @@ nonisolated struct FirmwareDiagnostic: Decodable, Sendable {
     let archive: Archive?
 
     var summary: String {
-        ap.headerRecognized ? "已识别启动头；运行兼容性尚未验证" : "已完成静态检查；芯片或启动布局尚未适配"
+        ap.headerRecognized ? "已读取启动头；导入后即按实例的硬件预设开机" : "已完成结构检查；启动头尚未适配，仍可导入后由运行结果说明"
     }
     var details: String {
         var lines = ["输入：\(inputKind == .fullOTA ? "完整 OTA ZIP" : "AP 候选文件") · \(bytes) 字节",
-                     "文件 SHA-256：\(sha256)", "芯片：\(ap.chip)"]
+                     "AP SHA-256：\(sha256)", "芯片：\(ap.chip)"]
         if let version = ap.build?["VERSION"] { lines.append("头部版本字段：\(version)") }
         if let archive {
-            lines.append("包内 \(archive.members) 个成员的 CRC 已校验；资源布局：\(archive.resourceLayout)")
+            lines.append("包内 \(archive.members) 个成员 · 展开约 \(archive.expandedBytes) 字节 · 资源布局：\(archive.resourceLayout)")
         }
         if let offset = ap.apOffset, let flash = ap.flashBytes, let entry = ap.resetEntry, let stack = ap.resetSP {
             lines.append(String(format: "AP 偏移：0x%X · Flash：0x%X · 启动入口：0x%X · 初始栈：0x%X", offset, flash, entry, stack))
@@ -165,7 +198,7 @@ nonisolated struct FirmwareDiagnostic: Decodable, Sendable {
         }
         if value.inputKind == .fullOTA {
             guard let archive = value.archive, (1...4096).contains(archive.members),
-                  (ap.bytes...1_073_741_824).contains(archive.expandedBytes), archive.allMemberCRCChecked,
+                  (ap.bytes...1_073_741_824).contains(archive.expandedBytes),
                   ["romfs", "multi-partition"].contains(archive.resourceLayout) else {
                 throw SimulatorError.invalidSession("固件包静态诊断不完整")
             }
@@ -340,12 +373,20 @@ nonisolated struct StandaloneBundledRuntime: Sendable {
         let expectedCount = listed.count + listedDirectories.count + 1 // manifest.json
         for case let url as URL in entries {
             try Task.checkCancellation()
-            visited += 1
-            guard visited <= expectedCount else { throw SimulatorError.transport("内置运行组件目录超过清单范围") }
             var info = stat()
             guard lstat(url.path, &info) == 0 else { throw SimulatorError.transport("内置运行组件目录在检查时发生变化") }
             let kind = info.st_mode & S_IFMT
             let relative = String(url.path.dropFirst(engine.path.count + 1))
+            // Runtime by-products and file-manager metadata are never engine
+            // inputs: ignore them instead of rejecting the whole component tree.
+            let name = url.lastPathComponent
+            let ignoredDirectories: Set<String> = ["__pycache__", ".Spotlight-V100", ".fseventsd", ".Trashes"]
+            let ignoredFiles: Set<String> = [".DS_Store", "Icon\r", "._.DS_Store"]
+            if (kind == S_IFDIR && ignoredDirectories.contains(name))
+                || (kind == S_IFREG && (ignoredFiles.contains(name) || name.hasPrefix("._")
+                    || ["pyc", "pyo"].contains(url.pathExtension))) { continue }
+            visited += 1
+            guard visited <= expectedCount else { throw SimulatorError.transport("内置运行组件目录超过清单范围") }
             if kind == S_IFDIR {
                 guard listedDirectories.contains(relative) else { throw SimulatorError.transport("内置运行组件包含未登记的目录") }
                 try validateDirectory(url)

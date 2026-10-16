@@ -367,7 +367,40 @@ class WatchControl:
             if type(data['values']) is not list:
                 raise ValueError('pmu.adcRaw values must be an array')
             return self.adc_raw(data['values'])
+        if set(data) == {'command'} and data['command'] == 'health.get':
+            return self.health()
+        if set(data) == {'command', 'value'} and data['command'] == 'health.set':
+            return self.health(data['value'])
         raise ValueError('Unsupported input command or fields')
+
+    def health(self, value=None):
+        """Live health input of the session's modeled sensors.
+
+        value: {"walkSteps": int, "cadence": int, "heartRate": int}, any subset.
+        walkSteps is the number of steps walked since boot (raising it walks the
+        difference; the firmware counts them itself). Only fixed fields reach
+        the core, never arbitrary QMP arguments."""
+        limits = {'walkSteps': ('walk', 0, 10000000), 'cadence': ('cadence', 40, 200),
+                  'heartRate': ('heart-rate', 0, 255)}
+        with self.lock:
+            state = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'health-fixture'})
+            if not isinstance(state, str) or state == 'off':
+                raise RuntimeError('unsupported_hardware_input: health')
+            if value is not None:
+                if type(value) is not dict or not value or set(value) - set(limits):
+                    raise ValueError('health.set requires walkSteps, cadence or heartRate')
+                fields = []
+                for key, item in value.items():
+                    name, low, high = limits[key]
+                    if type(item) is not int or not low <= item <= high:
+                        raise ValueError('health.%s must be an integer in %d..%d' % (key, low, high))
+                    fields.append('%s=%d' % (name, item))
+                self.qmp.execute('qom-set', {'path': '/machine', 'property': 'health-fixture',
+                                             'value': ';'.join(fields)})
+                state = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'health-fixture'})
+            parsed = dict(item.split('=', 1) for item in state.split(';') if '=' in item)
+            return {'walkSteps': int(parsed.get('walk', 0)), 'cadence': int(parsed.get('cadence', 0)),
+                    'heartRate': int(parsed.get('heart-rate', 0)), 'walked': int(parsed.get('walked', 0))}
 
     def _shared_frame(self):
         """Read the LCD snapshot published by QEMU, independent of QMP/Web."""

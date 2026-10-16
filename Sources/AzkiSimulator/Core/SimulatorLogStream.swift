@@ -94,6 +94,12 @@ nonisolated struct SimulatorLogBuffer: Sendable {
             self.isFollowing = false
         }
     }
+    /// Stop and drop the retained text, e.g. when the instance is reset.
+    func clear() {
+        stop()
+        text = ""; discardedUTF16 = 0; revision &+= 1; epoch &+= 1; detail = "暂无日志"
+    }
+
     func stop() {
         generation = UUID(); task?.cancel(); task = nil; isFollowing = false
         if let connection { Task { await connection.close() } }

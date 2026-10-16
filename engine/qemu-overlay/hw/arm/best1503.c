@@ -21,6 +21,7 @@
 #include "qemu/error-report.h"
 #include "hw/timer/cmsdk-apb-dualtimer.h"
 #include "system/reset.h"
+#include "system/runstate.h"
 #include "system/system.h"
 #include "hw/char/pl011.h"
 #include "hw/dma/pl080.h"
@@ -33,6 +34,8 @@
 #include "chardev/char-fe.h"
 #include "best1503-gpu.h"
 #include "best1503-adc.h"
+#include "best1503-i2cdev.h"
+#include "best1503-sensors.h"
 #include "qemu/thread.h"
 #include "bes-nand-store.h"
 #include "bes-nor-store.h"
@@ -256,6 +259,35 @@ struct Best1503State {
     bool power_adc_fixture;
     QemuMutex adc_lock;
     BesAdcInput adc_input;
+    uint32_t adc_ntc_channels;
+    /* PMU RTC (BEST1503 PMU regs 0x23/0x24 load, 0x54/0x55 value). Seconds
+     * advance with the virtual clock from an anchor; the host may set it. */
+    int64_t rtc_base;
+    int64_t rtc_anchor_ns;
+    Notifier shutdown_notifier;
+    /* PMU watchdog (WDT_CFG 0x37 EN|RESET_EN, timers 0x4d/0x36 in ms):
+     * pmu_wdt_reboot() arms it with a short timeout to restart the chip. */
+    QEMUTimer *pmu_wdt_timer;
+    /* Board I2C peripherals beyond touch, addressed on any controller. */
+    BesI2cDevice i2c_devices[BES_I2C_DEVICES];
+    unsigned i2c_device_count;
+    /* External charger/fuel gauge on the board's "charger-i2c" location (the
+     * HP4570 boards also carry a CW2218 coulomb counter): 0 unplugged,
+     * 1 charging, 2 full. */
+    uint8_t charger_state;
+    uint8_t charger_id;
+    bool charger_hp4570;
+    uint8_t charger_map; /* register layout, see charger_read() */
+    /* PMU CHARGER_STATUS (0x5e) AC_ON edge flags (bit3 rise, bit4 fall)
+     * pending for the PMU interrupt (NVIC 42); see pmu_charger_update(). */
+    uint16_t pmu_charger_edges;
+    bool pmu_charger_ac_on;
+    bool pmu_charger_armed;
+    qemu_irq pmu_irq;
+    /* Motion/optical sensors (best1503-sensors.h), wired per board by
+     * "sensor-board" and driven by the host's "health-fixture" input. */
+    BesSensorHub sensors;
+    QEMUTimer *sensor_timer;
     bool gh_reg0724_set;
     uint32_t gh_reg0724;
     bool bt_peer;
@@ -820,6 +852,11 @@ static MemTxResult cmu_write(void *opaque, hwaddr offset, uint64_t value,
      * released bits: hal_cmu_reset_get_status() reads SET and interprets
      * one as HAL_CMU_RST_CLR (Q66 .071 runtime 0x0026e938, also the SDK).
      * Inverting SET makes hal_cmu_reset_pulse() skip the actual pulse. */
+    /* hal_cmu_sys_reboot(): GBL_RESET_SET (0xc8) bit 8 = HAL_CMU_AON_GLOBAL.
+     * With -no-reboot QEMU exits and reports a guest reset. */
+    if (cmu->aon && reg == 0xc8 && (bits & (1u << 8))) {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
     const unsigned aon_reset[] = {0x10, 0xc8, 0xd8};
     const unsigned main_reset[] = {0x34, 0x3c, 0x44, 0x150, 0x174};
     const unsigned *reset = cmu->aon ? aon_reset : main_reset;
@@ -1672,6 +1709,24 @@ static bool spi0_unconnected_transfer(BesSpiConfig *spi, uint32_t value)
     return true;
 }
 
+/* A modeled board sensor selected by its own chip-select GPIO answers the
+ * byte; otherwise the bus falls through to the unconnected/fixture paths. */
+static bool sensor_spi_transfer(BesSpiConfig *spi, uint32_t value)
+{
+    uint8_t rx;
+    if (value > 255 || !bes_sensors_spi(&spi->machine->sensors, spi != &spi->machine->spi0,
+                                         value, &rx)) {
+        return false;
+    }
+    if (spi->rx_count == ARRAY_SIZE(spi->rx)) {
+        spi->rx_overrun = true;
+    } else {
+        spi->rx[(spi->rx_head + spi->rx_count) % ARRAY_SIZE(spi->rx)] = rx;
+        spi->rx_count++;
+    }
+    return true;
+}
+
 /* Eight-bit SPI with optional FIFO-driven DMA for the unconnected SPI0
  * fixture. Sensor protocol fixtures remain polled; no SPI interrupt model. */
 static MemTxResult spi0_read(void *opaque, hwaddr offset, uint64_t *value,
@@ -1683,7 +1738,9 @@ static MemTxResult spi0_read(void *opaque, hwaddr offset, uint64_t *value,
         *value = 3 | (spi->rx_count ? 4 : 0) | (spi->rx_count == 8 ? 8 : 0);
         return MEMTX_OK;
     case 0x08:
-        if ((spi->machine->gh3x2x_fixture || spi->machine->spi0_unconnected) && spi->rx_count) {
+        if ((spi->machine->gh3x2x_fixture || spi->machine->spi0_unconnected ||
+             bes_sensors_on_spi(&spi->machine->sensors, spi != &spi->machine->spi0)) &&
+            spi->rx_count) {
             *value = spi->rx[spi->rx_head];
             spi->rx_head = (spi->rx_head + 1) % 8;
             spi->rx_count--;
@@ -1710,7 +1767,8 @@ static MemTxResult spi0_write(void *opaque, hwaddr offset, uint64_t value,
     BesSpiConfig *spi = opaque;
     switch (offset) {
     case 0x08:
-        if (spi0_unconnected_transfer(spi, value) || gh_transfer(spi, value)) {
+        if (sensor_spi_transfer(spi, value) ||
+            spi0_unconnected_transfer(spi, value) || gh_transfer(spi, value)) {
             /* Retire one SPI word before the next TX DMA request. Without
              * this scheduling PL080 drains all TX synchronously before RX
              * gets a turn, overflowing even a correctly configured duplex
@@ -1931,7 +1989,18 @@ static MemTxResult gpu_probe_write(void *opaque, hwaddr offset, uint64_t value,
                                                value * 8, gpu_ram_read, &error))) {
                 qemu_log_mask(LOG_GUEST_ERROR,
                               "BES GPU render rejected: id=%u reason=%s\n", id, error);
-                return MEMTX_ERROR;
+                /* A drawing the renderer cannot execute (e.g. a chart path
+                 * outside its coordinate range) completes without pixels;
+                 * a bus error here would crash the firmware. */
+                if (s->gpu_busy || !gpu_decode_end(commands, value * 8,
+                                                   &s->gpu_pending_event)) {
+                    return MEMTX_ERROR;
+                }
+                s->gpu_pending_id = id;
+                s->gpu_busy = true;
+                timer_mod(s->gpu_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+                return MEMTX_OK;
             }
             s->gpu_pending_id = id;
             s->gpu_pending_event = s->gpu_work->event;
@@ -1976,9 +2045,30 @@ static const MemoryRegionOps gpu_probe_ops = {
     .valid.max_access_size = 4,
 };
 
+/* PMU charger input. The ROM's pmu_charger_set_irq_handler() sets PMU 0x05
+ * bits 11/12 (AC_ON rise/fall interrupt enables) and hooks the PMU IRQ
+ * (NVIC 42) whose dispatcher reads 0x5e, writes the edge bits back to clear
+ * them and calls the charger driver's plug-in/out handler, which then polls
+ * the I2C charger. AC_ON is reported only once a driver has armed those
+ * edges since reset: a charger visible during early boot sends the firmware
+ * into its power-off charging flow, and the host applies a charger after
+ * boot. Drivers unhook and re-arm the handler around each event (Band 10's
+ * batt_charger_callback), which must not read as another plug. */
+static void pmu_charger_update(Best1503State *s)
+{
+    uint16_t enable = s->ispi.analog[3][0][0x05] >> 8 & 0x18;
+    s->pmu_charger_armed |= enable != 0;
+    bool ac_on = s->charger_state && s->pmu_charger_armed;
+    if (ac_on != s->pmu_charger_ac_on) {
+        s->pmu_charger_ac_on = ac_on;
+        s->pmu_charger_edges |= ac_on ? 0x08 : 0x10;
+    }
+    qemu_set_irq(s->pmu_irq, !!(s->pmu_charger_edges & enable));
+}
+
 /* Internal SPI: register-level 25-bit BES analog transactions. FIFO and
- * page selection are modeled; analog devices currently retain register
- * writes rather than simulating voltage, charger, RF or ADC behavior.
+ * page selection are modeled; analog devices mostly retain register writes
+ * (the charger input above and the ADC fixture are the exceptions).
  */
 static uint64_t ispi_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -2005,6 +2095,38 @@ static uint64_t ispi_read(void *opaque, hwaddr offset, unsigned size)
     return spi->regs[offset / 4];
 }
 
+/* pmu_rtc_get() reads RTC_VAL_HIGH, LOW, HIGH; pmu_rtc_set() writes LOAD
+ * LOW then HIGH with three seconds added for the hardware load latency. */
+static int64_t bes_rtc_seconds(Best1503State *s)
+{
+    return s->rtc_base + (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                          s->rtc_anchor_ns) / NANOSECONDS_PER_SECOND;
+}
+
+static void bes_rtc_load(Best1503State *s, int64_t seconds)
+{
+    s->rtc_base = seconds;
+    s->rtc_anchor_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+static void bes_pmu_wdt_expired(void *opaque)
+{
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+/* Arm or cancel from the current register file after any WDT write. */
+static void bes_pmu_wdt_update(Best1503State *s, uint16_t (*pmu)[256])
+{
+    uint16_t cfg = pmu[0][0x37];
+    if ((cfg & (1u << 8)) && (cfg & (1u << 7))) {
+        uint64_t ms = (uint64_t)pmu[0][0x4d] + pmu[0][0x36];
+        timer_mod(s->pmu_wdt_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  MAX(ms, 1) * SCALE_MS);
+    } else {
+        timer_del(s->pmu_wdt_timer);
+    }
+}
+
 static void ispi_write(void *opaque, hwaddr offset, uint64_t value,
                        unsigned size)
 {
@@ -2024,6 +2146,20 @@ static void ispi_write(void *opaque, hwaddr offset, uint64_t value,
     uint64_t adc_version = 0;
     if (cmd & (1 << 24)) {
         uint16_t data = *cell;
+        if (cs == 3 && !spi->page[cs] && reg == 0x5e) {
+            /* CHARGER_STATUS: bit2 AC_ON, bits3/4 its latched edges. */
+            data = (data & ~0x1f) | (spi->machine->pmu_charger_ac_on ? 4 : 0) |
+                   spi->machine->pmu_charger_edges;
+        }
+        if (cs == 3 && !spi->page[cs] && reg == 0x61) {
+            /* COMMAND_NOT_RESET survives power cycles on hardware; the
+             * battery-backed RTC is always running (REG_NOT_RESET_RTC_ENABLED). */
+            data |= 1u << 1;
+        }
+        if (cs == 3 && !spi->page[cs] && (reg == 0x54 || reg == 0x55)) {
+            uint32_t rtc = (uint32_t)bes_rtc_seconds(spi->machine);
+            data = reg == 0x54 ? rtc & 0xffff : rtc >> 16;
+        }
         if (spi->machine->power_adc_fixture && cs == 3 && !spi->page[cs] &&
             (spi->analog[3][0][0x4f] & 0x20)) {
             /* Honor guest channel enablement. Raw inputs have no inferred
@@ -2060,6 +2196,25 @@ static void ispi_write(void *opaque, hwaddr offset, uint64_t value,
         }
     } else {
         *cell = cmd;
+        if (cs == 3 && !spi->page[cs] && reg == 0x5e) {
+            /* The PMU IRQ dispatcher writes the status back: edges are W1C. */
+            spi->machine->pmu_charger_edges &= ~(cmd & 0x18);
+        }
+        if (cs == 3 && !spi->page[cs] && (reg == 0x5e || reg == 0x05)) {
+            pmu_charger_update(spi->machine);
+        }
+        if (cs == 3 && !spi->page[cs] && reg == 0x24) {
+            /* LOAD_HIGH completes a pmu_rtc_set(); undo its +3 s latency. */
+            uint32_t loaded = (uint32_t)(cmd & 0xffff) << 16 | spi->analog[3][0][0x23];
+            bes_rtc_load(spi->machine, (int64_t)loaded - 3);
+        }
+        if (cs == 3 && !spi->page[cs] && (reg == 0x37 || reg == 0x36 || reg == 0x4d)) {
+            bes_pmu_wdt_update(spi->machine, spi->analog[3]);
+        }
+        if (cs == 3 && !spi->page[cs] && reg == 0x4f && (cmd & 1)) {
+            /* SOFT_POWER_OFF: pmu_shutdown() repeats this write until power drops. */
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+        }
         if (spi->machine->pmu_calibration && cs == 3 && !spi->page[cs] && reg == 0xf8) {
             /* O66 .28 SRAM 0x27574a polls FC bit11 after F8 bits14/3.
              * Functional completion only; no measured analog calibration. */
@@ -2658,6 +2813,9 @@ static MemTxResult i2c_write(void *opaque, hwaddr offset, uint64_t value,
     }
     if (offset == 0x10) {
         if (!(i2c->regs[0x6c / 4] & 1)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "BES I2C at 0x%08" HWADDR_PRIx " command 0x%03" PRIx64
+                          " dropped: controller disabled\n", i2c->base, value);
             return MEMTX_OK; /* Disabled controller does not issue commands. */
         }
         Best1503State *s = i2c->machine;
@@ -2703,6 +2861,52 @@ static MemTxResult i2c_write(void *opaque, hwaddr offset, uint64_t value,
                 i2c->abort_source = 1 << 3;
                 i2c->pending |= (1 << 6) | (1 << 9);
                 t->tx_count = 0;
+            }
+            i2c_update(i2c);
+            return MEMTX_OK;
+        }
+        BesI2cDevice *dev = NULL;
+        for (unsigned i = 0; !(i2c->regs[1] & (1 << 12)) && i < s->i2c_device_count; i++) {
+            /* Boards reuse addresses across buses (Band 10's light sensor is
+             * also 0x48), so a device answers only on its own controller. */
+            if (s->i2c_devices[i].controller < ARRAY_SIZE(s->i2c) &&
+                &s->i2c[s->i2c_devices[i].controller] == i2c &&
+                s->i2c_devices[i].address == (i2c->regs[1] & 0x7f)) {
+                dev = &s->i2c_devices[i];
+            }
+        }
+        if (dev) {
+            bool ok = true;
+            if (dev->reads + dev->writes < 96) {
+                qemu_log_mask(LOG_GUEST_ERROR, "BES I2C %s at 0x%08" HWADDR_PRIx " command=0x%03" PRIx64 "\n",
+                              dev->name, i2c->base, value);
+            }
+            if (value & 0x100) {
+                if (i2c->rx_count == ARRAY_SIZE(i2c->rx)) {
+                    ok = false;
+                } else {
+                    uint8_t reg = dev->pointer, byte = bes_i2c_device_read(dev);
+                    i2c->rx[(i2c->rx_head + i2c->rx_count++) % ARRAY_SIZE(i2c->rx)] = byte;
+                    if (dev->reads <= 64) {
+                        qemu_log_mask(LOG_GUEST_ERROR, "BES I2C %s at 0x%08" HWADDR_PRIx " read reg=0x%02x -> 0x%02x\n",
+                                      dev->name, i2c->base, reg, byte);
+                    }
+                }
+            } else {
+                bool pointer = dev->expect_pointer;
+                bes_i2c_device_write(dev, value & 0xff);
+                if (!pointer && dev->writes <= 64) {
+                    qemu_log_mask(LOG_GUEST_ERROR, "BES I2C %s at 0x%08" HWADDR_PRIx " write reg=0x%02x <- 0x%02x\n",
+                                  dev->name, i2c->base, (uint8_t)(dev->pointer - 1), (unsigned)(value & 0xff));
+                }
+            }
+            if (value & 0x200) {
+                bes_i2c_device_stop(dev);
+                i2c->pending |= 1 << 9;
+            }
+            if (!ok) {
+                i2c->abort_source = 1 << 3;
+                i2c->pending |= (1 << 6) | (1 << 9);
             }
             i2c_update(i2c);
             return MEMTX_OK;
@@ -2758,6 +2962,16 @@ static void panel_te_update_irq(Best1503State *s)
         g = &s->gpio[s->touch_irq_pin / 32];
         mask = ldl_le_p((uint8_t *)memory_region_get_ram_ptr(&s->psc) + 0x80 + (s->touch_irq_pin / 32) * 4);
         active |= !!(g->pending & g->regs[0x30 / 4] & ~g->regs[0x34 / 4] & mask & (1u << (s->touch_irq_pin % 32)));
+    }
+    for (int i = 0; i < 2; i++) {
+        BesSensorPort *port = bes_port(&s->sensors, i);
+        if (!port || port->irq_pin < 0) {
+            continue;
+        }
+        int pin = port->irq_pin;
+        g = &s->gpio[pin / 32];
+        mask = ldl_le_p((uint8_t *)memory_region_get_ram_ptr(&s->psc) + 0x80 + (pin / 32) * 4);
+        active |= !!(g->pending & g->regs[0x30 / 4] & ~g->regs[0x34 / 4] & mask & (1u << (pin % 32)));
     }
     qemu_set_irq(s->panel_te_irq,
                  active);
@@ -2937,6 +3151,7 @@ static MemTxResult gpio_write(void *opaque, hwaddr offset, uint64_t value,
                   "BES GPIO 0x%08" HWADDR_PRIx " write 0x%08x\n",
                   g->base + offset, (uint32_t)value);
     gh_pins_update(g->machine);
+    bes_sensors_pins(&g->machine->sensors);
     if (g->machine->touch.enabled) {
         if (!touch_powered(g->machine)) { touch_reset(g->machine); }
         else { touch_irq(g->machine); }
@@ -3447,6 +3662,58 @@ static const MemoryRegionOps lcdc_ops = {
     .valid.unaligned = false,
 };
 
+/* Board glue for best1503-sensors.h: GPIO chip selects/interrupts, clock. */
+static bool sensor_cs_low(void *opaque, int pin)
+{
+    BesGpio *g = &((Best1503State *)opaque)->gpio[pin / 32];
+    uint32_t bit = 1u << (pin % 32);
+    return (g->regs[1] & bit) && !(g->regs[0] & bit);
+}
+
+static void sensor_set_input(void *opaque, int pin, bool level)
+{
+    Best1503State *s = opaque;
+    BesGpio *g = &s->gpio[pin / 32];
+    uint32_t bit = 1u << (pin % 32);
+    bool old = !!(g->input & bit);
+    g->input = (g->input & ~bit) | (level ? bit : 0);
+    if (!(g->regs[1] & bit)) {
+        bool active_high = !!(g->regs[0x3c / 4] & bit);
+        if (g->regs[0x38 / 4] & bit) {
+            if (old != level && level == active_high) {
+                g->pending |= bit;
+            }
+        } else if (level == active_high) {
+            g->pending |= bit;
+        }
+    }
+    panel_te_update_irq(s);
+}
+
+static int64_t sensor_now(void *opaque)
+{
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+static void sensor_schedule(void *opaque, int64_t when)
+{
+    /* One timer serves every sensor: keep the earliest deadline. */
+    QEMUTimer *t = ((Best1503State *)opaque)->sensor_timer;
+    if (!timer_pending(t) || timer_expire_time_ns(t) > when) {
+        timer_mod(t, when);
+    }
+}
+
+static void sensor_log(void *opaque, const char *message)
+{
+    qemu_log_mask(LOG_GUEST_ERROR, "BES sensor %s\n", message);
+}
+
+static void sensor_tick(void *opaque)
+{
+    bes_sensors_timer(&((Best1503State *)opaque)->sensors);
+}
+
 static void best1503_peripheral_reset(void *opaque)
 {
     Best1503State *s = opaque;
@@ -3509,11 +3776,20 @@ static void best1503_peripheral_reset(void *opaque)
         }
     }
     s->cmu[1].regs[0] = s->revision_id << 16;
+    if (s->sensor_timer) {
+        timer_del(s->sensor_timer);
+    }
+    bes_sensors_reset(&s->sensors);
+    bes_sensors_reset_pins(&s->sensors);
     memset(s->ispi.regs, 0, sizeof(s->ispi.regs));
     memset(s->ispi.analog, 0, sizeof(s->ispi.analog));
     memset(s->ispi.page, 0, sizeof(s->ispi.page));
     s->ispi.head = s->ispi.count = 0;
     s->ispi.logged_reads = 0;
+    s->pmu_charger_edges = 0;
+    s->pmu_charger_ac_on = false;
+    s->pmu_charger_armed = false;
+    qemu_set_irq(s->pmu_irq, 0);
     memset(s->spi0.regs, 0, sizeof(s->spi0.regs));
     gh_reset(&s->spi0);
     spi0_dma_update(&s->spi0);
@@ -3725,7 +4001,11 @@ static void best1503_init(MachineState *machine)
     s->bt_rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, bt_peer_reset_response, s);
     s->gpu_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gpu_complete, s);
     s->panel_te_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, panel_te_edge, s);
+    s->pmu_wdt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, bes_pmu_wdt_expired, s);
     s->touch_irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, touch_irq_rearm, s);
+    s->sensor_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sensor_tick, s);
+    s->sensors.host = (BesSensorHost){sensor_cs_low, sensor_set_input, sensor_now,
+                                      sensor_schedule, sensor_log, s};
     s->lcdc.machine = s;
     if (s->touch.enabled) {
         if (!s->lcd_frame_capture) {
@@ -3819,8 +4099,11 @@ static void best1503_init(MachineState *machine)
          * Some differ from SDK bt_drv_config.c; names/side effects beyond
          * configuration remain unverified. Status offsets are not mapped.
          */
+        /* 0x0c4/0x0c8: three 10-bit fields Q66 4.200 rewrites (0x0c8e82fc)
+         * and reads back (0x0c8e84a6) from the PMU charger IRQ on unplug. */
         static const uint16_t modem[] = {
-            0x004, 0x00c, 0x018, 0x028, 0x02c, 0x040, 0x05c, 0x0c0, 0x0d0, 0x0d4,
+            0x004, 0x00c, 0x018, 0x028, 0x02c, 0x040, 0x05c, 0x0c0, 0x0c4, 0x0c8,
+            0x0d0, 0x0d4,
             0x0e0, 0x0e4, 0x0ec, 0x0f4, 0x0f8, 0x104, 0x108, 0x120,
             0x134, 0x140, 0x14c, 0x150, 0x154, 0x15c, 0x160, 0x168,
             0x174, 0x178, 0x17c, 0x1a8, 0x1ac, 0x1b0, 0x1b4, 0x1bc,
@@ -3957,6 +4240,7 @@ static void best1503_init(MachineState *machine)
     s->bt_rx_irq = qdev_get_gpio_in(cpu, 34);
     s->gpu_irq = qdev_get_gpio_in(cpu, 70);
     s->panel_te_irq = qdev_get_gpio_in(cpu, 44);
+    s->pmu_irq = qdev_get_gpio_in(cpu, 42);
     /* Original Q66 getter 0xc93448c returns67, unlike SDK LCD_FRAME_DONE=68. */
     s->lcdc.irq = qdev_get_gpio_in(cpu, 67);
     /* P67 3.101.043 AP table at file 0xc1ac18 confirms all eight bases
@@ -4163,6 +4447,41 @@ static bool best1503_get_power_adc_fixture(Object *obj, Error **errp)
 static void best1503_set_power_adc_fixture(Object *obj, bool value, Error **errp)
 {
     ((Best1503State *)obj)->power_adc_fixture = value;
+}
+
+/* Board thermistor channels boot at a room-temperature sample: 8990 raw is
+ * ~440 mV on the Band 9 calibration (0.051538 * raw - 23.3), 25 °C in its
+ * get_bat_temp table. The generic 21000 default reads below 0 °C and the
+ * charger managers then stop charging ("temperature too low"). */
+#define BES_ADC_NTC_ROOM 8990
+
+static void best1503_get_adc_ntc(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    uint32_t value = ((Best1503State *)obj)->adc_ntc_channels;
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void best1503_set_adc_ntc(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    uint32_t value;
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value >> BES_ADC_CHANNELS) {
+        error_setg(errp, "pmu-adc-ntc is a mask of channels 0..7");
+        return;
+    }
+    s->adc_ntc_channels = value;
+    qemu_mutex_lock(&s->adc_lock);
+    for (unsigned i = 0; i < BES_ADC_CHANNELS; i++) {
+        if (value & (1u << i)) {
+            s->adc_input.values[i] = BES_ADC_NTC_ROOM;
+        }
+    }
+    qemu_mutex_unlock(&s->adc_lock);
 }
 
 /* The runner owns QMP and exposes only pmu.adcRaw.set/get. Do not surface
@@ -4504,11 +4823,297 @@ GEOMETRY_ACCESSOR(touch_irq_pin)
 GEOMETRY_ACCESSOR(touch_module_id)
 GEOMETRY_ACCESSOR(touch_health_format)
 
+/* One machine-readable stderr line per guest power transition. The runner
+ * maps it to a power outcome; watchdog and SYSRESETREQ resets arrive here as
+ * guest resets as well. */
+static void best1503_shutdown_notify(Notifier *notifier, void *data)
+{
+    ShutdownCause cause = *(ShutdownCause *)data;
+    const char *event = cause == SHUTDOWN_CAUSE_GUEST_SHUTDOWN ? "poweroff" :
+                        cause == SHUTDOWN_CAUSE_GUEST_RESET ? "reboot" :
+                        cause == SHUTDOWN_CAUSE_GUEST_PANIC ? "panic" : NULL;
+    if (event) {
+        fprintf(stderr, "AZKI-POWER-EVENT %s\n", event);
+        fflush(stderr);
+    }
+}
+
+/* Current RTC seconds (Unix time as the firmware sees it). Writable at run
+ * time; reads return the live counter. */
+static void best1503_get_rtc_seconds(Object *obj, Visitor *v, const char *name,
+                                     void *opaque, Error **errp)
+{
+    int64_t value = bes_rtc_seconds((Best1503State *)obj);
+    visit_type_int64(v, name, &value, errp);
+}
+
+static void best1503_set_rtc_seconds(Object *obj, Visitor *v, const char *name,
+                                     void *opaque, Error **errp)
+{
+    int64_t value;
+    if (!visit_type_int64(v, name, &value, errp)) {
+        return;
+    }
+    if (value < 0 || value > UINT32_MAX) {
+        error_setg(errp, "rtc-seconds must be within 0..4294967295");
+        return;
+    }
+    bes_rtc_load((Best1503State *)obj, value);
+}
+
+/* HP4560/HP4570 register files as the Band 9 … Band 11 charger drivers use
+ * them. charger_map 0 is the hp4560x driver family (Band 9, 9 Pro, 11):
+ * 0x0a chip identity (hp4560x_checkid), 0x07 CHIP_STAT1 decoded by
+ * hp4560_detect_worker (bit1 clear = input present, bits3-4 = charge stage,
+ * 0x18 = done, bit2 = input in DPM) and 0x08/0x15 presence of the companion
+ * charger. charger_map 1 is the BESPOWER manager's driver (Band 10, 10 Pro):
+ * 0x60 chip identity (hp4560/hp4570_initialize expect 0xc6) and 0x08 status
+ * (bits3-5 charge stage read by get_state, bit2 DPM, bit1 power good read by
+ * hp4570_pg_state). Registers the driver read-modify-writes keep their
+ * written value so the sequence returns what the driver just stored. */
+static uint8_t charger_read(BesI2cDevice *dev, uint8_t reg, void *opaque)
+{
+    Best1503State *s = opaque;
+    unsigned state = MIN(s->charger_state, 2);
+    if (s->charger_map == 1) {
+        /* unplugged; power good + fast charge; power good + done */
+        static const uint8_t status[] = { 0x00, 0x12, 0x1a };
+        switch (reg) {
+        case 0x60:
+            return s->charger_id;
+        case 0x08:
+            return status[state];
+        default:
+            return dev->regs[reg];
+        }
+    }
+    switch (reg) {
+    case 0x0a:
+        return s->charger_id;
+    case 0x07: {
+        /* bit1 set = no input (hp4560_detect_worker: input present and not
+         * charging is reported as "charging abnormal"). */
+        static const uint8_t status[] = { 0x02, 0x08, 0x18 };
+        return status[state];
+    }
+    case 0x08:
+        /* Charger present: bits 5-6 report the companion supply state. */
+        return dev->regs[reg] | 0x40;
+    case 0x15:
+        return dev->regs[reg] ? dev->regs[reg] : 0x31;
+    default:
+        return dev->regs[reg];
+    }
+}
+
+static void charger_write(BesI2cDevice *dev, uint8_t reg, uint8_t value, void *opaque)
+{
+    Best1503State *s = opaque;
+    if (reg == 0x0a && s->charger_map == 0) {
+        s->charger_id = value;
+    }
+}
+
+static char *best1503_get_battery_charger(Object *obj, Error **errp)
+{
+    static const char *names[] = { "unplugged", "charging", "full" };
+    return g_strdup(names[MIN(((Best1503State *)obj)->charger_state, 2)]);
+}
+
+static void best1503_set_battery_charger(Object *obj, const char *value, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    if (!strcmp(value, "unplugged")) { s->charger_state = 0; }
+    else if (!strcmp(value, "charging")) { s->charger_state = 1; }
+    else if (!strcmp(value, "full")) { s->charger_state = 2; }
+    else { error_setg(errp, "battery-charger must be unplugged, charging or full"); return; }
+    pmu_charger_update(s);
+}
+
+/* The instance hardware preset names the fuel gauge/charger part. Both parts
+ * share the register-file layout this core models; the selection is reported
+ * back so a host can show which device the preset has. */
+static char *best1503_get_battery_gauge(Object *obj, Error **errp)
+{
+    return g_strdup(((Best1503State *)obj)->charger_hp4570 ? "hp4570" : "hp4560");
+}
+
+static void best1503_set_battery_gauge(Object *obj, const char *value, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    if (!strcmp(value, "hp4560")) {
+        s->charger_hp4570 = false;
+    } else if (!strcmp(value, "hp4570")) {
+        s->charger_hp4570 = true;
+    } else {
+        error_setg(errp, "battery-gauge must be hp4560 or hp4570");
+    }
+}
+
+/* The charger is i2c_devices[0]; value = controller << 8 | 7-bit address,
+ * or 0xffff to leave it off the board. */
+static void best1503_get_charger_i2c(Object *obj, Visitor *v, const char *name,
+                                     void *opaque, Error **errp)
+{
+    BesI2cDevice *dev = &((Best1503State *)obj)->i2c_devices[0];
+    uint32_t value = dev->controller << 8 | dev->address;
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void best1503_set_charger_i2c(Object *obj, Visitor *v, const char *name,
+                                     void *opaque, Error **errp)
+{
+    BesI2cDevice *dev = &((Best1503State *)obj)->i2c_devices[0];
+    uint32_t value;
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value != 0xffff && ((value >> 8) >= ARRAY_SIZE(((Best1503State *)obj)->i2c) ||
+                            (value & 0xff) > 0x7f)) {
+        error_setg(errp, "charger-i2c must be controller << 8 | 7-bit address");
+        return;
+    }
+    dev->controller = value >> 8;
+    dev->address = value & 0xff;
+}
+
+static void best1503_get_charger_id(Object *obj, Visitor *v, const char *name,
+                                    void *opaque, Error **errp)
+{
+    uint32_t value = ((Best1503State *)obj)->charger_id;
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void best1503_set_charger_id(Object *obj, Visitor *v, const char *name,
+                                    void *opaque, Error **errp)
+{
+    uint32_t value;
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value > 0xff) {
+        error_setg(errp, "charger-id must be one byte");
+        return;
+    }
+    ((Best1503State *)obj)->charger_id = value;
+}
+
+static void best1503_get_charger_map(Object *obj, Visitor *v, const char *name,
+                                     void *opaque, Error **errp)
+{
+    uint32_t value = ((Best1503State *)obj)->charger_map;
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void best1503_set_charger_map(Object *obj, Visitor *v, const char *name,
+                                     void *opaque, Error **errp)
+{
+    uint32_t value;
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value > 1) {
+        error_setg(errp, "charger-map must be 0 (hp4560x) or 1 (BESPOWER)");
+        return;
+    }
+    ((Best1503State *)obj)->charger_map = value;
+}
+
+/* Host health input for the modeled sensors. The firmware computes what it
+ * shows from the raw samples: walk=N makes the wearer walk N steps after boot
+ * at cadence C steps/min (raising N later walks the difference); heart-rate
+ * is the pulse rate the optical front end sees (0 = not on a wrist).
+ * Reading returns the input plus walked=W, the steps actually emitted. */
+static char *best1503_get_health_fixture(Object *obj, Error **errp)
+{
+    BesSensorHub *h = &((Best1503State *)obj)->sensors;
+    if (!h->health_enabled) {
+        return g_strdup("off");
+    }
+    return g_strdup_printf("walk=%u;cadence=%u;heart-rate=%u;walked=%u",
+                           h->walk_target, h->cadence, h->heart_rate,
+                           (unsigned)h->walk_phase);
+}
+
+static void best1503_set_health_fixture(Object *obj, const char *value, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    BesSensorHub *h = &s->sensors;
+    if (!strcmp(value, "off") || !*value) {
+        h->health_enabled = false;
+        return;
+    }
+    unsigned walk = h->walk_target, cadence = h->cadence ? h->cadence : 110;
+    unsigned rate = h->heart_rate;
+    bool ok = true;
+    gchar **items = g_strsplit(value, ";", 0);
+    for (gchar **i = items; ok && *i; i++) {
+        unsigned v;
+        char key[16], extra;
+        if (sscanf(*i, "%15[a-z-]=%u%c", key, &v, &extra) != 2) {
+            ok = false;
+        } else if (!strcmp(key, "walk") || !strcmp(key, "steps")) {
+            ok = v <= 10000000;
+            walk = v;
+        } else if (!strcmp(key, "cadence")) {
+            ok = v >= 40 && v <= 200;
+            cadence = v;
+        } else if (!strcmp(key, "heart-rate")) {
+            ok = v <= 255;
+            rate = v;
+        } else if (strcmp(key, "walked")) {
+            ok = false;
+        }
+    }
+    g_strfreev(items);
+    if (!ok) {
+        error_setg(errp, "health-fixture must be walk=N;cadence=C;heart-rate=H "
+                   "(walk<=10000000, cadence 40..200 steps/min, rate<=255)");
+        return;
+    }
+    h->health_enabled = true;
+    h->walk_target = walk;
+    h->cadence = cadence;
+    h->heart_rate = rate;
+    if (s->sensor_timer) {
+        timer_mod(s->sensor_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
+}
+
+static char *best1503_get_sensor_board(Object *obj, Error **errp)
+{
+    return bes_sensors_describe(&((Best1503State *)obj)->sensors);
+}
+
+static void best1503_set_sensor_board(Object *obj, const char *value, Error **errp)
+{
+    char *error = NULL;
+    if (!bes_sensors_configure(&((Best1503State *)obj)->sensors, value, &error)) {
+        error_setg(errp, "%s", error);
+        g_free(error);
+    }
+}
+
 static void best1503_instance_init(Object *obj)
 {
     Best1503State *s = (Best1503State *)obj;
     qemu_mutex_init(&s->adc_lock);
     bes_adc_init(&s->adc_input);
+    /* Default to the host's current time; rtc-seconds overrides it. */
+    s->rtc_base = time(NULL);
+    s->rtc_anchor_ns = 0;
+    s->shutdown_notifier.notify = best1503_shutdown_notify;
+    /* Band 9 (n66) default: I2C0 0x48; boards override it with charger-i2c. */
+    bes_i2c_device_init(&s->i2c_devices[s->i2c_device_count], "charger", 0, 0x48);
+    s->i2c_devices[s->i2c_device_count].read_hook = charger_read;
+    s->i2c_devices[s->i2c_device_count].write_hook = charger_write;
+    s->i2c_devices[s->i2c_device_count++].opaque = s;
+    /* The driver probes the identity register first; a zero id is not a part. */
+    /* hp4560_checkid accepts (id & 0xef) == 0x2e; hp4560_get_chipid reports 0x3e. */
+    s->charger_id = 0x3e;
+    s->charger_hp4570 = false;
+    s->charger_map = 0;
+    qemu_register_shutdown_notifier(&s->shutdown_notifier);
     s->ap_offset = 0xc0000;
     s->reset_sp = 0x2015fec0;
     s->flash_bytes = 16 * MiB;
@@ -4598,6 +5203,42 @@ static void best1503_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "pmu-adc-raw",
         "Atomically replace eight raw ADC words; dedicated runner input only");
     object_class_property_add_str(oc, "pmu-adc-state", best1503_get_adc_state, NULL);
+    object_class_property_add(oc, "pmu-adc-ntc", "uint32",
+        best1503_get_adc_ntc, best1503_set_adc_ntc, NULL, NULL);
+    object_class_property_set_description(oc, "pmu-adc-ntc",
+        "Mask of the board's thermistor ADC channels; they boot at a room-temperature sample");
+    object_class_property_add_str(oc, "battery-charger", best1503_get_battery_charger,
+                                  best1503_set_battery_charger);
+    object_class_property_set_description(oc, "battery-charger",
+        "External charger input: unplugged, charging or full; adjustable while running");
+    object_class_property_add_str(oc, "battery-gauge", best1503_get_battery_gauge,
+                                  best1503_set_battery_gauge);
+    object_class_property_set_description(oc, "battery-gauge",
+        "Fuel gauge/charger part of the instance hardware preset: hp4560 or hp4570");
+    object_class_property_add(oc, "charger-i2c", "uint32",
+        best1503_get_charger_i2c, best1503_set_charger_i2c, NULL, NULL);
+    object_class_property_set_description(oc, "charger-i2c",
+        "Charger/gauge location: I2C controller index << 8 | 7-bit address (0xffff = absent)");
+    object_class_property_add(oc, "charger-id", "uint32",
+        best1503_get_charger_id, best1503_set_charger_id, NULL, NULL);
+    object_class_property_set_description(oc, "charger-id",
+        "Chip identity byte the charger returns at its identity register");
+    object_class_property_add(oc, "charger-map", "uint32",
+        best1503_get_charger_map, best1503_set_charger_map, NULL, NULL);
+    object_class_property_set_description(oc, "charger-map",
+        "Charger register layout: 0 hp4560x driver (id at 0x0a), 1 BESPOWER driver (id at 0x60)");
+    object_class_property_add_str(oc, "health-fixture", best1503_get_health_fixture,
+                                  best1503_set_health_fixture);
+    object_class_property_add_str(oc, "sensor-board", best1503_get_sensor_board,
+                                  best1503_set_sensor_board);
+    object_class_property_set_description(oc, "sensor-board",
+        "Fitted motion sensor wiring: imu:<chip>:<spi0|i2cN>:<cs-pin|address>:<irq-pin|-1>");
+    object_class_property_set_description(oc, "health-fixture",
+        "Health input for the modeled sensors: walk=N;cadence=C;heart-rate=H");
+    object_class_property_add(oc, "rtc-seconds", "int",
+        best1503_get_rtc_seconds, best1503_set_rtc_seconds, NULL, NULL);
+    object_class_property_set_description(oc, "rtc-seconds",
+        "PMU RTC seconds; defaults to host time, adjustable while running");
     object_class_property_set_description(oc, "pmu-adc-state",
         "Raw vector version and actual guest ISPI FIFO read counters");
     object_class_property_set_description(oc, "touch", "CST9217 reports on configured I2C/GPIO from absolute pointer input");

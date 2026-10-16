@@ -18,8 +18,9 @@ def uuid_text(raw):
 
 
 class ExternalCentral:
-    def __init__(self, controller, timeout=30, smp=None):
+    def __init__(self, controller, timeout=30, smp=None, clock=time.monotonic):
         self.controller = controller
+        self.clock = clock
         self.link = None
         self.bridge_id = str(uuid.uuid4())
         self.timeout = timeout
@@ -34,7 +35,7 @@ class ExternalCentral:
         self.queue = deque()
         self.results = {}
         self.notifications = deque()
-        self.started = time.monotonic()
+        self.started = clock()
         self.outgoing = []
         if smp is None:
             from .smp import LegacyCentral
@@ -131,7 +132,7 @@ class ExternalCentral:
             # its GATT database. Keep discovery inside the original deadline.
             self.services.clear(); self.characteristics.clear(); self.descriptor_index = 0
             self.state, self.cursor = 'services', 1
-            self.next_discovery = time.monotonic() + .25
+            self.next_discovery = self.clock() + .25
             return
         for index, char in enumerate(self.characteristics):
             service = next(s for s in self.services if s['start'] <= char['decl'] <= s['end'])

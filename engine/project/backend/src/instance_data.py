@@ -242,3 +242,163 @@ def instance_nor_result_geometry(storage):
     if storage and storage.get('configBytes', 0):
         result.update(nor_config_offset=storage['configOffset'], nor_config_bytes=storage['configBytes'])
     return result
+
+
+SETTINGS_KEY = re.compile(r'persist\.[A-Za-z0-9._-]{1,120}\Z')
+
+
+def load_instance_settings(path, storage):
+    """The host-materialized settings file next to this session's data image."""
+    import json
+    path = Path(path)
+    if storage is None or path.parent != Path(storage['dataImage']).parent or path.name != 'instance-settings.json':
+        raise ValueError('Instance settings must belong to this session data image')
+    st = path.lstat()
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077 or st.st_size > 1 << 20:
+        raise ValueError('Instance settings file is unsafe')
+    value = json.loads(path.read_text(encoding='utf-8'))
+    properties, clock = value.get('properties'), value.get('clock')
+    if (value.get('schema') != 1 or not isinstance(properties, dict) or len(properties) > 512
+            or not isinstance(clock, dict) or clock.get('mode') not in ('host', 'offset', 'firmware')
+            or (clock['mode'] == 'offset' and type(clock.get('offsetSeconds')) is not int)
+            or (clock.get('timeZone') is not None and (not isinstance(clock['timeZone'], str)
+                or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_+/\-]{0,63}', clock['timeZone'])))):
+        raise ValueError('Instance settings schema is invalid')
+    for key, item in properties.items():
+        if (not isinstance(key, str) or not SETTINGS_KEY.fullmatch(key)
+                or (item is not None and (not isinstance(item, str) or len(item) > 1024
+                                          or any(c in item for c in '\0\n\r\t')))):
+            raise ValueError('Instance setting is invalid: ' + str(key)[:80])
+    validate_board_settings(value)
+    return value
+
+
+# Board inputs a hardware preset resolved before the session was created. The
+# runner only formats them into core properties; it never decides which model
+# has which device, so no firmware or version knowledge lives here.
+SETTINGS_CHARGERS = ('unplugged', 'charging', 'full')
+SETTINGS_GAUGES = ('hp4560', 'hp4570')
+
+
+def validate_board_settings(value):
+    battery, health = value.get('battery'), value.get('health')
+    if battery is not None:
+        if (not isinstance(battery, dict)
+                or set(battery) - {'channel', 'gauge', 'coulomb', 'sampleRaw', 'charger'}
+                or type(battery.get('channel')) is not int or not 0 <= battery['channel'] <= 7
+                or battery.get('gauge') not in SETTINGS_GAUGES
+                or battery.get('coulomb') not in (None, 'cw2218')
+                or (battery.get('coulomb') is not None and battery.get('gauge') != 'hp4570')
+                or ('sampleRaw' in battery and (type(battery['sampleRaw']) is not int
+                                                or not 0 <= battery['sampleRaw'] <= 65535))
+                or ('charger' in battery and battery['charger'] not in SETTINGS_CHARGERS)):
+            raise ValueError('Instance battery settings are invalid')
+    if health is not None:
+        # The host resolved the preset's sensor wiring (sensorBoard); the
+        # runner only checks its shape and forwards it to the core.
+        if (not isinstance(health, dict)
+                or set(health) - {'sensorBoard', 'walkSteps', 'cadence', 'heartRate'}
+                or not isinstance(health.get('sensorBoard'), str)
+                or not SENSOR_BOARD.fullmatch(health['sensorBoard'])
+                or ('walkSteps' in health and (type(health['walkSteps']) is not int
+                                               or not 0 <= health['walkSteps'] <= 10000000))
+                or ('cadence' in health and (type(health['cadence']) is not int
+                                             or not 40 <= health['cadence'] <= 200))
+                or ('heartRate' in health and (type(health['heartRate']) is not int
+                                               or not 0 <= health['heartRate'] <= 255))):
+            raise ValueError('Instance health settings are invalid')
+    return value
+
+
+# imu:<chip>:<spi0|spi1|i2cN>:<cs|address>:<irq|-1>[:mount];ppg:<chip>:...
+_SENSOR_ENTRY = r'(imu:(lsm6dso|icm42607)|ppg:hx3695):(spi[01]|i2c[0-7]):(0x[0-9a-f]{1,2}|\d{1,2}):(-1|\d{1,2})(:([+-]?[xyz]){3})?'
+SENSOR_BOARD = re.compile(_SENSOR_ENTRY + '(;' + _SENSOR_ENTRY + ')?')
+
+
+def instance_settings_options(settings, *, adc_fixture, default_sample=21000, ntc_channels=0,
+                              ntc_sample=8990):
+    """QEMU -M options for one session's host settings.
+
+    Values never contain a separator: the ADC vector doubles its commas the way
+    QEMU's machine parser expects, and the health fixture uses ';'. The board's
+    thermistor channels (geometry pmu-adc-ntc mask) keep the core's
+    room-temperature sample so a charger is not stopped as too cold.
+    """
+    options = []
+    battery = settings.get('battery')
+    if battery:
+        options.append('battery-gauge=' + battery['gauge'])
+        # The core always boots unplugged: a charger present at power-on
+        # sends the firmware into its charge-and-reboot flow. The runner
+        # plugs it in after boot (instance_settings_runtime).
+        if 'sampleRaw' in battery:
+            if not adc_fixture:
+                raise ValueError('Battery sample input requires the PMU ADC fixture')
+            raw = [ntc_sample if ntc_channels >> channel & 1 else default_sample
+                   for channel in range(8)]
+            raw[battery['channel']] = battery['sampleRaw']
+            options.append('pmu-adc-raw=' + ','.join(str(item) for item in raw).replace(',', ',,'))
+    health = settings.get('health')
+    if health:
+        # The preset's motion/optical sensors are attached only for a session
+        # that drives them: the firmware itself counts the walked steps and
+        # measures the pulse from their raw samples. ';' separates fields
+        # inside one machine value (a comma would split the option).
+        options.append('sensor-board=' + health['sensorBoard'])
+        options.append('health-fixture=walk=%d;cadence=%d;heart-rate=%d'
+                       % (health.get('walkSteps', 0), health.get('cadence', 110),
+                          health.get('heartRate', 0)))
+    return options
+
+
+def instance_settings_runtime(settings):
+    """Core properties the runner sets over QMP once the guest is running."""
+    battery = settings.get('battery') or {}
+    if battery.get('charger', 'unplugged') != 'unplugged':
+        return [('battery-charger', battery['charger'])]
+    return []
+
+
+def apply_instance_settings(storage, settings, helper, temporary):
+    """Write settings and the boot clock into persist.db before the core starts.
+
+    persist.rtc_save is the firmware's own saved wall clock: with no valid RTC
+    at boot it restores system time from it (miwear_rtc_checker)."""
+    import subprocess
+    import time
+    lines = []
+    for key, item in sorted(settings['properties'].items()):
+        lines.append(f'D\t{key}\n' if item is None else f'S\t{key}\t{item}\n')
+    clock_seconds = None
+    if settings['clock']['mode'] != 'firmware':
+        clock_seconds = int(time.time()) + settings['clock'].get('offsetSeconds', 0)
+        lines.append(f'S\tpersist.rtc_save\t{clock_seconds}\n')
+        zone = settings['clock'].get('timeZone')
+        if zone and 'persist.system_tz' not in settings['properties']:
+            lines.append(f'S\tpersist.system_tz\t{zone}\n')
+    if not lines:
+        return None
+    changes = Path(temporary) / 'instance-settings-changes.txt'
+    fd = os.open(changes, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as out:
+        out.writelines(lines)
+    try:
+        subprocess.run([str(helper), storage['dataImage'], storage['spareImage'], 'set', str(changes)],
+                       check=True, capture_output=True, timeout=120, env={**os.environ, 'TMPDIR': str(temporary)})
+    except subprocess.CalledProcessError as error:
+        raise ValueError('Writing instance settings failed: ' + error.stderr.decode(errors='replace')[-300:]) from error
+    finally:
+        changes.unlink(missing_ok=True)
+    return clock_seconds
+
+
+def read_instance_properties(storage, helper, temporary):
+    """The firmware's own persist.db properties after a clean stop."""
+    import json
+    import subprocess
+    result = subprocess.run([str(helper), storage['dataImage'], storage['spareImage'], 'get'],
+                            check=True, capture_output=True, timeout=120, env={**os.environ, 'TMPDIR': str(temporary)})
+    value = json.loads(result.stdout)
+    if not isinstance(value, dict):
+        raise ValueError('Instance property dump is invalid')
+    return value

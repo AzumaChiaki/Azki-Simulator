@@ -71,6 +71,7 @@ class MinativeSessionBridge(SessionBridge):
                 "lastExit": details.get("lastExit"), "error": self.last_error or details.get("error"),
                 "stopReason": details.get("reason"), "failureDetail": details.get("detail"),
                 "cleanup": details.get("cleanup"),
+                "debugger": details.get("debugger") if running else None,
                 "executionApproved": self.approved_digest == self.plan["approvalDigest"],
                 "approvalDigest": self.plan["approvalDigest"], "maxRuntimeSeconds": self.max_runtime,
                 "hostProcessRunning": running, "bootVerified": False, "guestHealth": "unverified",

@@ -1,18 +1,35 @@
 import Foundation
 import Darwin
 
+/// A GDB server the user asked for on this launch. QEMU listens on loopback
+/// only; port 0 lets it choose a free port, which the runner then reports.
+nonisolated struct StandaloneDebugger: Codable, Equatable, Sendable {
+    let port: Int
+    let waitForAttach: Bool
+    init(port: Int, waitForAttach: Bool) { self.port = port; self.waitForAttach = waitForAttach }
+    var isValid: Bool { (0...65_535).contains(port) }
+    /// Appended last to the fixed native guest invocation.
+    var arguments: [String] { ["--gdb", String(port)] + (waitForAttach ? ["--gdb-wait"] : []) }
+    /// Only a TCP listener on localhost; no outbound network is granted.
+    var sandboxRule: String {
+        "(allow network-bind network-inbound (local ip \"localhost:\(port == 0 ? "*" : String(port))\"))"
+    }
+}
+
 nonisolated struct StandaloneBrokerConfiguration: Codable, Sendable {
     let version: Int
     let id: String
     let run: String
     let approvalDigest: String
     let maxRuntimeSeconds: Int
+    let debugger: StandaloneDebugger?
     static let keys: Set<String> = ["version", "id", "run", "approvalDigest", "maxRuntimeSeconds"]
     static func validRun(_ value: String) -> Bool {
         value.hasPrefix("m-") && value.utf8.count == 14 && value.dropFirst(2).utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
     }
-    static func prepare(session: URL, digest: String, seconds: Int) throws -> Self {
-        guard FirmwareLibraryValidation.digest(digest), StandaloneRunLimits.isValid(seconds) else { throw SimulatorError.unsafeFile("原生代理批准无效") }
+    static func prepare(session: URL, digest: String, seconds: Int, debugger: StandaloneDebugger? = nil) throws -> Self {
+        guard FirmwareLibraryValidation.digest(digest), StandaloneRunLimits.isValid(seconds),
+              debugger?.isValid ?? true else { throw SimulatorError.unsafeFile("原生代理批准无效") }
         _ = try StandaloneSandboxFiles.directory(session, privateOnly: true)
         let folder = session.appendingPathComponent("native-broker", isDirectory: true)
         let path = folder.appendingPathComponent("config.json")
@@ -20,17 +37,18 @@ nonisolated struct StandaloneBrokerConfiguration: Codable, Sendable {
         if Darwin.access(folder.path, F_OK) == 0 {
             _ = try StandaloneSandboxFiles.directory(folder, privateOnly: true)
             let bytes = try StandaloneSandboxFiles.regular(path, limit: 4_096, privateOnly: true)
-            guard Set(try StandaloneProcessSandbox.object(bytes).keys) == keys else { throw SimulatorError.unsafeFile("原生代理配置字段不匹配") }
+            guard Set(try StandaloneProcessSandbox.object(bytes).keys).subtracting(["debugger"]) == keys else { throw SimulatorError.unsafeFile("原生代理配置字段不匹配") }
             value = try JSONDecoder().decode(Self.self, from: bytes)
         } else {
             try StandaloneSandboxFiles.createPrivate(folder)
             value = Self(version: 1, id: UUID().uuidString.lowercased(),
                 run: "m-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(12),
-                approvalDigest: digest, maxRuntimeSeconds: seconds)
+                approvalDigest: digest, maxRuntimeSeconds: seconds, debugger: debugger)
             try StandaloneSandboxFiles.writeExclusive(try JSONEncoder().encode(value), to: path)
         }
         guard value.version == 1, UUID(uuidString: value.id)?.uuidString.lowercased() == value.id,
-              validRun(value.run), value.approvalDigest == digest, value.maxRuntimeSeconds == seconds else {
+              validRun(value.run), value.approvalDigest == digest, value.maxRuntimeSeconds == seconds,
+              value.debugger == debugger, value.debugger?.isValid ?? true else {
             throw SimulatorError.unsafeFile("原生代理配置与本次批准不一致")
         }
         let run = session.appendingPathComponent(value.run, isDirectory: true)
@@ -69,8 +87,9 @@ nonisolated struct StandaloneNativeLaunch: Sendable {
     let sessionIdentity: StandaloneFileIdentity
     var brokerDirectory: URL { session.appendingPathComponent("native-broker", isDirectory: true) }
     var runDirectory: URL { session.appendingPathComponent(configuration.run, isDirectory: true) }
-    static func prepare(runtime: StandaloneBundledRuntime, session: URL, digest: String, seconds: Int) throws -> Self {
-        let config = try StandaloneBrokerConfiguration.prepare(session: session, digest: digest, seconds: seconds)
+    static func prepare(runtime: StandaloneBundledRuntime, session: URL, digest: String, seconds: Int,
+                        debugger: StandaloneDebugger? = nil) throws -> Self {
+        let config = try StandaloneBrokerConfiguration.prepare(session: session, digest: digest, seconds: seconds, debugger: debugger)
         let folder = session.appendingPathComponent("native-broker", isDirectory: true)
         let configURL = folder.appendingPathComponent("config.json")
         let temporary = session.appendingPathComponent("host-tmp", isDirectory: true)
@@ -79,7 +98,7 @@ nonisolated struct StandaloneNativeLaunch: Sendable {
             maxRuntime: seconds, library: BundledFirmwareService.libraryRoot, temporary: temporary)
         let guest = try StandaloneProcessSandbox.makeServe(runtime: runtime, session: session, approvedIdentity: digest,
             maxRuntime: seconds, library: BundledFirmwareService.libraryRoot, temporary: temporary,
-            guestRun: session.appendingPathComponent(config.run))
+            guestRun: session.appendingPathComponent(config.run), debugger: config.debugger)
         return Self(runtime: runtime, session: session, configuration: config, helper: helper, guest: guest,
             configData: try StandaloneSandboxFiles.regular(configURL, limit: 4_096, privateOnly: true),
             configIdentity: try StandaloneFileIdentity(configURL), directoryIdentity: try StandaloneFileIdentity(folder),
@@ -205,7 +224,7 @@ actor StandaloneGuestBroker {
             return try StandaloneProcessSandbox.makeServe(runtime: runtime, session: prepared.session,
                 approvedIdentity: prepared.configuration.approvalDigest, maxRuntime: prepared.configuration.maxRuntimeSeconds,
                 library: BundledFirmwareService.libraryRoot, temporary: prepared.helper.temporaryDirectory,
-                guestRun: prepared.runDirectory)
+                guestRun: prepared.runDirectory, debugger: prepared.configuration.debugger)
         }.value
         guard !stopRequested, !Task.isCancelled, fresh.policySHA256 == launch.guest.policySHA256,
               fresh.arguments == launch.guest.arguments else { throw CancellationError() }

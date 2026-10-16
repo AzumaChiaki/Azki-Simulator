@@ -76,7 +76,12 @@ class NativeBrokerSession:
             os.close(fd)
         self.config, self.config_identity = _record(self.directory / "config.json")
         config = self.config
-        if (not isinstance(config, dict) or set(config) != {"version", "id", "run", "approvalDigest", "maxRuntimeSeconds"}
+        debugger = config.get("debugger") if isinstance(config, dict) else None
+        if (not isinstance(config, dict)
+                or set(config) - {"debugger"} != {"version", "id", "run", "approvalDigest", "maxRuntimeSeconds"}
+                or ("debugger" in config and (type(debugger) is not dict or set(debugger) != {"port", "waitForAttach"}
+                    or type(debugger["port"]) is not int or not 0 <= debugger["port"] <= 65535
+                    or type(debugger["waitForAttach"]) is not bool))
                 or type(config.get("version")) is not int or config["version"] != 1
                 or not isinstance(config.get("id"), str)
                 or not isinstance(config.get("run"), str) or re.fullmatch("m-[0-9a-f]{12}", config["run"]) is None

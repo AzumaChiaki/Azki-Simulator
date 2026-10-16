@@ -233,15 +233,27 @@ def _nor_capability(capability, profile_id, ap_sha256, qemu_sha256):
 
 
 def _private(path: Path, *, directory=False, size=None):
+    """Require an object this app owns, narrowing a wider mode back.
+
+    Modes change when a library is restored from a backup or copied by a file
+    manager; that must not brick an instance. Ownership, link count and image
+    size are still enforced, and a mode is only ever narrowed, never widened.
+    """
     s = path.lstat()
     good = stat.S_ISDIR(s.st_mode) if directory else stat.S_ISREG(s.st_mode)
-    if not good or s.st_uid != os.geteuid() or s.st_mode & 0o077:
+    if not good or s.st_uid != os.geteuid():
         raise ValueError("Expected owned private directory/file")
     if not directory and (s.st_nlink != 1 or (size is not None and s.st_size != size)):
         raise ValueError("Unsafe link or wrong image size")
+    if stat.S_IMODE(s.st_mode) != (0o700 if directory else 0o600):
+        try:
+            path.chmod(0o700 if directory else 0o600)
+        except OSError as error:
+            raise ValueError("Expected owned private directory/file") from error
 
 
 def _json(path: Path):
+    _private(path)
     value = _decode(_read(path, 16_384, private=True))
     if not isinstance(value, dict): raise ValueError("Expected metadata object")
     return value
@@ -264,6 +276,20 @@ def _atomic_json(path: Path, value):
         os.replace(tmp, path); _sync_dir(path.parent)
     finally:
         if tmp.exists(): tmp.unlink()
+
+
+def _resize(path, size):
+    """Truncate or extend with erased (0xFF) bytes to the selected geometry."""
+    current = path.stat().st_size
+    if current > size:
+        os.truncate(path, size)
+    elif current < size:
+        with path.open("ab") as stream:
+            remaining = size - current
+            while remaining:
+                amount = min(remaining, BLOCK)
+                stream.write(b"\xff" * amount); remaining -= amount
+            stream.flush(); os.fsync(stream.fileno())
 
 
 def _blank(path, size):
@@ -433,12 +459,21 @@ class InstanceStorage:
         self.root = Path(root).absolute()
         # Keep path traversal symlink-free. The production host also confines
         # the core to these two exact files in its default-deny sandbox.
+        _private(self.root, directory=True)
         fd = _directory_fd(self.root, private=True)
         os.close(fd)
         self.info = _json(self.root / "instance.json")
         if self.info.get("schema") != 1 or not ID.fullmatch(self.info.get("model", "")):
-            raise ValueError("Invalid instance identity")
-        self.lock = os.open(self.root / ".lock", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+            raise ValueError("实例数据的身份记录无效")
+        # A restore that skipped hidden files or empty folders must not brick
+        # the instance: the lock file and revision folder are recreated.
+        self.lock = os.open(self.root / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            (self.root / "revisions").mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        except BaseException:
+            os.close(self.lock); raise
         try:
             _private(self.root / ".lock")
             fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -481,9 +516,10 @@ class InstanceStorage:
         fw = Firmware(**manifest["firmware"]); fw.validate()
         if fw.model != self.info["model"]: raise ValueError("Wrong model in revision")
         for name, size, key, _ in fw.images:
+            # Owner, link count and exact size only. Re-hashing up to 512 MiB on
+            # every start slowed launches and could only refuse to boot data
+            # that is already on disk; commit records the digest for diagnosis.
             _private(folder / name, size=size)
-            if manifest.get(key) != _initial_pin(folder / name):
-                raise ValueError("Accepted instance snapshot hash differs")
         if VIRTUAL_SHA in manifest:
             if not _hex(manifest[VIRTUAL_SHA], 64):
                 raise ValueError("Accepted virtual state has no valid hash")
@@ -496,25 +532,51 @@ class InstanceStorage:
               synthetic_seed_sha256: str | None = None, virtual_state=None, rebuild_identity=False,
               _previous_head=_UNREAD_HEAD):
         self._ensure(); firmware.validate()
-        if firmware.model != self.info["model"]: raise ValueError("Cross-model data reuse denied")
+        if firmware.model != self.info["model"]:
+            raise ValueError("此实例的数据属于 " + self.info["model"] + "，不能用 " + firmware.model
+                             + " 硬件预设启动；请换回原硬件预设，或新建实例")
         if self.active is not None or (self.root / "pending.json").exists():
-            raise ValueError("An active/interrupted transaction must be finished or recovered")
+            raise ValueError("此实例还有一次未完成的运行记录；请重置该实例后再启动")
         # prepare_session_storage already verified HEAD under this same held lock.
         old = self.head() if _previous_head is _UNREAD_HEAD else _previous_head
         if rebuild_identity and (old is None or virtual_state is None):
             raise ValueError("Identity rebuild requires a retained snapshot and fresh synthetic identity")
-        if old and not rebuild_identity and (old[2].layout != firmware.layout or
-                    (old[2].profile != firmware.profile and firmware.data_format == "unknown")):
-            raise ValueError("Data format/geometry incompatible or unverified; preserve snapshot")
-        nor_prefix = firmware.nor_prefix_from(old[2]) if old and not rebuild_identity else 0
-        if old and not rebuild_identity and old[2].nor_bytes and old[2].nor_layout != firmware.nor_layout and not nor_prefix:
-            raise ValueError("Existing NOR must never be dropped or reinterpreted")
-        if old and not rebuild_identity and firmware.nor_bytes and old[2].profile != firmware.profile:
-            raise ValueError("NOR migration across firmware versions is unverified")
+        # Firmware is never locked to an instance. Any version for the same
+        # hardware preset runs on a private copy of the saved data; HEAD only
+        # advances after a healthy stop, so a firmware that cannot use the data
+        # fails at boot and leaves the committed snapshot intact. Only pieces
+        # that genuinely cannot carry over are reinitialized, with a reason.
+        carry = old is not None and not rebuild_identity
+        notes = []
+        nor_prefix = firmware.nor_prefix_from(old[2]) if carry else 0
+        if carry and old[2].data_bytes != firmware.data_bytes:
+            notes.append("此固件的数据分区大小与上次不同，已沿用原数据并按新大小" +
+                         ("补齐空白区" if firmware.data_bytes > old[2].data_bytes else "截断末尾") +
+                         "；上次的快照保留到本次正常停止为止")
+        nor_carry = bool(carry and old[2].nor_bytes and firmware.nor_bytes
+                         and (old[2].nor_layout == firmware.nor_layout or nor_prefix))
+        # NOR saved by an earlier firmware travels along unused ("dormant")
+        # through firmware without NOR, so switching back restores it.
+        dormant = None
+        if carry and old[2].nor_bytes:
+            dormant = {"file": old[0] / "nor-config.bin", "layout": list(old[2].nor_layout), "bytes": old[2].nor_bytes}
+        elif carry and isinstance(old[1].get("dormantNor"), dict):
+            record = old[1]["dormantNor"]
+            if (old[0] / "nor-config.dormant.bin").exists() and type(record.get("bytes")) is int:
+                dormant = {"file": old[0] / "nor-config.dormant.bin", "layout": record.get("layout"),
+                           "bytes": record["bytes"]}
+        if not nor_carry and dormant and firmware.nor_bytes and dormant["layout"] == list(firmware.nor_layout):
+            nor_carry, nor_source = True, dormant["file"]
+            notes.append("已恢复此实例早先保存的 NOR 配置")
+        else:
+            nor_source = old[0] / "nor-config.bin" if nor_carry else None
+        if carry and dormant and firmware.nor_bytes and not nor_carry:
+            notes.append("此固件的 NOR 配置区布局与上次不同，NOR 配置区已重新初始化（原配置仍保存在旧快照中）；NAND 用户数据已沿用")
+        if carry and dormant and not firmware.nor_bytes:
+            notes.append("此固件不使用 NOR 配置区，上次的 NOR 配置原样保留，换回原固件时继续使用；NAND 用户数据已沿用")
         revisions = self.root / "revisions"
         _private(revisions, directory=True)
-        if len(list(revisions.iterdir())) >= self.max_revisions:
-            raise ValueError("Snapshot quota reached; explicitly prune retained revisions")
+        self._make_room(protect={old[0].name} if old else set())
         if old and synthetic_seed is not None and not rebuild_identity:
             raise ValueError("Never reseed existing user data")
         if virtual_state is not None:
@@ -523,7 +585,8 @@ class InstanceStorage:
             if rebuild_identity and VIRTUAL_SHA in old[1]:
                 previous_state, _, _ = _virtual_read(old[0] / VIRTUAL_STATE)
                 expected_version = previous_state["identityVersion"] + 1
-            if ((old and not rebuild_identity) or not firmware.nor_bytes or firmware.profile != virtual_state["profileID"]
+            if ((old and not rebuild_identity and VIRTUAL_SHA in old[1]) or not firmware.nor_bytes
+                    or firmware.profile != virtual_state["profileID"]
                     or virtual_state["binding"] is not None or virtual_state["identityVersion"] != expected_version):
                 raise ValueError("Fresh identity requires a new data revision without the old pairing")
         tx = "r-" + uuid.uuid4().hex
@@ -535,8 +598,10 @@ class InstanceStorage:
         self.active = folder
         try:
             data, spare = folder / "nand-data.bin", folder / "nand-spare.bin"
-            if old and not rebuild_identity:
+            if carry:
                 _copy(old[0] / data.name, data); _copy(old[0] / spare.name, spare)
+                _resize(data, firmware.data_bytes)
+                _resize(spare, firmware.data_bytes // 2048 * 64)
                 origin = "accepted-instance-revision"
             else:
                 if synthetic_seed is None:
@@ -552,14 +617,28 @@ class InstanceStorage:
                     _copy(synthetic_seed, data); origin = "host-verified-synthetic-ui-seed"
                 _blank(spare, firmware.data_bytes // 2048 * 64)
             if firmware.nor_bytes:
-                if old and not rebuild_identity and old[2].nor_bytes:
-                    _copy(old[0] / "nor-config.bin", folder / "nor-config.bin",
+                if nor_carry:
+                    _copy(nor_source, folder / "nor-config.bin",
                           erased_prefix=nor_prefix, preserved_prefix=firmware.nor_config_bytes)
                 else:
                     _blank(folder / "nor-config.bin", firmware.nor_bytes)
-            if old and not rebuild_identity and VIRTUAL_SHA in old[1]:
-                _copy(old[0] / VIRTUAL_STATE, folder / VIRTUAL_STATE)
-                marker[VIRTUAL_SHA] = old[1][VIRTUAL_SHA]
+            dormant_kept = False
+            if dormant and not firmware.nor_bytes:
+                _copy(dormant["file"], folder / "nor-config.dormant.bin")
+                dormant_kept = True
+            if carry and VIRTUAL_SHA in old[1]:
+                previous_state, raw, digest = _virtual_read(old[0] / VIRTUAL_STATE)
+                target = VIRTUAL_PROFILES.get(firmware.profile)
+                if (previous_state["profileID"] != firmware.profile and target is not None
+                        and target[1] == previous_state["identity"]["model"] and firmware.nor_bytes):
+                    # Same device identity, keys and pairing; only the firmware
+                    # build it is announced for follows the selected firmware.
+                    raw = _virtual_encode({**previous_state, "profileID": firmware.profile, "apSHA256": target[0]})
+                    digest = hashlib.sha256(raw).hexdigest()
+                elif previous_state["profileID"] != firmware.profile:
+                    notes.append("此固件没有已核验的虚拟通信支持，虚拟身份已原样保留但本次不启用")
+                _virtual_write(folder / VIRTUAL_STATE, raw)
+                marker[VIRTUAL_SHA] = digest
             elif virtual_state is not None:
                 raw = _virtual_encode(virtual_state)
                 _virtual_write(folder / VIRTUAL_STATE, raw)
@@ -567,17 +646,54 @@ class InstanceStorage:
             _atomic_json(folder / "revision.json", {**marker, "origin": origin,
                          "identityRebuilt": rebuild_identity,
                          **({"norExpandedFrom": list(old[2].nor_layout)} if nor_prefix else {}),
+                         "carryOver": notes,
+                         **({"dormantNor": {"layout": dormant["layout"], "bytes": dormant["bytes"]}}
+                            if dormant_kept else {}),
                          "compatibility": "same-firmware-erased-nor-prefix" if nor_prefix else
-                                          "same-layout-only; application migration unverified"})
+                                          "data carried over; application migration unverified"})
             _atomic_json(self.root / "pending.json", {**marker, "phase": "guest"})
             return {"data_image": str(data), "data_spare_image": str(spare),
                     "data_writeback": True, "previous_revision": marker["previous"],
-                    "nor_initialize": bool(firmware.nor_bytes and (rebuild_identity or not (old and old[2].nor_bytes))),
-                    "compatibility": "format-and-layout-match; no arbitrary downgrade guarantee"}
+                    "nor_initialize": bool(firmware.nor_bytes and not nor_carry),
+                    "notes": notes,
+                    "compatibility": "data carried over; firmware decides at boot"}
         except BaseException:
             # Preparation only: no process has received the image paths yet.
             shutil.rmtree(folder); (self.root / "pending.json").unlink()
             self.active = None; raise
+
+    def _make_room(self, *, protect=()):
+        """Keep the snapshot count under the limit instead of refusing to start.
+
+        Uncommitted leftovers go first, then the oldest committed history.
+        HEAD and the snapshot right before it are always kept.
+        """
+        from .maintenance import _committed, _read_json, remove_tree
+        revisions = self.root / "revisions"
+        names = sorted(name for name in os.listdir(revisions) if re.fullmatch(r"r-[0-9a-f]{32}", name))
+        if len(names) < self.max_revisions:
+            return []
+        head = (_read_json(self.root / "head.json") or {}).get("revision")
+        chain, cursor = [], head
+        while isinstance(cursor, str) and cursor in names and cursor not in chain:
+            chain.append(cursor)
+            cursor = (_read_json(revisions / cursor / "revision.json") or {}).get("previous")
+        keep = set(chain[:2]) | set(protect)
+        orphans = [name for name in names if name not in chain and name not in keep]
+        orphans.sort(key=lambda name: (_committed(revisions / name), name))
+        candidates = orphans + [name for name in reversed(chain) if name not in keep]
+        removed = []
+        for name in candidates:
+            if len(names) - len(removed) < self.max_revisions:
+                break
+            try:
+                remove_tree(str(revisions), name)
+                removed.append(name)
+            except OSError:
+                continue
+        if len(names) - len(removed) >= self.max_revisions:
+            raise ValueError("实例快照目录无法整理出空间；请检查 " + str(revisions) + " 的权限")
+        return removed
 
     def _idle_files(self, folder, firmware):
         held = []
@@ -692,7 +808,7 @@ class InstanceStorage:
 
 def _uuid(value):
     if not isinstance(value, str) or str(uuid.UUID(value)) != value:
-        raise ValueError("Expected canonical instance UUID")
+        raise ValueError("实例 ID 无效，应为小写 UUID")
     return value
 
 
@@ -799,7 +915,44 @@ def _instance_root(library_root, instance_id):
     return _path(library_root) / "instances" / _uuid(instance_id) / "storage"
 
 
+def _open_or_create(root, model):
+    """Open an instance store, rebuilding missing metadata in place.
+
+    A storage folder without instance.json (interrupted creation, partial
+    restore) is reinitialized when it has no committed HEAD; with a HEAD the
+    model is recovered from that snapshot. Snapshot files are never touched.
+    """
+    if not root.exists():
+        try:
+            return InstanceStorage.create(root, model)
+        except FileNotFoundError:
+            # The host normally creates instances/<uuid>; create it if missing.
+            from .firmware_catalog import _owned_directory
+            os.close(_owned_directory(root.parent, create=True))
+            return InstanceStorage.create(root, model)
+    _private(root, directory=True)
+    try:
+        info = _json(root / "instance.json")
+        healthy = info.get("schema") == 1 and type(info.get("model")) is str and ID.fullmatch(info["model"])
+    except (FileNotFoundError, ValueError):
+        healthy = False  # Unreadable metadata is set aside below, never deleted.
+    if healthy:
+        return InstanceStorage(root)
+    from .maintenance import _read_json
+    recovered = model
+    head = (_read_json(root / "head.json") or {}).get("revision")
+    if isinstance(head, str) and re.fullmatch(r"r-[0-9a-f]{32}", head):
+        firmware = (_read_json(root / "revisions" / head / "revision.json") or {}).get("firmware") or {}
+        if isinstance(firmware.get("model"), str) and ID.fullmatch(firmware["model"]):
+            recovered = firmware["model"]
+    if (root / "instance.json").exists() or (root / "instance.json").is_symlink():
+        os.rename(root / "instance.json", root / ("instance.json.broken-" + uuid.uuid4().hex[:8]))
+    _atomic_json(root / "instance.json", {"schema": 1, "model": recovered, "id": uuid.uuid4().hex})
+    return InstanceStorage(root)
+
+
 def _initial_pin(path):
+    _private(path)
     fd, info = _open_file(path, MAX_DATA, private=True)
     try:
         digest = hashlib.sha256()
@@ -827,23 +980,32 @@ def requested_virtual_identity(serial, address, model):
 
 def public_instance_identity(library_root, instance_id):
     """Read only public fields; never return synthetic keys or peer bindings."""
-    root = _instance_root(library_root, _uuid(instance_id))
+    try:
+        root = _instance_root(library_root, _uuid(instance_id))
+    except ValueError as error:
+        raise ValueError("实例 ID 无效，应为小写 UUID") from error
     result = {"ok": True, "version": 1, "identity": None}
     if not root.exists():
         return result
-    _private(root, directory=True)
-    head_path = root / "head.json"
-    if not head_path.exists():
-        return result
-    revision = _json(head_path).get("revision", "")
-    if re.fullmatch(r"r-[0-9a-f]{32}", revision) is None:
-        raise ValueError("Invalid identity snapshot")
-    folder = root / "revisions" / revision
-    _private(folder, directory=True)
-    path = folder / VIRTUAL_STATE
-    if path.exists():
-        value = _virtual_value(_decode(_read(path, 4096, private=True)), instance_id=instance_id)
-        result["identity"] = {key: value["identity"][key] for key in ("serial", "address")}
+    # Display only: a damaged snapshot reports no identity instead of failing
+    # the instance list; starting the instance repairs or reports it.
+    try:
+        _private(root, directory=True)
+        head_path = root / "head.json"
+        if not head_path.exists():
+            return result
+        revision = _json(head_path).get("revision", "")
+        if type(revision) is not str or re.fullmatch(r"r-[0-9a-f]{32}", revision) is None:
+            raise ValueError("Invalid identity snapshot")
+        folder = root / "revisions" / revision
+        _private(folder, directory=True)
+        path = folder / VIRTUAL_STATE
+        if path.exists():
+            _private(path)
+            value = _virtual_value(_decode(_read(path, 4096, private=True)), instance_id=instance_id)
+            result["identity"] = {key: value["identity"][key] for key in ("serial", "address")}
+    except (OSError, ValueError, KeyError, TypeError):
+        result["warning"] = "无法读取此实例保存的虚拟身份；下次启动时会自动整理实例数据"
     return result
 
 
@@ -866,11 +1028,17 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
     identity_model = VIRTUAL_PROFILES.get(firmware.profile, (None, firmware.model))[1]
     requested_identity = requested_virtual_identity(virtual_serial, virtual_address, identity_model)
     root = _instance_root(library_root, instance_id)
-    store = InstanceStorage(root) if root.exists() else InstanceStorage.create(root, firmware.model)
+    # An interrupted earlier run (crash, forced quit, lost receipt) is settled
+    # here rather than refusing the start: a healthy stopped run is committed,
+    # anything else rolls back to the last committed snapshot.
+    from .maintenance import reset_instance
+    reset_instance(library_root, instance_id)
+    store = _open_or_create(root, firmware.model)
     clones = session_root / "instance-data"
     try:
         if store.info["model"] != firmware.model:
-            raise ValueError("Cross-model instance data reuse denied")
+            raise ValueError("此实例的数据属于 " + store.info["model"] + "，不能用 " + firmware.model
+                             + " 硬件预设启动；请换回原硬件预设，或新建实例")
         old = store.head()
         virtual_capability = plan["identity"].get("runtimeCapabilities", {}).get("virtualPeer")
         virtual_enabled = False
@@ -885,15 +1053,17 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
         previous_identity = None
         if old and VIRTUAL_SHA in old[1]:
             previous_identity, _, _ = _virtual_read(old[0] / VIRTUAL_STATE, instance_id=instance_id)
-        rebuild_identity = bool(old and requested_identity is not None and
-            (previous_identity is None or any(previous_identity["identity"][key] != value
-                                             for key, value in requested_identity.items())))
+        # Only an explicit change of an existing identity starts a new device;
+        # a first identity for existing data is added on top of that data.
+        rebuild_identity = bool(old and requested_identity is not None and previous_identity is not None
+            and any(previous_identity["identity"][key] != value for key, value in requested_identity.items()))
+        identity_note = None
         if requested_identity is not None and not virtual_enabled:
-            raise ValueError("此设备尚未提供虚拟身份写入支持，未修改原数据")
-        if old and VIRTUAL_SHA not in old[1] and not rebuild_identity:
-            virtual_enabled = False
-            base["virtualPeerReason"] = "此实例已有用户数据但没有合成通信身份；请新建实例启用虚拟配对"
-        elif virtual_enabled and (not old or rebuild_identity):
+            # The requested serial/address waits for a firmware with verified
+            # virtual-peer support; the start itself is never refused for it.
+            requested_identity, rebuild_identity = None, False
+            identity_note = "所选固件没有已核验的虚拟通信支持，本次未写入虚拟序列号和蓝牙地址"
+        if virtual_enabled and (not old or rebuild_identity or VIRTUAL_SHA not in old[1]):
             virtual_state = _create_virtual_state(plan["spec"]["project"], instance_id,
                 profile_id=firmware.profile, virtual_key_file=virtual_key_file,
                 virtual_key_sha256=virtual_key_sha256)
@@ -916,6 +1086,7 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
         clones.mkdir(mode=0o700)
         for name, _, _, _ in firmware.images:
             _copy(store.active / name, clones / name)
+        carry_notes = list(transaction.get("notes", [])) + ([identity_note] if identity_note else [])
         binding = {**base, "available": True, "reason": "仅持久化 NAND 用户区和 OOB；NOR 尚未持久化",
                    "sessionRoot": str(session_root), "model": firmware.model, "profileID": firmware.profile,
                    "transactionID": store.active.name, "previousRevision": transaction["previous_revision"],
@@ -939,6 +1110,14 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
             if firmware.nor_config_bytes:
                 binding.update(norConfigOffset=firmware.nor_config_offset,
                                norConfigBytes=firmware.nor_config_bytes)
+        if any(Path(item["path"]).name == "instance-props" for item in plan["identity"].get("builders", [])):
+            # Firmware settings and boot clock, written into persist.db by the
+            # runner before the core opens the private data image.
+            from .instance_settings import materialize
+            # The instance hardware preset binds the board options; a preset
+            # without that device keeps the emulated default.
+            settings_path, settings_sha = materialize(library_root, instance_id, clones, model=firmware.model)
+            binding.update(settingsPath=settings_path, settingsSHA256=settings_sha)
         if (store.active / VIRTUAL_STATE).exists():
             _, _, digest = _virtual_read(store.active / VIRTUAL_STATE, instance_id=instance_id)
             _copy(store.active / VIRTUAL_STATE, clones / VIRTUAL_STATE)
@@ -946,6 +1125,9 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
                            virtualPeerStateSHA256=digest, virtualPeerEnabled=virtual_enabled)
             if virtual_enabled:
                 binding["virtualPeerReason"] = "本实例的合成通信身份与 NAND、OOB、NOR 在同一快照提交"
+        if carry_notes:
+            binding["reason"] = binding["reason"] + "。" + "；".join(carry_notes)
+            binding["carryOver"] = carry_notes
         pending = _json(store.root / "pending.json")
         _atomic_json(store.root / "pending.json", {**pending, "sessionRoot": str(session_root)})
         _atomic_json(session_root / "instance-storage.json", binding)
@@ -1012,6 +1194,11 @@ def validate_binding(binding, *, project, profile_id, model, qemu_sha256, capabi
         _private(path, size=size)
         # Preparation/commit own snapshot content integrity; launch only checks
         # this private working file's path, permissions and exact size.
+    if "settingsPath" in binding or "settingsSHA256" in binding:
+        path = expected / "instance-data" / "instance-settings.json"
+        if binding.get("settingsPath") != str(path) or not _hex(binding.get("settingsSHA256"), 64):
+            raise ValueError("Instance settings path or identity is invalid")
+        _private(path)
     # Legacy bindings without these additive fields remain valid. Disabled
     # sessions may still carry immutable state for an older selected Engine.
     enabled = binding.get("virtualPeerEnabled", False)
@@ -1046,6 +1233,8 @@ def instance_arguments(binding, *, run_directory=None):
         arguments += ["--instance-nor-image", binding["norImage"], "--instance-nor-sha256", binding["norSHA256"]]
         if binding["norInitialize"]:
             arguments.append("--instance-nor-initialize")
+    if binding.get("settingsPath"):
+        arguments += ["--instance-settings", binding["settingsPath"]]
     if binding.get("virtualPeerEnabled") is True:
         run = _path(run_directory) if run_directory is not None else None
         if (run is None or run.parent != Path(binding["sessionRoot"])
@@ -1072,7 +1261,7 @@ def _stopped_health(session, plan, binding):
             or re.fullmatch(r"m-[0-9a-f]{12}", run) is None
             or state.get("id") != config.get("id") or state.get("run") != run
             or state.get("state") not in ("exited", "failed") or state.get("cleanup") != "reaped"):
-        raise ValueError("Owned native guest cleanup is not confirmed; snapshot left unchanged")
+        raise ValueError("模拟器进程尚未确认退出，本次数据暂不提交；已保存的快照保持不变")
     if state["state"] == "failed":
         return False, "native-guest-launch-or-cleanup-failed"
     try:
@@ -1086,7 +1275,7 @@ def _stopped_health(session, plan, binding):
             or result.get("qmp_error") or result.get("storage_writeback_error")
             or result.get("virtual_peer_error")
             or result.get("diagnostic_errors") or result.get("outcome") not in
-            ("time_limit", "interrupted", "window_closed", "qemu_stopped")):
+            ("time_limit", "interrupted", "window_closed", "qemu_stopped", "guest_poweroff", "guest_reboot")):
         return False, "guest-or-storage-health-unconfirmed"
     if (result.get("data_writeback") is not True or result.get("data_image") != binding["dataImage"]
             or result.get("data_spare_image") != binding["spareImage"]):
@@ -1151,7 +1340,7 @@ def finish_session_storage(library_root, session_root, instance_id):
     session = _path(session_root)
     binding = _json(session / "instance-storage.json")
     if binding.get("instanceID") != _uuid(instance_id):
-        raise ValueError("Instance ID differs from prepared session")
+        raise ValueError("提交的实例与这次运行准备的实例不一致，未改动任何数据")
     result_path = session / "instance-storage-result.json"
     if result_path.exists():
         previous_result = _json(result_path)
@@ -1203,17 +1392,17 @@ def finish_session_storage(library_root, session_root, instance_id):
                         or head[1].get(VIRTUAL_SHA) != virtual_sha
                         or any(head[1].get(key) != _initial_pin(Path(binding[role]))
                                for _, _, key, role in firmware.images)):
-                    raise ValueError("Missing pending transaction has no matching accepted snapshot")
+                    raise ValueError("找不到这次运行对应的数据提交记录；已保存的快照保持不变")
             elif (head_id != binding["previousRevision"] or
                   (store.root / "revisions" / binding["transactionID"]).exists()):
-                raise ValueError("Missing pending transaction has no verified rollback endpoint")
+                raise ValueError("找不到这次运行对应的数据提交记录；已保存的快照保持不变")
             _atomic_json(result_path, receipt)
             return receipt
         pending = _json(store.root / "pending.json")
         if (pending.get("revision") != binding["transactionID"] or pending.get("sessionRoot") != str(session)
                 or pending.get("firmware") != firmware.record
                 or pending.get(VIRTUAL_SHA) != binding.get(VIRTUAL_SHA)):
-            raise ValueError("Pending instance transaction does not belong to this session")
+            raise ValueError("此实例的未完成运行记录属于另一次会话；请重置该实例后再启动，已保存的数据不受影响")
         store.active = store.root / "revisions" / pending["revision"]
         if healthy:
             for source_fd, (name, _, _, _) in zip(held, firmware.images):
@@ -1242,6 +1431,15 @@ def finish_session_storage(library_root, session_root, instance_id):
                     if target.exists(): target.unlink()
         store.finish(success=healthy)
         _atomic_json(result_path, receipt)
+        if healthy and binding.get("settingsPath"):
+            # Informational: the firmware's own settings as committed now.
+            try:
+                from .instance_settings import record_observed
+                run = _json(session / "native-broker" / "config.json").get("run", "")
+                if re.fullmatch(r"m-[0-9a-f]{12}", run):
+                    record_observed(library_root, instance_id, session / run)
+            except (OSError, ValueError):
+                pass
         return receipt
     finally:
         for fd in held: os.close(fd)

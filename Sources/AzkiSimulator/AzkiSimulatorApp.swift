@@ -13,7 +13,13 @@ struct AzkiSimulatorApp: App {
         }
         .defaultSize(width: 1_300, height: 860)
         .windowResizability(.contentMinSize)
-        .commands { CommandGroup(replacing: .newItem) {} }
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("新建设备实例…") { library.creationRequested = true }
+                    .keyboardShortcut("n")
+                    .disabled(!library.storageAvailable || library.deviceModels.isEmpty)
+            }
+        }
     }
 }
 
@@ -22,6 +28,7 @@ struct AzkiSimulatorApp: App {
 @MainActor final class SimulatorAppDelegate: NSObject, NSApplicationDelegate {
     var library: SimulatorInstanceLibrary?
     private var terminating = false
+    private var signalled = false
     private var termination: DispatchSourceSignal?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -31,7 +38,10 @@ struct AzkiSimulatorApp: App {
         let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         // Hop to a run-loop block: terminating inside this main-queue callout would
         // block the main queue that the asynchronous stop (terminateLater) needs.
-        source.setEventHandler { RunLoop.main.perform { NSApp.terminate(nil) } }
+        source.setEventHandler { [weak self] in
+            self?.signalled = true
+            RunLoop.main.perform { NSApp.terminate(nil) }
+        }
         source.resume()
         termination = source
     }
@@ -43,12 +53,22 @@ struct AzkiSimulatorApp: App {
         guard !terminating else { return .terminateLater }
         terminating = true
         Task {
-            if !(await library.stopAll()) {
-                terminating = false
-                sender.reply(toApplicationShouldTerminate: false)
+            // Each instance's stop is bounded, so Quit always gets an answer.
+            let failed = await library.stopAll()
+            // Logout/kill cannot wait for a dialog; every stop was already tried.
+            guard !failed.isEmpty, !signalled else {
+                sender.reply(toApplicationShouldTerminate: true)
                 return
             }
-            sender.reply(toApplicationShouldTerminate: true)
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "部分设备未能确认停止"
+            alert.informativeText = "「\(failed.joined(separator: "」「"))」的设备进程尚未确认退出。仍然退出可能留下后台进程，下次启动时会自动清理临时会话。"
+            alert.addButton(withTitle: "仍然退出")
+            alert.addButton(withTitle: "取消")
+            let quit = alert.runModal() == .alertFirstButtonReturn
+            terminating = false
+            sender.reply(toApplicationShouldTerminate: quit)
         }
         return .terminateLater
     }

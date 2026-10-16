@@ -12,7 +12,7 @@ import os
 from pathlib import Path, PurePosixPath
 import stat
 
-from .firmware_catalog import (CatalogError, FirmwareCatalog, _atomic_json, _copy, check_compatibility,
+from .firmware_catalog import (CatalogError, FirmwareCatalog, _atomic_json, _copy,
                                EXECUTION_PROFILES, _need, _sha, _text, storage_mode)
 from .minative import (INCLUDED_PROFILE_IDS, _canonical, _decode, _directory_fd,
                        _open_file, _path, _pin, _read, inspect_backend)
@@ -30,42 +30,6 @@ def _relative(value):
     return value
 
 
-
-def _exact_files(root, expected):
-    """Bounded no-follow enumeration, including directories that may shadow imports."""
-    seen, count = set(), 0
-    directory = _directory_fd(root)
-    def visit(fd, prefix, depth):
-        nonlocal count
-        _need(depth <= 32, "engine_quota", "内置引擎目录层级过深")
-        with os.scandir(fd) as entries:
-            for entry in entries:
-                count += 1
-                _need(count <= MAX_ENGINE_FILES * 2, "engine_quota", "内置引擎目录项目过多")
-                path = prefix + entry.name
-                info = entry.stat(follow_symlinks=False)
-                _need(info.st_uid in (0, os.getuid()) and not info.st_mode & 0o022,
-                      "unsafe_engine_path", "内置引擎包含可被其他用户修改的项目")
-                if stat.S_ISDIR(info.st_mode):
-                    _need(any(value.startswith(path + "/") for value in expected),
-                          "engine_changed", "内置引擎包含未登记目录", path=path)
-                    child = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-                    try:
-                        opened = os.fstat(child)
-                        _need((opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino),
-                              "engine_changed", "内置引擎目录在校验期间发生变化")
-                        visit(child, path + "/", depth + 1)
-                    finally:
-                        os.close(child)
-                else:
-                    _need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and path in expected,
-                          "engine_changed", "内置引擎包含未登记文件或链接", path=path)
-                    seen.add(path)
-    try:
-        visit(directory, "", 0)
-    finally:
-        os.close(directory)
-    _need(seen == expected, "engine_changed", "内置引擎文件集合与清单不一致")
 
 def _manifest(engine_root, verify=False):
     root = _path(engine_root)
@@ -106,7 +70,9 @@ def _manifest(engine_root, verify=False):
     if verify:
         _need(hashlib.sha256(payload).hexdigest() == manifest.get("payloadSha256"),
               "engine_changed", "内置引擎聚合身份无效")
-    _exact_files(root, set(by_path) | {"manifest.json"})
+    # Files beyond the manifest (caches, Finder metadata, a newer build's
+    # extras) are not engine inputs and no longer make the whole engine
+    # unusable; every listed file is still required, regular and unlinked.
     _need(all(entries[key] in by_path for key in ("python", "qemu", "bootstrap"))
           and by_path[entries["python"]]["executable"] and by_path[entries["qemu"]]["executable"]
           and all("project/" + value in by_path for value in (
@@ -129,8 +95,8 @@ def runtime_readiness(engine_root):
                 "profile": info["manifest"]["profile"], "manifestSHA256": info["sha256"],
                 "executionVerified": False, "manifestExecutionClaim": info["manifest"].get("executionVerified") is True,
                 "executionProfiles": sorted(EXECUTION_PROFILES), "verification": "startup-metadata"}
-    except (OSError, ValueError, KeyError) as error:
-        return {"ready": False, "reason": "内置引擎不可用：" + str(error)[:240],
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return {"ready": False, "reason": "内置引擎不可用，请重新安装应用：" + str(error)[:240],
                 "code": getattr(error, "code", "engine_missing"), "version": 1, "source": "bundled",
                 "executionVerified": False, "executionProfiles": []}
 
@@ -174,16 +140,13 @@ def prepare_profile(engine_root, library_root, profile_id, session_root, *, rese
     engine = _manifest(engine_root)
     catalog = FirmwareCatalog(engine["root"].parent / "Firmware", library_root,
                               distribution="public" if engine["manifest"]["profile"] == "public" else "local")
-    _need(set(catalog.profiles) == INCLUDED_PROFILE_IDS, "profile_scope_incomplete", "内置目录缺少完整的 39 项手环配置元数据")
-    imported = profile_id not in catalog.profiles
-    if imported:
-        # Imported firmware runs on the instance hardware preset named by the ID.
-        resolved = catalog.resolve_generic(profile_id)
-        check_compatibility(resolved["recipe"]["model"], resolved["recipe"], resolved["assets"]["ap"]["path"])
-    else:
-        resolved = catalog.resolve_profile(profile_id, verify=False)
-        _need(profile_id in EXECUTION_PROFILES, "profile_execution_unavailable",
-              "此固件不在可运行的小米手环配置范围内", profileID=profile_id)
+    _need(bool(catalog.hardware_models), "profile_scope_incomplete", "内置目录没有任何硬件预设，请重新安装应用")
+    # The user's imported firmware runs on the instance hardware preset named by
+    # the ID and takes precedence over a bundled metadata profile with the same
+    # ID. Nothing is checked or refused up front: the boot reports the outcome,
+    # and the user is never asked to match a cataloged version.
+    imported = catalog.imported_id(profile_id)
+    resolved = catalog.resolve_generic(profile_id) if imported else catalog.resolve_profile(profile_id)
     container = _path(session_root)
     from .bridge import SessionReservation
     reservation = SessionReservation(container, reservation_nonce) if reservation_nonce is not None else None
