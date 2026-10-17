@@ -23,7 +23,7 @@ nonisolated struct BundledFirmwareItem: Codable, Identifiable, Equatable, Sendab
     func validate() throws {
         guard FirmwareLibraryValidation.identifier(id),
               [displayName, device, model, firmwareVersion].allSatisfy({ FirmwareLibraryValidation.text($0, limit: 240) }),
-              [(192, 490), (212, 520), (336, 480)].contains(where: { $0 == (width, height) }),
+              [(192, 490), (212, 520), (336, 480), (432, 514)].contains(where: { $0 == (width, height) }),
               FirmwareLibraryValidation.text(availability.reason, limit: 1_024, empty: true),
               availability.missingRoles.count <= 32,
               availability.missingRoles.allSatisfy({ FirmwareLibraryValidation.identifier($0) }),
@@ -46,7 +46,7 @@ nonisolated struct BundledDevicePreset: Decodable, Identifiable, Equatable, Send
     func validate() throws {
         guard FirmwareLibraryValidation.identifier(model),
               FirmwareLibraryValidation.text(displayName, limit: 240),
-              [(192, 490), (212, 520), (336, 480)].contains(where: { $0 == (width, height) }) else {
+              [(192, 490), (212, 520), (336, 480), (432, 514)].contains(where: { $0 == (width, height) }) else {
             throw SimulatorError.invalidSession("硬件预设包含无效的型号或尺寸")
         }
     }
@@ -187,12 +187,13 @@ nonisolated struct FirmwareDiagnostic: Decodable, Sendable {
             throw SimulatorError.invalidSession("固件静态诊断内容无效；未赋予运行能力")
         }
         if ap.headerRecognized {
-            guard ap.chip == "best1503", let offset = ap.apOffset, let flash = ap.flashBytes,
+            let ramEnd = ap.chip == "best1502p" ? 0x201a0000 : 0x20160000
+            guard ["best1503", "best1502p"].contains(ap.chip), let offset = ap.apOffset, let flash = ap.flashBytes,
                   let alias = ap.dataAlias, let entry = ap.resetEntry, let stack = ap.resetSP,
                   0 <= offset, offset < flash, offset % 4096 == 0, flash <= 67_108_864,
                   ap.bytes <= flash - offset, (0x28000000..<0x30000000).contains(alias),
                   (1...0xffffffff).contains(entry), entry & 1 == 1,
-                  (0x20000000...0x20160000).contains(stack), stack % 8 == 0 else {
+                  (0x20000000...ramEnd).contains(stack), stack % 8 == 0 else {
                 throw SimulatorError.invalidSession("固件启动头诊断边界无效")
             }
         }
@@ -239,7 +240,7 @@ nonisolated struct BundledPreparedSession: Sendable {
             ("version", value.version == 1), ("id", UUID(uuidString: value.id) != nil),
             ("directory", sameDirectory), ("profileID", value.profileID == profileID),
             ("identifier", FirmwareLibraryValidation.identifier(profileID)),
-            ("geometry", [(192, 490), (212, 520), (336, 480)].contains(where: { $0 == (value.width, value.height) })),
+            ("geometry", [(192, 490), (212, 520), (336, 480), (432, 514)].contains(where: { $0 == (value.width, value.height) })),
             ("digest", FirmwareLibraryValidation.digest(value.identityDigest)),
             ("runLimit", StandaloneRunLimits.isValid(value.maxRuntimeSeconds)),
             ("summary", FirmwareLibraryValidation.text(value.summary, limit: 48_000)),

@@ -33,6 +33,7 @@ static bool bes_nor_layout_init(BesNorLayout *layout, uint32_t flash_bytes,
          * next dual-chip erase boundary; mode/nv remain at 0xfc0000. */
         { 0x1000000, 0x0c0000, 0xdea000, 0xfc0000, 0, 0 },
         { 0x1000000, 0x0c0000, BES_NOR_OFFSET, 0xfc0000, 0, 0 }, /* Q66 */
+        { 0x1000000, 0x0b0000, 0xfc0000, 0xfe0000, 0, 0 }, /* Q65 nv/nvflash0/misc */
     };
     for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
         const BesNorLayout *k = &known[i];

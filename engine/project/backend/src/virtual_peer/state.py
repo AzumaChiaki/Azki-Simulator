@@ -47,14 +47,14 @@ def _descriptor(identity, ap, model, _historical_reason):
     return MappingProxyType({
         'profileID': identity, 'apSHA256': ap, 'model': model,
         'family': family, 'unsupportedReason': None,
-        'protocol': 'miwear-psk1-q66' if family == 'q66' else 'miwear-psk1-literal16',
+        'protocol': 'miwear-psk1-q66' if family in ('q65', 'q66') else 'miwear-psk1-literal16',
         'verifyMode': 1, 'requiresSMPBond': True,
         'factoryFormat': 'legacy-fixed-8k' if legacy else 'n67-config-journal' if family == 'n67' else 'littlefs-8192x16',
-        'factoryPropertyFile': 'app_nv.prop' if family == 'p67' else 'factory.prop' if family == 'q66' else None,
+        'factoryPropertyFile': 'app_nv.prop' if family == 'p67' else 'factory.prop' if family in ('q65', 'q66') else None,
         'factoryBytes': 8192 if legacy or family == 'n67' else 128 * 1024,
         'configBytes': 16384 if family == 'n67' else 0,
-        'pskEncoding': 'ascii-hex32' if family == 'q66' else 'hex-of-ascii16',
-        'pskProperty': 'ro.factory.psk' if family == 'q66' else 'ro.factory.key' if family in ('n67', 'p67') else 'factory.param.key',
+        'pskEncoding': 'ascii-hex32' if family in ('q65', 'q66') else 'hex-of-ascii16',
+        'pskProperty': 'ro.factory.psk' if family in ('q65', 'q66') else 'ro.factory.key' if family in ('n67', 'p67') else 'factory.param.key',
         'didDigits': 9 if family == 'n66' else 11 if family == 'o66' else 13,
         'serialMaximum': 24 if legacy else 21 if family == 'n67' else 31,
         'boardID': {'cn': 2, 'nfc': 1, 'tc': 5, 'lj': 7}.get(sku) if legacy else None,
@@ -68,7 +68,7 @@ PROFILE_DESCRIPTORS = MappingProxyType({identity: _descriptor(identity, ap, mode
 
 
 # Any firmware build of these families: "<model>@<version>@<OTA SHA prefix>".
-_FIRMWARE_PROFILE = re.compile(r'(miwear\.watch\.(n66|n67|o66|p67|q66)[a-z]{0,8})@[0-9][0-9.]{0,31}@[0-9a-f]{12}')
+_FIRMWARE_PROFILE = re.compile(r'(miwear\.watch\.(n66|n67|o66|p67|q65|q66)[a-z]{0,8})@[0-9][0-9.]{0,31}@[0-9a-f]{12}')
 
 
 def descriptor_for(profile_id, ap_sha256=None):
@@ -299,6 +299,9 @@ def factory_image(state, *, skip_oobe=True):
         'product.model':firmware_model,'ro.factory.model':firmware_model}
     if skip_oobe:
         properties.update({'persist.setup_wizard':'1','persist.locale':'zh_CN'})
+        if descriptor['family'] == 'q65':
+            properties.update({'persist.system_novice_guidance':'false',
+                               'persist.settings_novice':'true'})
     with fs.open(descriptor['factoryPropertyFile'],'w') as stream:
         stream.write(''.join(f'{key}={value}\n' for key,value in properties.items()))
     fs.unmount()

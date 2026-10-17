@@ -29,7 +29,7 @@ MAX_JSON = 4 * 1024 * 1024
 MAX_ASSET = 768 * 1024 * 1024
 MAX_FRAME_FILE = 8 * 1024 * 1024
 FRAME_HEADER = struct.Struct("<8s6I")
-GEOMETRIES = {(192, 490), (212, 520), (336, 480)}
+GEOMETRIES = {(192, 490), (212, 520), (336, 480), (432, 514)}
 RUNTIME_FILES = (
     "multi_device.py", "device_catalog.py", "firmware_resources.py",
     "legacy_ui_seed.py", "backend/src/legacy_ui_db.c",
@@ -277,6 +277,8 @@ def _geometry(model):
         return 336, 480
     if model == "q66" or model.startswith(("miwear.watch.o66", "miwear.watch.q66")):
         return 212, 520
+    if model == "miwear.watch.q65":
+        return 432, 514
     raise MError("unsupported_profile", "Model is outside the Mi Band scope")
 
 
@@ -563,7 +565,8 @@ def _catalog(project):
         raise MError("invalid_catalog", "Catalog is missing a scoped profile")
     for key in ids:
         row = known[key]
-        if (row.get("ap", {}).get("chip") != "best1503"
+        chip = "best1502p" if row.get("model") == "miwear.watch.q65" else "best1503"
+        if (row.get("ap", {}).get("chip") != chip
                 or "@".join(key.split("@")[:2]) != str(row.get("model")) + "@" + str(row.get("version"))):
             raise MError("invalid_catalog", "Profile and supported board identity disagree")
         _geometry(row["model"])
@@ -746,6 +749,11 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
     if not dependency_paths or not bridge_paths:
         raise MError("identity_incomplete", "Explicit interpreter/dependency and bridge identity paths are required")
     profile = rows[profile_id]
+    expected_chip = "best1502p" if profile["model"] == "miwear.watch.q65" else "best1503"
+    if expected_chip == "best1502p":
+        # Q65 has independent AP-derived storage, but no band ADC ABI.
+        runtime_capabilities = {key: value for key, value in runtime_capabilities.items()
+                                if key in ("nandPersistence", "norPersistence", "virtualPeer")}
     declarations[str(_path(profile["ap_path"]))] = (profile["ap"]["sha256"], "catalog")
     if profile.get("ota_path"):
         declarations[str(_path(profile["ota_path"]))] = (profile.get("ota_sha256"), "catalog")
@@ -777,7 +785,7 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
         raise MError("invalid_catalog", "Ambiguous ROMFS resource")
     storage = "romfs" if members else "yaffs"
     if generated:
-        if profile["ap"].get("chip") != "best1503":
+        if profile["ap"].get("chip") != expected_chip:
             raise MError("identity_mismatch", "Generated mode requires a BES1503 band profile")
         if ota is None and not profile.get("resource_path"):
             raise MError("preparation_required", "Generated mode needs the OTA package or a catalog resource")
@@ -786,7 +794,7 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
         prepared_pins = {"resource": resource} if resource is not None else {}
     else:
         board = _json(prepared["board"])
-        if (board.get("profile_id") != profile_id or board.get("chip") != "best1503"
+        if (board.get("profile_id") != profile_id or board.get("chip") != expected_chip
                 or not isinstance(board.get("geometry"), dict)
                 or any(type(v) is not int or not 0 <= v <= 0xffffffff for v in board["geometry"].values())):
             raise MError("identity_mismatch", "Prepared board differs from exact profile")
@@ -1448,7 +1456,10 @@ class MinativeAdapter:
             exact = FRAME_HEADER.size + width * height * 2
             # The multi-device core allocates one fixed-capacity buffer (2 MiB +
             # header) for every geometry; only the leading exact frame is read.
-            fd, info = _open_file(control["framebuffer"], MAX_FRAME_FILE, private=True)
+            try:
+                fd, info = _open_file(control["framebuffer"], MAX_FRAME_FILE, private=True)
+            except FileNotFoundError as error:
+                raise MError("frame_unavailable", "Waiting for the first shared frame file") from error
             try:
                 header = os.pread(fd, 32, 0)
                 if len(header) != 32:
@@ -1569,6 +1580,7 @@ class MinativeAdapter:
             return self.status()
 
     def status(self):
+        from .virtual_peer import supports_peer
         with self._lock:
             if self.process is not None and self.process.poll() is not None:
                 self._finish()
@@ -1581,7 +1593,7 @@ class MinativeAdapter:
                     "detail": self._detail,
                     "runDirectory": str(self.run), "cleanup": self._cleanup,
                     "approvalDigest": self.plan["approvalDigest"], "fixtureOnly": self.fixture_only,
-                    "guestInstallSupported": True, "desktopVerified": False,
+                    "guestInstallSupported": supports_peer(self.plan), "desktopVerified": False,
                     "identityMode": self.plan["identity"].get("mode", "prepared"),
                     "observedBoard": self._observed_board,
                     "debugger": (self._control or {}).get("gdb"),

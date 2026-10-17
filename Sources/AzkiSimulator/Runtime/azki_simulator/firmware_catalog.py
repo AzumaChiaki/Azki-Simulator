@@ -47,7 +47,8 @@ EXECUTION_PROFILES = INCLUDED_PROFILE_IDS
 # Profiles whose board/factory/resource are pre-pinned catalog objects keep "prepared" mode;
 # every other profile is "generated": the sandboxed runner derives storage from the pinned AP/OTA.
 PRODUCT_NAMES = {
-    "n66": "小米手环 9", "n67": "小米手环 9 Pro", "o66": "小米手环 10", "p67": "小米手环 10 Pro", "q66": "小米手环 11"}
+    "n66": "小米手环 9", "n67": "小米手环 9 Pro", "o66": "小米手环 10", "p67": "小米手环 10 Pro", "q66": "小米手环 11",
+    "q65": "红米手表7"}
 BRANCH_NAMES = {
     "cn": "标准版", "nfc": "NFC 版", "tc": "陶瓷版", "lj": "耀影金版", "glt": "GLT", "u": "U", "": ""}
 
@@ -637,7 +638,9 @@ class FirmwareCatalog:
     @property
     def hardware_models(self):
         """Instance hardware presets: every product model the catalog describes."""
-        return sorted({profile["model"] for profile in self.profiles.values()})
+        # q65 is metadata-only: its firmware is supplied by the user and is
+        # intentionally not represented as a bundled profile.
+        return sorted({profile["model"] for profile in self.profiles.values()} | {"miwear.watch.q65"})
 
     def hardware_presets(self):
         """Instance hardware presets for the UI: model metadata, no firmware version."""
@@ -646,6 +649,7 @@ class FirmwareCatalog:
             rows.setdefault(profile["model"], {"model": profile["model"],
                                                "displayName": product_name(profile["model"]),
                                                "width": profile["width"], "height": profile["height"]})
+        rows.setdefault("miwear.watch.q65", {"model": "miwear.watch.q65", "displayName": "红米手表7", "width": 432, "height": 514})
         return [rows[model] for model in sorted(rows)]
 
     def _object_path(self, digest, size, index):
@@ -679,11 +683,13 @@ class FirmwareCatalog:
                         and re.fullmatch(r"[0-9][0-9.]{0,31}", generic["version"])):
                     continue
                 sources[digest] = {"version": generic["version"], "ap": generic["apSHA256"],
-                                   "apBytes": generic["apBytes"], "recipe": recipe}
+                                   "apBytes": generic["apBytes"], "declaredModels": generic.get("declaredModels", []),
+                                   "recipe": recipe}
             elif digest in self.imports and self.imports[digest]["kind"] == "ota":
                 profile = self.profiles[sorted(self.imports[digest]["profileIDs"])[0]]
                 ap = profile["assets"]["ap"]
                 sources[digest] = {"version": profile["version"], "ap": ap, "apBytes": self.objects[ap]["bytes"],
+                                   "declaredModels": [],
                                    "recipe": {"ap": profile["recipe"]["ap"],
                                               "partitions": profile["recipe"].get("partitions", []), "family": ""}}
         return sources
@@ -720,7 +726,11 @@ class FirmwareCatalog:
         for digest, source in sorted(self._generic_sources(index).items()):
             if only is not None and digest != only:
                 continue
-            for model in self.hardware_models:
+            declared = set(source.get("declaredModels", []))
+            # A q65 AP is a different BES1502P product and must never be
+            # offered as a runnable preset for the BES1503 band devices.
+            models = ["miwear.watch.q65"] if "q65" in declared else [m for m in self.hardware_models if m != "miwear.watch.q65"]
+            for model in models:
                 items.append(self._generic_item(model, digest, source, index))
         return items
 
@@ -741,7 +751,8 @@ class FirmwareCatalog:
         index = self._index()
         sources = self._generic_sources(index)
         matches = [digest for digest, source in sources.items()
-                   if digest.startswith(prefix) and source["version"] == version]
+                   if digest.startswith(prefix) and source["version"] == version
+                   and ((model == "miwear.watch.q65") == ("q65" in source.get("declaredModels", [])))]
         _need(len(matches) == 1, "unknown_profile", "所选导入固件已不在固件库中，请重新导入", profileID=profile_id)
         digest = matches[0]
         source = sources[digest]
@@ -852,8 +863,10 @@ class FirmwareCatalog:
                 os.close(input_fd)
             ap_record = next(r for r in generic["partitions"] if r["name"].rsplit("/", 1)[-1] == "vela_ap.bin")
             entry = {"kind": "ota", "profileIDs": [], "members": [{"asset": generic["ap"]["sha256"], "record": ap_record}]}
+            declared = set(generic.get("declaredModels", []))
+            candidate_models = ["miwear.watch.q65"] if "q65" in declared else [m for m in self.hardware_models if m != "miwear.watch.q65"]
             candidates = sorted(model + "@" + generic["version"] + "@" + actual["sha256"][:12]
-                                for model in self.hardware_models)
+                                for model in candidate_models)
             _need(profile_id is None or profile_id in candidates, "profile_mismatch", "此固件不属于所选配置", candidateIDs=candidates)
             _need(existing_total + actual["bytes"] + sum(member["record"]["size"] for member in entry.get("members", [])) <= MAX_LIBRARY,
                   "library_quota", "固件包的临时展开将超过私有库容量限制")

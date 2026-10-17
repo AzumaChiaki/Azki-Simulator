@@ -22,3 +22,6 @@ AGENTS.md
 Firmware/
 instances/
 .workbuddy
+.build-debug
+
+tests

@@ -24,8 +24,8 @@ import uuid
 import zlib
 
 MAX_MESSAGE = 65536
-DISPLAY_GEOMETRIES = frozenset(((192, 490), (212, 520), (336, 480)))
-MAX_FRAME = 32 + 336 * 480 * 2
+DISPLAY_GEOMETRIES = frozenset(((192, 490), (212, 520), (336, 480), (432, 514)))
+MAX_FRAME = 32 + 432 * 514 * 2
 MAX_LOG = 16 * 1024 * 1024
 CAPABILITIES = ["status", "start", "stop", "input", "screenshot", "logs",
                 "inspect-package", "stage-package"]
@@ -704,6 +704,9 @@ class SessionBridge:
                 return self.pmu_adc_get(args) if command == "pmu-adc-get" else self.pmu_adc_set(args)
             if command in ("live-get", "live-set"):
                 return self.live_get(args) if command == "live-get" else self.live_set(args)
+            if command == "device-button":
+                from .device_buttons import click_button
+                return click_button(getattr(self, "adapter", None), args)
             if command == "input":
                 if "batch" in args:
                     if set(args) != {"batch"}:

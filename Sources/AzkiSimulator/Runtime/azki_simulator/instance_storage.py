@@ -72,7 +72,7 @@ VIRTUAL_PROFILES = {
 # Families whose synthetic identity format the virtual peer knows. The format
 # follows the hardware family and SKU, not one firmware build: any firmware of
 # these presets (catalog or imported) gets the virtual connection.
-VIRTUAL_FAMILIES = ("n66", "n67", "o66", "p67", "q66")
+VIRTUAL_FAMILIES = ("n66", "n67", "o66", "p67", "q65", "q66")
 
 
 def derived_nor_layout(project, profile_id, storage_kind):
@@ -1185,7 +1185,7 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
             if firmware.nor_config_bytes:
                 binding.update(norConfigOffset=firmware.nor_config_offset,
                                norConfigBytes=firmware.nor_config_bytes)
-        if any(Path(item["path"]).name == "instance-props" for item in plan["identity"].get("builders", [])):
+        if firmware.model != "miwear.watch.q65" and any(Path(item["path"]).name == "instance-props" for item in plan["identity"].get("builders", [])):
             # Firmware settings and boot clock, written into persist.db by the
             # runner before the core opens the private data image.
             from .instance_settings import materialize

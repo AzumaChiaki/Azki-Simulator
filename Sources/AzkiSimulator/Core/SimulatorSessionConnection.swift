@@ -105,7 +105,7 @@ actor SimulatorSessionConnection {
 
     func command(_ command: String, arguments: [String: SimulatorJSON] = [:]) throws -> SimulatorJSON {
         guard !closed else { throw SimulatorError.disconnected }
-        let permitted = ["status", "start", "stop", "input", "screenshot", "logs", "inspect-package", "stage-package", "pmu-adc-get", "pmu-adc-set",
+        let permitted = ["status", "start", "stop", "input", "device-button", "screenshot", "logs", "inspect-package", "stage-package", "pmu-adc-get", "pmu-adc-set",
                          "guest-status", "guest-connect", "guest-install", "guest-operation", "guest-inventory", "guest-select",
                          "external-open", "external-status", "external-request", "external-result", "external-close", "external-reconnect"]
         guard permitted.contains(command) || SimulatorLiveCommands.all.contains(command) else {

@@ -39,7 +39,7 @@ export PATH="$(brew --prefix python@3.12)/libexec/bin:$PATH"
 ./scripts/build-dmg.sh
 ```
 
-Full Xcode with Swift 6.2 or later is required. Outputs in `dist/` include the DMG, product source and engine dependency sources. See [build instructions](docs/BUILDING.en.md) for details and options.
+Full Xcode with Swift 6.2 or later is required. Every build outputs final artifacts only to `dist/`, with no caches or intermediates there. Use `./scripts/build.sh debug` for Debug. See [build instructions](docs/BUILDING.en.md) for details and options.
 
 `VERSION` controls the application version. `BUILD_NUMBER` is the build-number base; each Actions build increments it automatically (base + run number − 1). Merging or pushing to `main` builds and publishes a Release; manual runs are also available in Actions. No Apple certificates, passwords or notarization profile are required.
 

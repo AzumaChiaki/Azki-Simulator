@@ -1,16 +1,17 @@
 import Foundation
 import CoreGraphics
+import Accelerate
 
 /// Finite display contract for the imported Xiaomi Band profiles. A generic
 /// codec fixture may be smaller; live sessions and input accept only these pairs.
 nonisolated enum SimulatorDisplayGeometry: CaseIterable, Equatable, Sendable {
-    case pixels192x490, pixels212x520, pixels336x480
+    case pixels192x490, pixels212x520, pixels336x480, pixels432x514
 
     var width: Int {
-        switch self { case .pixels192x490: 192; case .pixels212x520: 212; case .pixels336x480: 336 }
+        switch self { case .pixels192x490: 192; case .pixels212x520: 212; case .pixels336x480: 336; case .pixels432x514: 432 }
     }
     var height: Int {
-        switch self { case .pixels192x490: 490; case .pixels212x520: 520; case .pixels336x480: 480 }
+        switch self { case .pixels192x490: 490; case .pixels212x520: 520; case .pixels336x480: 480; case .pixels432x514: 514 }
     }
     var size: CGSize { CGSize(width: width, height: height) }
     init?(width: Int, height: Int) {
@@ -83,6 +84,10 @@ nonisolated struct SimulatorFrame: Sendable {
     let width: Int
     let height: Int
     let rgba: Data
+    // vImage expands to 0...255. Remove only its added low bits so the
+    // displayed pixels remain identical to the core's left-aligned RGB565.
+    private static let fiveBitChannel = (0..<256).map { UInt8($0 & 0xf8) }
+    private static let sixBitChannel = (0..<256).map { UInt8($0 & 0xfc) }
 
     static func decode(_ data: Data, expectedSize: CGSize? = nil) throws -> Self {
         let header = try SimulatorFrameHeader.decode(data)
@@ -95,26 +100,22 @@ nonisolated struct SimulatorFrame: Sendable {
             }
         }
         var output = Data(count: header.width * header.height * 4)
-        data.withUnsafeBytes { sourceBytes in
+        let error = data.withUnsafeBytes { sourceBytes in
             output.withUnsafeMutableBytes { outputBytes in
-                let source = sourceBytes.bindMemory(to: UInt8.self)
-                let destination = outputBytes.bindMemory(to: UInt8.self)
-                for y in 0..<header.height {
-                    for x in 0..<header.width {
-                        let index = SimulatorFrameHeader.byteCount + y * header.stride + x * 2
-                        let pixel = UInt16(source[index]) | UInt16(source[index + 1]) << 8
-                        let target = (y * header.width + x) * 4
-                        let red = UInt8((pixel >> 11) & 31), green = UInt8((pixel >> 5) & 63), blue = UInt8(pixel & 31)
-                        // Match the Q66 core's existing screenshot definition:
-                        // shift only, without introducing replicated low bits.
-                        destination[target] = red << 3
-                        destination[target + 1] = green << 2
-                        destination[target + 2] = blue << 3
-                        destination[target + 3] = 255
-                    }
-                }
+                var source = vImage_Buffer(
+                    data: UnsafeMutableRawPointer(mutating: sourceBytes.baseAddress!.advanced(by: SimulatorFrameHeader.byteCount)),
+                    height: vImagePixelCount(header.height), width: vImagePixelCount(header.width), rowBytes: header.stride)
+                var destination = vImage_Buffer(data: outputBytes.baseAddress!,
+                    height: vImagePixelCount(header.height), width: vImagePixelCount(header.width), rowBytes: header.width * 4)
+                let flags = vImage_Flags(kvImageDoNotTile)
+                let converted = vImageConvert_RGB565toRGBA8888(255, &source, &destination, flags)
+                guard converted == kvImageNoError else { return converted }
+                // Table order follows RGBA bytes, not the function's ARGB name.
+                return vImageTableLookUp_ARGB8888(&destination, &destination,
+                    fiveBitChannel, sixBitChannel, fiveBitChannel, nil, flags)
             }
         }
+        guard error == kvImageNoError else { throw SimulatorError.invalidFrame("像素转换失败 (\(error))") }
         return Self(sequence: header.sequence, width: header.width, height: header.height, rgba: output)
     }
 

@@ -12,17 +12,12 @@ import UniformTypeIdentifiers
     let instanceRecording: SimulatorRecordingModel?
     @State private var localRecording = SimulatorRecordingModel()
     @State private var choosingFile = false
-    @State private var fileChoice: SimulatorFileChoice = .importFirmware
+    @State private var fileChoice: SimulatorFileChoice = .session
     @State private var showingAdvanced = false
     @State private var showingLogs = false
-    @State private var logName = "uart1.log"
     @State private var logStream = SimulatorLogStreamModel()
-    @State private var followLogBottom = true
     @State private var displayWindow = SimulatorDisplayWindow()
-    @State private var showingPackageReport = true
     @State private var guestOperations = SimulatorGuestOperationsModel()
-    @State private var installSelectionHost: UUID?
-    @State private var installSelectionPeer: SimulatorGuestOperationsModel.Identity?
     @State private var showingPreparedFiles = false
     @State private var showingSharing = false
     @State private var review: SimulatorRunReview?
@@ -31,12 +26,7 @@ import UniformTypeIdentifiers
     @State private var debugDocument = SimulatorDebugDocument(data: Data())
     @State private var exportingDebug = false
     @State private var adcDraft = PMUADCDraft()
-    @State private var connectionTimeoutText = ""
     @State private var editingFirmwareSettings = false
-    @State private var screenshotURL: URL?
-    @State private var screenshotError: String?
-    /// Firmware chosen while the device runs; applied by "切换并重新开机".
-    @State private var pendingProfileID: String?
 
     private var session: SimulatorSessionModel { runtime.runtimeSession }
     private var recording: SimulatorRecordingModel { instanceRecording ?? localRecording }
@@ -44,21 +34,13 @@ import UniformTypeIdentifiers
     private var canEnableSharing: Bool {
         Self.canEnableSharing(runtime: runtime, sharing: sharing)
     }
-    /// Stop stays available while starting or checking: it cancels that work
-    /// instead of making the user wait for a stuck start to time out.
-    private var canStop: Bool {
-        !runtime.isStopping && (runtime.isServing || runtime.isBusy || (session.isRunning && !session.isCommandInFlight))
-    }
     private var allFilesSelected: Bool { runtime.qemuURL != nil && runtime.firmwareURL != nil && runtime.resourceURL != nil }
     private var displayGeometry: SimulatorDisplayGeometry? { session.manifest?.displayGeometry }
-    private var logsVisible: Bool { presentation == .controlsAndLogs || showingLogs }
-    private var guestAvailable: Bool { session.isRunning }
-    private var guestContext: String { "\(session.manifest?.id.uuidString ?? "none")/\(guestAvailable)" }
-    private var sessionRunLimit: Int? {
-        guard let value = session.status?["maxRuntimeSeconds"], case .number(let seconds) = value,
-              seconds.isFinite, seconds.rounded() == seconds, (1...Double(StandaloneRunLimits.maximumSeconds)).contains(seconds) else { return nil }
-        return Int(seconds)
+    private var logsVisible: Bool { presentation == .controlsAndLogs || showingLogs || displayWindow.isDetached }
+    private var guestAvailable: Bool {
+        session.isRunning && session.status?["guestConnectSupported"] != .bool(false)
     }
+    private var guestContext: String { "\(session.manifest?.id.uuidString ?? "none")/\(guestAvailable)" }
     private var adcAvailable: Bool {
         guard session.isRunning, case .array(let inputs)? = session.status?["hardwareInputs"] else { return false }
         return inputs.contains(.string("pmu.adcRaw"))
@@ -152,24 +134,19 @@ import UniformTypeIdentifiers
             }
         }
         .task {
-            connectionTimeoutText = String(runtime.connectionSettings.timeoutSeconds)
             if !runtime.hasLoadedCatalog && controlsAvailable { await runtime.loadCatalog() }
         }
-        .onChange(of: runtime.connectionSettings.timeoutSeconds) { _, seconds in
-            connectionTimeoutText = String(seconds)
-        }
-        .onChange(of: runtime.isServing) { _, serving in if !serving { pendingProfileID = nil } }
         .onChange(of: runtime.resetEpoch) { _, _ in
             // The instance was reset or is booting again: drop this view's
             // per-instance caches so nothing from the previous run lingers.
-            debugText = ""; uiError = nil; review = nil; pendingProfileID = nil
+            debugText = ""; uiError = nil; review = nil
             adcDraft = PMUADCDraft()
             guestOperations.invalidate()
             logStream.clear()
-            showingPackageReport = true
         }
         .task(id: guestContext) {
             guestOperations.configure(hostSessionID: session.manifest?.id, available: guestAvailable,
+                packagesAvailable: session.status?["guestInstallSupported"] != .bool(false),
                 command: { try await session.guestCommand($0, arguments: $1) },
                 install: { try await session.installGuestPackage($0, expectedSessionID: $1, expectedGeneration: $2) })
             // This task deliberately does not depend on which instance is selected.
@@ -179,14 +156,13 @@ import UniformTypeIdentifiers
                 catch { break }
             }
         }
-        .task(id: "\(session.manifest?.id.uuidString ?? "none")/\(logsVisible)/\(logName)") {
+        .task(id: "\(session.manifest?.id.uuidString ?? "none")/\(logsVisible)/\(logStream.selectedName)") {
             // Keep each instance's bounded stream/cursor alive while its view is
             // hidden, so changing controls never resets another instance's log.
             if logsVisible, let id = session.manifest?.id, let directory = runtime.sessionURL {
-                logStream.start(directory: directory, sessionID: id, name: logName)
+                logStream.start(directory: directory, sessionID: id, name: logStream.selectedName)
             } else { logStream.stop() }
         }
-        .onChange(of: session.manifest?.id) { _, id in displayWindow.reconcile(sessionID: id) }
         .onDisappear {
             logStream.stop(); displayWindow.close()
             guestOperations.invalidate()
@@ -237,195 +213,22 @@ import UniformTypeIdentifiers
 
     private var controlRegions: some View {
         VStack(spacing: 0) {
-            firmwareLibrarySection
-            SimulatorSectionDivider()
-            SimulatorSection(title: "会话", icon: "desktopcomputer") {
-                HStack {
-                    Text("连接超时（秒）")
-                    TextField("30", text: $connectionTimeoutText)
-                        .textFieldStyle(.roundedBorder).frame(width: 80)
-                        .accessibilityIdentifier("simulator.connection-timeout")
-                        .onChange(of: connectionTimeoutText) { _, value in
-                            if let seconds = Int(value), ConnectionSettings.timeoutRange.contains(seconds) {
-                                runtime.connectionSettings.timeoutSeconds = seconds
-                            }
-                        }
-                    Text("1–300，自动保存")
-                        .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
-                }
-                Text("用于虚拟设备连接和通信请求，下次操作生效；不限制设备运行时长，硬件采样读取使用独立超时。")
-                    .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
-                if !connectionTimeoutText.isEmpty,
-                   Int(connectionTimeoutText).map({ ConnectionSettings.timeoutRange.contains($0) }) != true {
-                    Text("请输入 1–300 之间的整数，当前仍使用 \(runtime.connectionSettings.timeoutSeconds) 秒。")
-                        .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
-                }
-                SimulatorActionFlow {
-                    if !runtime.isServing {
-                        action("断开", icon: "eject", enabled: session.isAttached && controlsAvailable) { session.detach() }
-                    }
-                    action("停止模拟器", icon: "stop.fill", enabled: canStop) {
-                        Task {
-                            await recording.stop()
-                            if runtime.isServing || runtime.isBusy { await runtime.stop() }
-                            else { session.perform("stop") }
-                        }
-                    }
-                    .keyboardShortcut(".", modifiers: .command)
-                    .help(runtime.isStopping ? "正在停止…" : "停止设备（⌘.）；启动或检查进行中时会取消该操作")
-                    .accessibilityIdentifier("simulator.stop")
-                    if runtime.instanceID != nil {
-                        action("重置实例", icon: "arrow.counterclockwise.circle", enabled: !runtime.isStopping) {
-                            Task {
-                                await recording.stop()
-                                _ = await sharing.disable()
-                                await runtime.resetInstance()
-                            }
-                        }
-                        .help("启动失败或状态异常时使用：停止设备并清除此实例的运行缓存与错误；已保存的数据、固件设置和已导入固件都会保留")
-                        .accessibilityIdentifier("simulator.reset-instance")
-                    }
-                    action("截图", icon: "camera", enabled: controlsAvailable && session.image != nil) {
-                        guard let image = session.image else { return }
-                        do {
-                            screenshotURL = try SimulatorScreenshot.save(image, instanceName: instanceName ?? "Azki Simulator")
-                            screenshotError = nil
-                        } catch { screenshotError = error.localizedDescription }
-                    }
-                    action(recording.isRecording ? "停止录屏" : "录屏", icon: recording.isRecording ? "stop.circle" : "record.circle",
-                           enabled: !recording.isFinishing && (recording.isRecording || (session.isRunning && session.image != nil))) {
-                        if recording.isRecording { Task { await recording.stop() } }
-                        else { recording.start(session: session, instanceName: instanceName ?? "Azki Simulator") }
-                    }
-                    .accessibilityIdentifier("simulator.recording")
-                    .help("录制此设备的画面，完成后保存到桌面")
-                    if presentation == .full {
-                        action("日志", icon: "text.alignleft", enabled: controlsAvailable && session.isAttached) {
-                            showingLogs.toggle()
-                        }
-                    }
-                    action(displayWindow.isDetached ? "显示独立窗口" : "独立显示窗口", icon: "macwindow", enabled: session.isAttached) {
-                        displayWindow.show(session: session)
-                    }
-                    if displayWindow.isDetached {
-                        action(presentation == .full ? "画面回到主窗口" : "关闭独立窗口", icon: "rectangle.inset.filled", enabled: true) { displayWindow.close() }
+            SimulatorDeviceControls(runtime: runtime, sharing: sharing, recording: recording,
+                guestOperations: guestOperations, instanceName: instanceName) {
+                if presentation == .full {
+                    action("日志", icon: "text.alignleft", enabled: controlsAvailable && session.isAttached) {
+                        showingLogs.toggle()
                     }
                 }
-                if runtime.isStopping {
-                    ProgressView("正在停止设备…").controlSize(.small)
-                } else if !session.isRunning && !runtime.statusMessage.isEmpty {
-                    Text(runtime.statusMessage)
-                        .foregroundStyle(SimulatorTheme.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                action(displayWindow.isDetached ? "显示独立窗口" : "独立显示窗口", icon: "macwindow",
+                       enabled: runtime.instanceID != nil || session.isAttached) {
+                    displayWindow.show(runtime: runtime, sharing: sharing, recording: recording,
+                        guestOperations: guestOperations, logStream: logStream, instanceName: instanceName)
                 }
-                if let issue = session.transientIssue {
-                    Label(issue, systemImage: "exclamationmark.triangle")
-                        .font(.system(size: 12)).foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .accessibilityIdentifier("simulator.transient-issue")
-                }
-                if let seconds = sessionRunLimit {
-                    Text("运行上限：\(StandaloneRunLimits.describe(seconds))")
-                        .foregroundStyle(SimulatorTheme.secondary)
-                }
-                if session.isAttached && session.image == nil {
-                    Text("等待画面")
-                        .foregroundStyle(SimulatorTheme.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if let url = screenshotURL {
-                    HStack {
-                        Text("截图已保存到桌面：\(url.lastPathComponent)")
-                            .foregroundStyle(SimulatorTheme.secondary)
-                            .textSelection(.enabled)
-                        Button("在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
-                    }
-                }
-                if let screenshotError {
-                    Text(screenshotError).foregroundStyle(.red)
-                }
-                if recording.isRecording {
-                    Label("录制中 \(Int(recording.elapsedTime) / 60):\(String(format: "%02d", Int(recording.elapsedTime) % 60))", systemImage: "record.circle.fill")
-                        .foregroundStyle(.red)
-                } else if recording.isFinishing {
-                    ProgressView("正在保存录屏…").controlSize(.small)
-                } else if let url = recording.savedFileURL {
-                    Button("在桌面显示录屏") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
-                        .help(url.lastPathComponent)
-                }
-                if let message = recording.errorMessage {
-                    Text(message).foregroundStyle(SimulatorTheme.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if let url = recording.recoveryFileURL {
-                        Button("显示可恢复视频") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
-                    }
-                }
-            }
-            SimulatorSectionDivider()
-            SimulatorSection(title: "应用与表盘", icon: "shippingbox") {
-                SimulatorActionFlow {
-                    action("连接虚拟手环", icon: "link", enabled: guestOperations.canConnect) {
-                        Task { await guestOperations.connect() }
-                    }
-                    .help("连接此实例的本机虚拟通信通道")
-                    .accessibilityIdentifier("simulator.guest.connect")
-                    action("安装…", icon: "square.and.arrow.down", enabled: guestOperations.canInstall) {
-                        installSelectionHost = session.manifest?.id
-                        installSelectionPeer = guestOperations.identity
-                        choose(.installGuestPackage)
-                    }
-                        .accessibilityIdentifier("simulator.install")
-                }
-                Text(session.isRunning ? guestOperations.connectionLabel : "运行设备后可连接")
-                    .font(.system(size: 12)).accessibilityIdentifier("simulator.guest.connection-state")
-                    .foregroundStyle(SimulatorTheme.secondary)
-                if guestOperations.isAuthenticated {
-                    HStack {
-                        Picker("表盘", selection: $guestOperations.selectedWatchfaceID) {
-                            Text(guestOperations.inventoryLoaded ? "选择表盘" : "正在读取…").tag(Optional<String>.none)
-                            ForEach(guestOperations.inventory) { face in
-                                Text("\(face.name)\(face.isCurrent ? " · 当前" : "")").tag(Optional(face.id))
-                            }
-                        }.disabled(guestOperations.isBusy)
-                            .accessibilityIdentifier("simulator.guest.watchface-picker")
-                        Button { Task { await guestOperations.loadInventory() } } label: {
-                            Image(systemName: "arrow.clockwise")
-                        }.disabled(!guestOperations.canRefresh).help("刷新设备表盘")
-                            .accessibilityLabel("刷新设备表盘")
-                    }
-                    action("使用表盘", icon: "checkmark.circle", enabled: guestOperations.canSelect) {
-                        Task { await guestOperations.selectWatchface() }
-                    }.accessibilityIdentifier("simulator.guest.select")
-                    applicationInventory
-                }
-                if let progress = guestOperations.progressLabel {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text(progress)
-                    }.font(.system(size: 12)).accessibilityIdentifier("simulator.guest.progress")
-                } else if let result = guestOperations.resultMessage {
-                    Text(result).font(.system(size: 12)).accessibilityIdentifier("simulator.guest.result")
-                }
-                if let error = guestOperations.errorMessage {
-                    Text(error).font(.system(size: 12)).foregroundStyle(.red)
-                        .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
-                        .accessibilityIdentifier("simulator.guest.error")
-                }
-                DisclosureGroup("安装包检查与暂存") {
-                    SimulatorActionFlow {
-                        action("检查安装包", icon: "doc.text.magnifyingglass", enabled: controlsAvailable && session.isAttached) { choose(.inspectPackage) }
-                        action("暂存安装包", icon: "tray.and.arrow.down", enabled: controlsAvailable && session.isAttached) { choose(.stagePackage) }
-                    }
-                    Text("仅处理宿主文件，不会安装到设备。")
-                        .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
-                }
-                if !session.packageReport.isEmpty {
-                    DisclosureGroup("检查与暂存结果", isExpanded: $showingPackageReport) {
-                        Text(session.packageReport)
-                            .font(.system(size: 12, design: .monospaced))
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier("simulator.open-display-window")
+                if displayWindow.isDetached {
+                    action(presentation == .full ? "画面回到主窗口" : "关闭独立窗口", icon: "rectangle.inset.filled", enabled: true) {
+                        displayWindow.close()
                     }
                 }
             }
@@ -590,173 +393,8 @@ import UniformTypeIdentifiers
         .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
-    private var applicationInventory: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("应用").font(.subheadline.weight(.medium))
-                Spacer()
-                Button { Task { await guestOperations.loadInventory(kind: .quickapp) } } label: {
-                    Image(systemName: "arrow.clockwise")
-                }.disabled(!guestOperations.canRefresh).help("刷新设备应用")
-                    .accessibilityLabel("刷新设备应用")
-                    .accessibilityIdentifier("simulator.guest.apps-refresh")
-            }
-            if guestOperations.applications.isEmpty {
-                Text(guestOperations.applicationsLoaded ? "暂无应用" : "正在读取…")
-                    .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
-            } else {
-                ForEach(guestOperations.applications) { app in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(app.name.isEmpty ? app.id : app.name).font(.system(size: 13, weight: .medium))
-                        Text("\(app.id) · 版本 \(app.version)")
-                            .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
-                    }.fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
-                }
-                Text("从设备应用列表打开。")
-                    .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
-            }
-        }.accessibilityIdentifier("simulator.guest.apps-inventory")
-    }
-
     private var logPanel: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label(instanceName.map { "\($0) · 日志" } ?? "日志", systemImage: "text.alignleft")
-                .font(.headline).accessibilityAddTraits(.isHeader)
-            SimulatorActionFlow {
-                Picker("日志来源", selection: $logName) {
-                    Text("UART 0").tag("uart0.log")
-                    Text("UART 1").tag("uart1.log")
-                    Text("UART 2").tag("uart2.log")
-                    Text("QEMU").tag("qemu.log")
-                    Text("虚拟手环连接").tag("virtual-peer.log")
-                    Text("标准错误").tag("stderr.log")
-                }.fixedSize().disabled(!session.isAttached)
-                Toggle("跟随最新日志", isOn: $followLogBottom).toggleStyle(.checkbox)
-                action("重连日志", icon: "arrow.clockwise", enabled: isActive && session.isAttached) {
-                    if let id = session.manifest?.id, let directory = runtime.sessionURL {
-                        logStream.start(directory: directory, sessionID: id, name: logName)
-                    }
-                }
-            }
-            if session.isAttached && logStream.detail != "实时刷新 · 最多保留 256 KiB" {
-                Text(logStream.detail)
-                    .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
-            }
-            SimulatorLogTextView(text: logStream.text, followBottom: followLogBottom,
-                                 discardedUTF16: logStream.discardedUTF16, epoch: logStream.epoch)
-                .frame(minHeight: 70, maxHeight: .infinity)
-                .accessibilityIdentifier("simulator.live-log")
-        }.padding(16).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .background(SimulatorTheme.surface)
-    }
-
-    private var firmwareLibrarySection: some View {
-        SimulatorSection(title: "固件", icon: "applewatch") {
-            if runtime.selectableFirmwareItems.isEmpty {
-                Text(runtime.hasLoadedCatalog ? "尚未导入固件；点击「导入固件…」选择完整 OTA 包" : "正在读取固件库")
-                    .fontWeight(.medium)
-            } else {
-                Picker("已导入固件", selection: Binding(get: { pendingProfileID ?? runtime.selectedProfileID }, set: { id in
-                    if runtime.isServing {
-                        pendingProfileID = id == runtime.selectedProfileID ? nil : id
-                    } else if let id {
-                        Task { await runtime.switchFirmware(to: id) }
-                    } else { runtime.selectedProfileID = nil }
-                })) {
-                    Text("选择启动固件…").tag(Optional<String>.none)
-                    ForEach(runtime.selectableFirmwareItems) { item in
-                        Text("\(item.displayName)\(item.source == .imported ? " · 已导入" : "")")
-                            .tag(Optional(item.id))
-                    }
-                }
-                // Switching is free whenever this app owns or has stopped the
-                // core; only an externally attached session cannot be switched.
-                .disabled(!controlsAvailable || (session.isAttached && !runtime.isServing))
-                .help(session.isAttached && !runtime.isServing ? "已连接外部会话；断开后可切换固件"
-                    : "可切换本型号的任意已导入固件；切换固件会保留数据盘")
-                .accessibilityIdentifier("simulator.firmware-picker")
-                if let pending = pendingProfileID, runtime.isServing {
-                    SimulatorActionFlow {
-                        action("切换并重新开机", icon: "arrow.triangle.2.circlepath", enabled: controlsAvailable) {
-                            pendingProfileID = nil
-                            Task { await recording.stop(); await runtime.switchFirmware(to: pending) }
-                        }
-                        .accessibilityIdentifier("simulator.switch-firmware")
-                        action("取消", icon: "xmark", enabled: true) { pendingProfileID = nil }
-                    }
-                    Text("将停止设备、保存数据盘，然后用所选固件冷启动；切换固件会保留数据盘。")
-                        .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                } else if runtime.selectableFirmwareItems.count > 1 {
-                    Text("可随时切换本型号的其他已导入固件；切换固件会保留数据盘。")
-                        .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            if let item = runtime.selectedFirmware {
-                Text("\(item.model) · \(item.width) × \(item.height)")
-                    .foregroundStyle(SimulatorTheme.secondary)
-                if !item.availability.ready {
-                    Text(item.availability.reason.isEmpty ? "此固件尚缺少完整运行资源" : item.availability.reason)
-                        .foregroundStyle(SimulatorTheme.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            if runtime.importCandidateIDs.count > 1 && runtime.selectedProfileID == nil {
-                Text("导入文件对应多个型号，请选择匹配的设备后运行。")
-                    .foregroundStyle(SimulatorTheme.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            SimulatorActionFlow {
-                action("运行", icon: "play.fill", enabled: controlsAvailable && runtime.canRunSelectedFirmware) {
-                    Task {
-                        guard controlsAvailable, await runtime.prepareSelectedFirmware(), controlsAvailable else { return }
-                        if !runtime.preparedNeedsReview { await runtime.startApproved() }
-                        else { review = SimulatorRunReview(summary: runtime.selectedSummary, runLimitSeconds: runtime.preparedRunLimitSeconds) }
-                    }
-                }
-                .keyboardShortcut("r", modifiers: .command)
-                .help(runtime.runUnavailableReason ?? (sharing.isSharing || sharing.sessionURL != nil
-                    ? "请先停止 Studio 连接共享" : "按本实例的硬件预设开机（⌘R）"))
-                .accessibilityIdentifier("simulator.run-firmware")
-                action("导入固件…", icon: "square.and.arrow.down", enabled: controlsAvailable && runtime.libraryAvailable && !runtime.isServing && !session.isAttached) { choose(.importFirmware) }
-                    .help(runtime.isServing || session.isAttached ? "停止设备后可导入固件"
-                        : runtime.libraryAvailable ? "选择完整 OTA 包导入到固件库" : "固件库暂不可用；请先点击「刷新目录」")
-                    .accessibilityIdentifier("simulator.import-firmware")
-                action("刷新目录", icon: "arrow.clockwise", enabled: controlsAvailable && !runtime.isServing && !session.isAttached) {
-                    Task { await runtime.loadCatalog() }
-                }
-            }
-            if let failure = runtime.importFailureMessage {
-                Label("上次导入失败：\(failure)", systemImage: "exclamationmark.circle")
-                    .foregroundStyle(SimulatorTheme.text)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("simulator.import-error")
-            }
-            if let diagnostic = runtime.importDiagnostic {
-                Text(diagnostic.summary).fontWeight(.medium)
-                Text(diagnostic.details).font(.system(size: 12, design: .monospaced))
-                    .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("simulator.firmware-diagnostic")
-            }
-            if let diagnosticError = runtime.importDiagnosticError {
-                Text(diagnosticError).foregroundStyle(SimulatorTheme.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if runtime.modelConstraint != nil {
-                DisclosureGroup("存储状态") {
-                    Text(runtime.instanceStorageMessage)
-                        .font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            if !runtime.libraryStatus.isEmpty && runtime.libraryStatus != "固件库已就绪" {
-                Text(runtime.libraryStatus).font(.system(size: 12))
-                    .foregroundStyle(SimulatorTheme.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if runtime.isBusy { ProgressView().controlSize(.small).accessibilityLabel("正在检查固件") }
-        }
+        SimulatorLogPanel(runtime: runtime, stream: logStream, instanceName: instanceName, allowsReconnect: isActive)
     }
 
     private func devicePane(_ geometry: SimulatorDisplayGeometry) -> some View {
@@ -789,7 +427,7 @@ import UniformTypeIdentifiers
     }
     private func captureDebug(export: Bool) {
         let snapshot = SimulatorDebugSnapshot(manifest: session.manifest, status: session.status,
-            frame: session.frame, isAttached: session.isAttached, logName: logsVisible ? logName : nil,
+            frame: session.frame, isAttached: session.isAttached, logName: logsVisible ? logStream.selectedName : nil,
             logText: logsVisible ? logStream.text : nil)
         let frame = snapshot.frame.map { "\($0.width) × \($0.height) · 序号 \($0.sequence)" } ?? "尚无完整帧"
         debugText = "固件：\(snapshot.profileID ?? "未报告")\n状态：\(snapshot.reportedState ?? "未报告")\n画面：\(frame)\n核心进程：\(snapshot.hostProcessRunning.map { $0 ? "运行" : "停止" } ?? "未报告")\n客体安装：\(snapshot.guestInstallSupported.map { $0 ? "后端声明支持" : "未实现" } ?? "未报告")\n采集时间：\(snapshot.capturedAt.formatted())"
@@ -802,33 +440,24 @@ import UniformTypeIdentifiers
     private func selected(_ url: URL, for choice: SimulatorFileChoice) {
         guard controlsAvailable else { uiError = "请先停止只读共享或等待当前操作结束。"; return }
         switch choice {
-        case .importFirmware: Task { guard controlsAvailable else { return }; await runtime.importFirmware(url) }
         case .qemu: runtime.qemuURL = url
         case .firmware: runtime.firmwareURL = url
         case .resource: runtime.resourceURL = url
         case .session: Task { guard controlsAvailable else { return }; await runtime.attachExisting(url) }
-        case .inspectPackage: showingPackageReport = true; session.inspectPackage(url)
-        case .stagePackage: showingPackageReport = true; session.stagePackage(url)
-        case .installGuestPackage:
-            guard guestOperations.canInstall, installSelectionHost == session.manifest?.id,
-                  installSelectionPeer == guestOperations.identity else {
-                uiError = "设备连接已变化，请重新选择安装包。"; return
-            }
-            Task { await guestOperations.install(url) }
         }
     }
     private var errorMessage: String? { uiError ?? sharing.errorMessage ?? runtime.errorMessage ?? session.errorMessage }
     private func dismissErrors() { uiError = nil; sharing.errorMessage = nil; runtime.errorMessage = nil; session.errorMessage = nil }
 }
 
-private enum SimulatorFileChoice { case importFirmware, qemu, firmware, resource, session, inspectPackage, stagePackage, installGuestPackage }
-private struct SimulatorRunReview: Identifiable {
+private enum SimulatorFileChoice { case qemu, firmware, resource, session }
+struct SimulatorRunReview: Identifiable {
     let id = UUID()
     let summary: String
     let runLimitSeconds: Int
 }
 
-private struct SimulatorRunConfirmation: View {
+struct SimulatorRunConfirmation: View {
     let summary: String
     let runLimitSeconds: Int
     let cancel: () -> Void

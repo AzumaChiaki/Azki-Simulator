@@ -34,6 +34,9 @@ nonisolated struct SimulatorLogBuffer: Sendable {
 /// A dedicated read-only connection keeps log I/O off the frame/input channel.
 /// Polling is single-flight and at most four requests/UI batches per second.
 @MainActor @Observable final class SimulatorLogStreamModel {
+    // One selection and one bounded stream per instance, shared by all windows.
+    var selectedName = "uart2.log"
+    var followBottom = true
     private(set) var text = ""
     private(set) var isFollowing = false
     private(set) var detail = "暂无日志"

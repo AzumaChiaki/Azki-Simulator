@@ -2,21 +2,25 @@
 """Build the macOS arm64 engine from source, without firmware or Developer ID.
 
 Requires Xcode command line tools and Homebrew build dependencies documented in
-README. All outputs live under --work-dir / --output. No guest is executed.
+README. Final outputs live in dist; temporary work is cleaned. No guest is executed.
 """
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
 import re
+import signal
 import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
+import time
 import urllib.request
 import zipfile
 
@@ -37,13 +41,136 @@ def output(args):
     return subprocess.check_output(list(map(str, args)), text=True).strip()
 
 
+class RangeDownloadUnavailable(Exception):
+    """The server advertised ranges but did not honor the request."""
+
+
+class DownloadRateLimited(Exception):
+    """The source temporarily rejected a request; the caller may fall back."""
+
+
+def response_headers(text):
+    # curl includes proxy and redirect headers; only the final response counts.
+    for block in reversed(re.split(r'\r?\n\r?\n', text.strip())):
+        lines=block.splitlines()
+        match=re.match(r'HTTP/\S+\s+(\d{3})\b',lines[0]) if lines else None
+        if match:
+            headers={}
+            for line in lines[1:]:
+                name,separator,value=line.partition(':')
+                if separator:headers[name.lower().strip()]=value.strip()
+            return int(match.group(1)),headers
+    return 0,{}
+
+
+def parallel_download(url, temporary, size, metadata):
+    # Every segment stays inside the same disposable build work directory.
+    with tempfile.TemporaryDirectory(prefix=temporary.name+'.segments-',dir=temporary.parent) as directory:
+        directory=Path(directory)
+        ranges=[(size*i//8,size*(i+1)//8-1) for i in range(8)]
+        validator=metadata.get('etag','')
+        if not validator or validator.startswith('W/'):validator=metadata.get('last-modified','')
+
+        def fetch(item):
+            index,(start,end)=item
+            part=directory/str(index);header=directory/(str(index)+'.headers')
+            for attempt in range(1, 6):
+                header.unlink(missing_ok=True)
+                part.unlink(missing_ok=True)
+                command=['curl','--fail','--location','--silent','--show-error',
+                         '--connect-timeout','15','--max-time','900',
+                         '--header','Accept-Encoding: identity',
+                         '--range',f'{start}-{end}','--max-filesize',str(end-start+1),
+                         '--dump-header',str(header),'--output',str(part)]
+                if validator:command+=['--header','If-Range: '+validator]
+                result=subprocess.run([*command,url],capture_output=True,text=True)
+                status,headers=response_headers(header.read_text() if header.exists() else '')
+                if status in (200,405,416):
+                    raise RangeDownloadUnavailable('Server did not honor byte ranges')
+                if status == 429 or 500 <= status <= 599:
+                    if attempt == 5:
+                        raise DownloadRateLimited(f'HTTP {status} after {attempt} attempts')
+                    # CDN rate limits are commonly per-client rather than per
+                    # URL. Back off before retrying the same segment, honoring
+                    # Retry-After when it is a bounded number of seconds.
+                    retry_after=headers.get('retry-after','')
+                    try:
+                        delay=min(60.0, max(1.0, float(retry_after)))
+                    except ValueError:
+                        delay=min(60.0, 2.0 ** (attempt - 1))
+                    time.sleep(delay)
+                    continue
+                if result.returncode:
+                    raise RuntimeError(f'Range download failed ({result.returncode}): {result.stderr.strip()}')
+                content_range=re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',headers.get('content-range',''))
+                if status!=206 or not content_range or tuple(map(int,content_range.groups()))!=(start,end,size):
+                    raise RangeDownloadUnavailable('Missing or incorrect Content-Range')
+                if headers.get('content-encoding','identity').lower()!='identity':
+                    raise RuntimeError('Unexpected encoding in range response')
+                if part.stat().st_size!=end-start+1:
+                    raise RuntimeError('Range download has an incorrect length')
+                return part
+
+        print(f'Downloading {temporary.name.removesuffix(".part")} in 8 verified byte ranges',flush=True)
+        # Eight simultaneous requests can trigger 429 responses on otherwise
+        # range-capable public mirrors. Keep the default conservative; callers
+        # may raise it explicitly for an internal mirror.
+        workers=max(1, min(8, int(os.environ.get('AZKI_DOWNLOAD_JOBS','2'))))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            parts=list(executor.map(fetch,enumerate(ranges)))
+        with temporary.open('wb') as joined:
+            for part in parts:
+                with part.open('rb') as source:shutil.copyfileobj(source,joined)
+        if temporary.stat().st_size!=size:
+            raise RuntimeError('Combined download has an incorrect length')
+
+
 def download(url, target):
-    if not target.exists():
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(target.name + '.part')
-        run(['curl', '--fail', '--location', '--retry', '3', '--output', temporary, url])
+    if target.exists():return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary=target.with_name(target.name+'.part')
+    try:
+        head=subprocess.run(['curl','--fail','--location','--silent','--show-error',
+                             '--connect-timeout','15','--max-time','30','--head',
+                             '--header','Accept-Encoding: identity',url],capture_output=True,text=True)
+        status,metadata=response_headers(head.stdout)
+        length=metadata.get('content-length','')
+        size=int(length) if length.isdecimal() else 0
+        ranged=(head.returncode==0 and status==200 and size>16*1024*1024
+                and metadata.get('accept-ranges','').lower()=='bytes'
+                and metadata.get('content-encoding','identity').lower()=='identity')
+        if ranged:
+            try:
+                parallel_download(url,temporary,size,metadata)
+            except (RangeDownloadUnavailable, DownloadRateLimited) as error:
+                print(f'{error}; falling back to a single download',flush=True)
+                ranged=False
+        if not ranged:
+            # A single request is often accepted after the mirror's rate-limit
+            # window has reset. Retry transient 429/5xx responses with a bounded
+            # backoff; curl's default retry list is not portable across versions.
+            for attempt in range(1, 6):
+                result=subprocess.run(['curl','--fail','--location','--silent','--show-error',
+                                       '--connect-timeout','15','--max-time','1800',
+                                       '--dump-header',str(temporary)+'.headers',
+                                       '--output',temporary,url],capture_output=True,text=True)
+                status,metadata=response_headers(Path(str(temporary)+'.headers').read_text()
+                                                if Path(str(temporary)+'.headers').exists() else '')
+                Path(str(temporary)+'.headers').unlink(missing_ok=True)
+                if result.returncode == 0:
+                    break
+                if status == 429 or 500 <= status <= 599:
+                    if attempt == 5:
+                        raise RuntimeError(f'Source download failed with HTTP {status} after {attempt} attempts')
+                    time.sleep(min(60.0, 2.0 ** (attempt - 1)))
+                    continue
+                raise RuntimeError(f'Source download failed ({result.returncode}): {result.stderr.strip()}')
+            else:
+                raise RuntimeError('Source download failed')
         temporary.rename(target)
-    return target
+        return target
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def unpack(archive, parent):
@@ -170,22 +297,49 @@ def relocate(engine, brew, source_delivery):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--work-dir',type=Path,required=True)
-    parser.add_argument('--output',type=Path,required=True)
-    parser.add_argument('--source-output',type=Path,required=True)
+    parser.add_argument('--output',type=Path,default=ROOT/'dist/Engine')
+    parser.add_argument('--source-output',type=Path,default=ROOT/'dist/Engine-sources.tar.gz')
     parser.add_argument('--jobs',type=int,default=min(os.cpu_count() or 2,8))
     parser.add_argument('--build-python',type=Path,help='Existing CPython 3.12 with pip; default: Homebrew python@3.12')
     parser.add_argument('--tools-dir',type=Path,help='Optional existing directory containing ninja/pkg-config')
     args=parser.parse_args()
     if platform.system()!='Darwin' or platform.machine()!='arm64': parser.error('macOS arm64 build host required')
-    work=args.work_dir.resolve(); engine=args.output.resolve(); source_output=args.source_output.resolve()
-    if engine.exists(): parser.error('--output must be a new path')
+    dist=ROOT/'dist'
+    engine=args.output.resolve(); source_output=args.source_output.resolve()
+    if dist.is_symlink() or engine.parent != dist or source_output.parent != dist:
+        parser.error('Final engine and source outputs must be direct children of the repository dist directory')
+    if engine == source_output or engine.exists() or source_output.exists():
+        parser.error('Engine and source outputs must be distinct new paths')
+    dist.mkdir(exist_ok=True)
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+    previous_handlers={}
+    try:
+        for signum in (signal.SIGTERM,signal.SIGHUP):
+            previous_handlers[signum]=signal.signal(signum,terminate)
+        with tempfile.TemporaryDirectory(prefix='azki-engine-',dir='/private/tmp') as temporary:
+            work=Path(temporary)
+            build_engine(work,work/'Engine',work/'Engine-sources.tar.gz',args.jobs,args.build_python,args.tools_dir)
+            (work/'Engine').rename(engine)
+            (work/'Engine-sources.tar.gz').rename(source_output)
+    finally:
+        for signum,handler in previous_handlers.items():
+            signal.signal(signum,handler)
+
+
+def build_engine(work, engine, source_output, jobs=None, build_python=None, tools_dir=None):
+    """Internal staging API; callers own and clean the temporary work tree."""
+    if platform.system()!='Darwin' or platform.machine()!='arm64':
+        raise RuntimeError('macOS arm64 build host required')
+    args=argparse.Namespace(jobs=jobs or min(os.cpu_count() or 2,8),build_python=build_python,tools_dir=tools_dir)
     work.mkdir(parents=True,exist_ok=True)
     brew=shutil.which('brew')
-    if not brew: parser.error('Homebrew build dependencies are required; see README')
+    if not brew: raise RuntimeError('Homebrew build dependencies are required; see README')
     builder=args.build_python or Path(output([brew,'--prefix','python@3.12']))/'bin/python3.12'
-    if not builder.is_file(): parser.error('Install python@3.12 for building wheels')
+    if not builder.is_file(): raise RuntimeError('Install python@3.12 for building wheels')
     env=os.environ.copy(); env['MACOSX_DEPLOYMENT_TARGET']='15.0'
+    temporary=work/'tmp';temporary.mkdir(exist_ok=True)
+    env['TMPDIR']=str(temporary);env['PIP_CACHE_DIR']=str(work/'pip-cache')
     # Some portable builder Pythons record their original, now absent compiler
     # paths in sysconfig. Use the selected Xcode tools for native extensions.
     for key,tool in (('CC','clang'),('CXX','clang++'),('AR','ar'),('RANLIB','ranlib')):
@@ -228,6 +382,9 @@ def main():
     wheels=work/'wheels';wheels.mkdir(exist_ok=True)
     package_sources=delivery/'python-packages';package_sources.mkdir(exist_ok=True)
     for package,version in PACKAGES.items():
+        # Always deliver the pinned source and build it with this recipe.  A
+        # cached wheel may use different optional features or dependencies and
+        # is not a substitute for its corresponding source distribution.
         metadata=json.loads(urllib.request.urlopen(f'https://pypi.org/pypi/{package}/{version}/json').read())
         item=next(x for x in metadata['urls'] if x['packagetype']=='sdist')
         source=download(item['url'],package_sources/item['filename'])

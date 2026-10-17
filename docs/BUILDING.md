@@ -11,6 +11,18 @@
 
 应用使用者无需安装这些开发依赖。
 
+## 输出规则与 Debug 编译
+
+所有编译的最终产物都直接放在仓库根目录 `dist/`，该目录只放应用、DMG 和对应源码交付包，不放缓存、日志、下载或中间文件。中间文件使用仓库外的专用临时目录，成功、失败或常规中断时都会清理（强制 SIGKILL、断电或系统崩溃除外）；不再保留 `.build/`、`.build-debug/` 或 `build/`。
+
+```sh
+./scripts/build.sh debug
+```
+
+输出应用为 `dist/Azki Simulator.app`，同时输出匹配的源码包。Release 使用 `./scripts/build.sh release`。这两个命令从源码构建完整引擎，不内置固件。不要直接运行会留下 `.build` 的裸 `swift build`。如已另行准备完整引擎，可用 `AZKI_BUILD_CONFIGURATION=debug ./scripts/build-app.sh /绝对路径/Engine` 仅打包应用；最终应用仍只输出到 `dist/`。
+
+不允许自定义最终输出目录。同名产物存在时，先移走或清理旧产物，脚本不会静默覆盖。
+
 ## 生成 DMG
 
 ```sh
@@ -19,20 +31,24 @@ export PATH="$(brew --prefix python@3.12)/libexec/bin:$PATH"
 ./scripts/build-dmg.sh dist
 ```
 
-脚本从源码构建定制 QEMU、内置 Python 和必要依赖，再构建原生应用并生成 DMG。缺少引擎时构建失败，不会输出只含界面的安装包。输出目录已存在同名 DMG 时，请选新目录或先自行移走旧产物。
+脚本从源码构建定制 QEMU、内置 Python 和必要依赖，再构建原生应用并生成 DMG。缺少引擎时构建失败，不会输出只含界面的安装包。输出目录已存在同名产物时，请先自行移走或清理旧产物。
 
 | 参数 | 用途 |
 | --- | --- |
-| `build-dmg.sh` 的第一个参数 | 输出目录，默认 `dist` |
-| `AZKI_WORK_DIR` | 临时构建工作区的父目录，默认 `build` |
-| `AZKI_BUILD_DIR` | Swift 构建缓存目录 |
+| `build-dmg.sh` 的第一个参数 | 可省略；仅接受本仓库 `dist` |
+| `AZKI_BUILD_CONFIGURATION` | `build-app.sh` 的 `debug` / `release` 配置 |
 | `AZKI_BUILD_JOBS` | Swift 并行任务数，默认 2 |
 | `DEVELOPER_DIR` | 要使用的完整 Xcode 开发目录 |
+
+`AZKI_WORK_DIR` 和 `AZKI_BUILD_DIR` 已不再支持，避免遗留工作目录。独立引擎构建使用 `python3 -B scripts/build-engine.py`，默认最终输出为 `dist/Engine` 和 `dist/Engine-sources.tar.gz`；引擎与其源码包也必须直接位于 `dist/`。
 
 `VERSION` 与 `BUILD_NUMBER` 分别写入 `CFBundleShortVersionString` 和 `CFBundleVersion`。本地构建直接使用文件中的值。GitHub Actions 把它作为起点，按“起点 + 运行序号 − 1”自动递增，只在构建机上写入，不回写仓库；需要跳号时调大 `BUILD_NUMBER` 即可。
 
 ## 产物
 
+- `Azki Simulator.app`：可直接运行的原生应用。
+- `*-debug-source.tar.gz` / `*-release-source.tar.gz`：Debug / Release 构建的项目源码。
+- `*-debug-engine-sources.tar.gz` / `*-release-engine-sources.tar.gz`：对应引擎、依赖源码及许可证。
 - `*-unsigned.dmg`：原生应用和 Applications 快捷方式。
 - `*-unsigned-source.tar.gz`：该次构建的项目源码及构建说明。
 - `*-unsigned-engine-sources.tar.gz`：引擎及其依赖的对应源码与许可证。

@@ -34,10 +34,13 @@ def _attach_nor_geometry(board, profile, ap_data, factory_bytes):
     """Attach only an exact AP-bound storage description, not runtime support."""
     from backend.src.instance_data import validate_nor_geometry
     geometry = board['geometry']
-    if profile['id'] in (
-        'miwear.watch.p67cn@3.101.043@a4ce85647786',
-        'miwear.watch.p67tc@3.101.043@a4ce85647786',
-    ):
+    # Imported p67 OTAs retain the same AP and writable-NOR layout but carry a
+    # generated profile ID (for example @0@<sha>).  Restrict this derivation to
+    # the verified p67 AP identity while accepting those imported IDs; matching
+    # only catalog IDs silently placed imported instances' nv records at the
+    # factory boundary and the firmware disconnected before BindInfo.
+    if (profile['model'] in ('miwear.watch.p67cn', 'miwear.watch.p67tc')
+            and profile['ap']['sha256'] == '519307675665e4866d722a8119a98589c397b614ac3294cb87bfc86de45756ec'):
         # These two catalog profiles share the same AP. Its BES userdata
         # starts after the actual image, before the mode/nv MTD partitions.
         # A real NOR0 erase at 0xdea000 proves this area is guest-writable.
@@ -68,6 +71,9 @@ def _attach_nor_geometry(board, profile, ap_data, factory_bytes):
 
 def board_profile(profile, resource_bytes, storage_kind='romfs'):
     ap=profile['ap']
+    if profile['model'] == 'miwear.watch.q65':
+        from backend.src.q65_runner import board_profile as q65_board
+        return q65_board(profile)
     if ap['chip']!='best1503':
         raise ValueError(ap['backend_requirement'])
     ap_data = Path(profile['ap_path']).read_bytes()
@@ -229,6 +235,9 @@ def main():
         return 0
     try:
         profile=select(args.device)
+        if profile['model'] == 'miwear.watch.q65':
+            from backend.src.q65_runner import run
+            return run(profile, args)
         if profile['ap']['chip']!='best1503': raise ValueError(profile['ap']['backend_requirement'])
         qemu_sha256 = None  # No startup full-core hash; release manifest owns provenance.
         resource,resource_sha,storage_kind=prepare_storage(profile)

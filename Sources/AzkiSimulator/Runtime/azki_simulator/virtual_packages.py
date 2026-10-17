@@ -21,10 +21,10 @@ import zlib
 
 if __package__:
     from .packages import PackageError, _bin_header, _json
-    from .minative import INCLUDED_PROFILE_IDS
+    from .minative import INCLUDED_PROFILE_IDS, profile_in_scope
 else:
     from packages import PackageError, _bin_header, _json
-    from minative import INCLUDED_PROFILE_IDS
+    from minative import INCLUDED_PROFILE_IDS, profile_in_scope
 
 PROFILE_IDS = frozenset(INCLUDED_PROFILE_IDS)
 # Kept for the existing native adapter test fixtures and older in-process
@@ -45,8 +45,8 @@ def _require(value, code, message):
 
 
 def _profile(profile_id):
-    _require(type(profile_id) is str and profile_id in PROFILE_IDS,
-             'unsupported_profile', '包预检需要目录中的精确固件 profile。')
+    _require(type(profile_id) is str and profile_in_scope(profile_id),
+             'unsupported_profile', '包预检需要受支持设备的精确固件 profile。')
 
 
 def _absolute(path):

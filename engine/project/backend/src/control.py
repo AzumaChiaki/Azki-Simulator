@@ -364,6 +364,8 @@ class WatchControl:
         if set(data) == {'x', 'y', 'down'}:
             self.touch(data['x'], data['y'], data['down'])
             return {}
+        if set(data) == {'command', 'button', 'clicks'} and data['command'] == 'q65.button':
+            return self.device_button(data['button'], data['clicks'])
         if set(data) == {'command'} and data['command'] == 'pmu.adcRaw.get':
             return self.adc_raw()
         if set(data) == {'command', 'values'} and data['command'] == 'pmu.adcRaw.set':
@@ -384,6 +386,34 @@ class WatchControl:
         if set(data) == {'command', 'channels'} and data['command'] == 'pmu.adcChannels.set':
             return self.adc_channels(data['channels'])
         raise ValueError('Unsupported input command or fields')
+
+    def device_button(self, button, clicks):
+        """Repeat the same physical click; never inject a guest double-click."""
+        if (type(button) is not str or button not in ('lower', 'crown') or
+                type(clicks) is not int or clicks not in (1, 2) or
+                (button == 'crown' and clicks != 1)):
+            raise ValueError('q65.button requires lower with 1/2 clicks or crown with 1 click')
+        with self.lock:
+            if self.qmp.execute('qom-get', {'path': '/machine', 'property': 'type'}) != 'azki-q65-machine':
+                raise RuntimeError('unsupported_hardware_input: q65 requires the isolated azki-q65 core')
+            if self._servers_stop.is_set():
+                raise RuntimeError('Instance is stopping')
+            mouse_button = 'right' if button == 'lower' else 'middle'
+            for index in range(clicks):
+                # Separate QMP requests prevent press/release coalescing.
+                try:
+                    self.qmp.execute('input-send-event', {'events': [
+                        {'type': 'btn', 'data': {'button': mouse_button, 'down': True}}]})
+                    self._servers_stop.wait(.2)
+                finally:
+                    self.qmp.execute('input-send-event', {'events': [
+                        {'type': 'btn', 'data': {'button': mouse_button, 'down': False}}]})
+                if self._servers_stop.is_set():
+                    raise RuntimeError('Button sequence interrupted; do not automatically retry')
+                if index + 1 < clicks and self._servers_stop.wait(.1):
+                    raise RuntimeError('Button sequence interrupted; do not automatically retry')
+            self.events.append({'type': 'device-button', 'button': button, 'clicks': clicks})
+            return {'accepted': True, 'guestObserved': False, 'button': button, 'clicks': clicks}
 
     def walk(self, steps):
         """Walk steps more from now at the current cadence (live input)."""

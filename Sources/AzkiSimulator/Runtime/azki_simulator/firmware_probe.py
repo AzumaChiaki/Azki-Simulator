@@ -55,7 +55,7 @@ def inspect_ap(data):
         return result
     build = {key.decode("ascii"): value.decode("ascii", "replace") for key, value in pairs}
     result["build"] = build
-    if chip != "best1503":
+    if chip not in ("best1503", "best1502p"):
         result["diagnostic"] = "当前核心尚未实现此芯片，保留版本身份用于适配"
         return result
     try:
@@ -86,7 +86,8 @@ def inspect_ap(data):
         need(0 < entry <= 0xffffffff and entry & 1, "BES Thumb 启动地址无效")
         # Match the selected BEST1503 core's reset-sp geometry bound. A broad
         # 0x20000000..0x40000000 range also includes flash and unmapped memory.
-        need(0x20000000 <= stack <= 0x20160000 and stack % 8 == 0,
+        ram_end = 0x201a0000 if chip == "best1502p" else 0x20160000
+        need(0x20000000 <= stack <= ram_end and stack % 8 == 0,
              "MSP 不在已建模 RAM 范围")
         result.update(headerRecognized=True, apOffset=offset, flashBytes=flash,
                       dataAlias=alias, resetEntry=entry, resetSP=stack)
@@ -189,7 +190,7 @@ def engine_ap(ap_data):
     if probe["headerRecognized"]:
         ap.update(image_format="bes-header", ap_offset=probe["apOffset"], flash_bytes=probe["flashBytes"],
                   data_alias=probe["dataAlias"], reset_entry=probe["resetEntry"], reset_sp=probe["resetSP"],
-                  backend_requirement="BES1503 peripheral and product storage/panel profile")
+                  backend_requirement=probe["chip"] + " peripheral and product storage/panel profile")
     else:
         ap.update(image_format="unrecognized", backend_requirement=probe.get("diagnostic", "启动头尚未适配"))
     return ap
@@ -231,7 +232,13 @@ def ota_recipe(fd, size):
             pass
     for name in ("version", "version.ini", "ota.sh"):
         version = version or _version(small.get(name))
-    version = version or _version(ap.get("build", {}).get("VERSION")) or "0"
+    version = version or _version(ap.get("build", {}).get("VERSION"))
+    if version is None:
+        # q65 packages carry the release in build.prop inside vela_ap.bin
+        # rather than in ota.json/version files. Keep this bounded to the AP.
+        match = re.search(rb"(?:ro\.build\.(?:id|version))=([0-9]+(?:\.[0-9]+){1,7})(?:\r?\n|\x00)", ap_data)
+        version = _version(match.group(1).decode("ascii", "ignore")) if match else None
+    version = version or "0"
     declared = sorted({m.decode("ascii") for m in DECLARED_MODEL.findall(ap_data)})[:64]
     return {"version": version, "family": family, "declaredModels": declared, "ap": ap,
             "partitions": records, "resourceLayout": archive["resourceLayout"]}

@@ -1,22 +1,24 @@
 #!/bin/bash
 set -euo pipefail
 root="$(cd -- "$(dirname -- "$0")/.." && pwd)"
-if [ "$#" -ne 2 ]; then
-  echo "Usage: $0 <prepared Engine directory> <new app output directory>" >&2
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  echo "Usage: $0 <prepared Engine directory> [dist]" >&2
   exit 2
 fi
+source "$root/scripts/build-common.sh"
 engine="$(cd -- "$1" && pwd)"
-mkdir -p "$2"
-output="$(cd -- "$2" && pwd)"
-app="$output/Azki Simulator.app"
-test ! -e "$app" || { echo "Output app already exists: $app" >&2; exit 2; }
+output="$(azki_dist_output "${2:-$root/dist}")"
+final_app="$output/Azki Simulator.app"
+test ! -e "$final_app" || { echo "Output app already exists: $final_app; move or clean the old output first." >&2; exit 2; }
 test -f "$engine/manifest.json"
 test -x "$engine/python/bin/python3.12"
 test -x "$engine/project/backend/build/qemu-system-arm"
-build="${AZKI_BUILD_DIR:-$root/.build}"
 cd "$root"
 configuration="${AZKI_BUILD_CONFIGURATION:-release}"
 case "$configuration" in debug|release) ;; *) echo "Invalid build configuration: $configuration" >&2; exit 2 ;; esac
+azki_temporary_work
+build="$azki_work/swift"
+app="$azki_work/Azki Simulator.app"
 /usr/bin/xcrun swift build --scratch-path "$build" -c "$configuration" -j "${AZKI_BUILD_JOBS:-2}"
 bin="$(/usr/bin/xcrun swift build --scratch-path "$build" -c "$configuration" --show-bin-path)"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/Firmware"
@@ -67,4 +69,5 @@ PY
 # certificate, timestamp service, Developer ID account or notarization service.
 /usr/bin/codesign --force --sign - --timestamp=none "$app"
 /usr/bin/codesign --verify --deep --strict "$app"
-printf '%s\n' "$app"
+mv -- "$app" "$final_app"
+printf '%s\n' "$final_app"

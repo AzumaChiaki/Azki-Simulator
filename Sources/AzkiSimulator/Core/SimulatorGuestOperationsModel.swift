@@ -26,6 +26,7 @@ final class SimulatorGuestOperationsModel {
     }
 
     private(set) var isAvailable = false
+    private(set) var packagesAvailable = false
     private(set) var isAuthenticated = false
     private(set) var isTransportReady = false
     private(set) var authPhase = "disconnected"
@@ -63,7 +64,7 @@ final class SimulatorGuestOperationsModel {
     }
     // A package/request error does not invalidate authentication. The engine's
     // reported transport state determines whether another operation may start.
-    var canInstall: Bool { isAvailable && isAuthenticated && isTransportReady && identity != nil && !isBusy }
+    var canInstall: Bool { isAvailable && packagesAvailable && isAuthenticated && isTransportReady && identity != nil && !isBusy }
     var canRefresh: Bool { canInstall }
     var canSelect: Bool {
         canInstall && selectedWatchfaceID.map { id in inventory.contains { $0.id == id && !$0.isCurrent } } == true
@@ -93,16 +94,15 @@ final class SimulatorGuestOperationsModel {
         }
     }
 
-    func configure(hostSessionID: UUID?, available: Bool, command: @escaping Command, install: @escaping Install) {
-        // Guest-connect validation removed: every running session may attempt
-        // the connection; the transport itself reports any real failure.
-        let enabled = hostSessionID != nil
+    func configure(hostSessionID: UUID?, available: Bool, packagesAvailable: Bool = true, command: @escaping Command, install: @escaping Install) {
+        let enabled = available && hostSessionID != nil
         if self.hostSessionID != hostSessionID || isAvailable != enabled {
             invalidate()
             self.hostSessionID = hostSessionID
             isAvailable = enabled
         }
         self.command = command
+        self.packagesAvailable = packagesAvailable
         installPackage = install
     }
 
@@ -111,6 +111,7 @@ final class SimulatorGuestOperationsModel {
         hostSessionID = nil
         peerProfileID = nil
         isAvailable = false
+        packagesAvailable = false
         isAuthenticated = false
         isTransportReady = false
         authPhase = "disconnected"

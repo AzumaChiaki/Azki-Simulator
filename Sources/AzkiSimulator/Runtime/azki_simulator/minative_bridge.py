@@ -14,7 +14,8 @@ from .bridge import (BridgeError, CAPABILITIES, SessionBridge, atomic_json,
 from .minative import MAX_RUN_SECONDS, MError, MinativeAdapter, _json, revalidate_plan
 from .adc_commands import supports_adc, get_raw, set_raw
 from .live_commands import live_get, live_set
-from .virtual_peer import COMMANDS as GUEST_COMMANDS
+from .device_buttons import supports_buttons
+from .virtual_peer import COMMANDS as GUEST_COMMANDS, supports_peer
 
 
 def create_minative_session(root, plan, *, instance_id=None, library_root=None,
@@ -64,6 +65,7 @@ class MinativeSessionBridge(SessionBridge):
         adapter_state = details.get("state", "ready")
         running = adapter_state in ("starting", "running", "stopping")
         failed = adapter_state == "failed" or self.last_error is not None
+        peer_available = supports_peer(self.plan)
         return {"id": self.session["id"], "state": "running" if running else "crashed" if failed else "stopped",
                 "adapterState": adapter_state, "backend": "minative", "profileID": self.plan["profileID"],
                 "launchMode": "native-sibling-sandboxes" if self.native_broker else "developer-inner-sandbox",
@@ -76,10 +78,12 @@ class MinativeSessionBridge(SessionBridge):
                 "executionApproved": self.approved_digest == self.plan["approvalDigest"],
                 "approvalDigest": self.plan["approvalDigest"], "maxRuntimeSeconds": self.max_runtime,
                 "hostProcessRunning": running, "bootVerified": False, "guestHealth": "unverified",
-                "guestInstallSupported": True, "capabilities": list(CAPABILITIES) +
-                    list(GUEST_COMMANDS) +
+                "guestConnectSupported": peer_available,
+                "guestInstallSupported": peer_available, "capabilities": list(CAPABILITIES) +
+                    (list(GUEST_COMMANDS) if peer_available else []) +
                     (["pmu-adc-get", "pmu-adc-set"] if supports_adc(self.plan) else []) +
-                    ["live-get", "live-set"],
+                    ["live-get", "live-set"] +
+                    (["device-button"] if supports_buttons(self.plan) else []),
                 "generation": self.generation, "hardwareInputs": ["touch"] +
                     (["pmu.adcRaw"] if supports_adc(self.plan) else []),
                 "width": self.width, "height": self.height}
@@ -182,6 +186,12 @@ class MinativeSessionBridge(SessionBridge):
         return set_raw(self.adapter, arguments)
 
     def live_get(self, arguments):
+        if supports_buttons(self.plan):
+            if arguments:
+                raise MError("invalid_live", "live-get takes no arguments")
+            return {"supported": {key: False for key in
+                ("steps", "heartRate", "charger", "batteryLevel", "batteryRaw", "temperature", "clock")},
+                "notes": {"settings": "Q65 暂未接入手环专属的实时输入和实例设置。"}, "state": {}}
         return live_get(self.adapter, arguments)
 
     def live_set(self, arguments):

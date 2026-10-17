@@ -39,7 +39,7 @@ export PATH="$(brew --prefix python@3.12)/libexec/bin:$PATH"
 ./scripts/build-dmg.sh
 ```
 
-需要包含 Swift 6.2 或更新版本的完整 Xcode。构建输出位于 `dist/`，包括 DMG、项目源码和引擎依赖源码包。完整步骤与参数见[构建说明](docs/BUILDING.md)。
+需要包含 Swift 6.2 或更新版本的完整 Xcode。任何构建的最终产物只输出到 `dist/`，该目录不包含缓存和中间文件；Debug 使用 `./scripts/build.sh debug`。完整步骤与参数见[构建说明](docs/BUILDING.md)。
 
 `VERSION` 管理应用版本；`BUILD_NUMBER` 是构建号起点，每次 Actions 构建自动在其基础上递增（起点 + 运行序号 − 1）。合并或直接推送到 `main` 会自动构建并发布到 Releases，也可以在 Actions 页面手动触发。工作流不需要 Apple 证书、密码或公证配置。
 
