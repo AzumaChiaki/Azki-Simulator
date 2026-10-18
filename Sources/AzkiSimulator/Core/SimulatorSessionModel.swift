@@ -283,6 +283,20 @@ final class SimulatorSessionModel {
         }
     }
 
+    /// Physical watch buttons (crown / lower key) exist only on the isolated
+    /// best1502p cores; the runtime capability mirrors the runner's support.
+    var deviceButtonsAvailable: Bool {
+        guard isRunning, case .array(let capabilities)? = status?["capabilities"] else { return false }
+        return capabilities.contains(.string("device-button"))
+    }
+
+    /// One physical watch-button click (crown or lower key). The runner owns
+    /// the timing (press, bounded gap, release) and validates the hardware.
+    func sendDeviceButton(_ button: String) {
+        guard deviceButtonsAvailable, !isCommandInFlight else { return }
+        perform("device-button", arguments: ["button": .string(button), "clicks": .number(1)])
+    }
+
     private func beginPolling(_ reader: SimulatorFrameReader, token: UUID) {
         polling = Task { [weak self] in
             var sequence: UInt32?

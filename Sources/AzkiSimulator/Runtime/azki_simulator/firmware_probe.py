@@ -8,6 +8,7 @@ without expanding its members.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 from pathlib import PurePosixPath
@@ -23,6 +24,7 @@ MAX_INPUT = 768 * 1024 * 1024
 MAX_AP = 64 * 1024 * 1024
 MAX_EXPANDED = 1024 * 1024 * 1024
 MAX_MEMBERS = 4096
+BES_ENVELOPE_MAGIC = b"\x60ZZ~"
 
 
 class ProbeError(ValueError):
@@ -197,11 +199,17 @@ def engine_ap(ap_data):
 
 
 def ota_recipe(fd, size):
-    """Runner recipe for any complete OTA ZIP: member boundaries, AP header,
+    """Runner recipe for any complete OTA: member boundaries, AP header,
     package version and the product models the AP itself declares. Only the AP
     member carries a digest, because that digest names the extracted AP object;
     no other member is read or hashed. Nothing is executed and no member name
-    becomes a host path."""
+    becomes a host path. Accepts both a plain OTA ZIP and the BES full-package
+    envelope (0x60ZZ~ header with an embedded per-member ZIP chain)."""
+    if os.pread(fd, 4, 0) == BES_ENVELOPE_MAGIC:
+        need(size <= MAX_INPUT, "固件包超过大小限制")
+        data = os.pread(fd, size, 0)
+        need(len(data) == size, "分析期间固件发生变化")
+        return _envelope_recipe(data)
     ap_data, archive = inventory(fd, size)
     ap = engine_ap(ap_data)
     records, small = [], {}
@@ -220,7 +228,7 @@ def ota_recipe(fd, size):
             if base == "vela_ap.bin":
                 record["sha256"] = ap["sha256"]
             records.append(record)
-            if base in ("ota.json", "version", "version.ini", "ota.sh") and info.file_size <= 65536:
+            if base in ("ota.json", "version", "version.ini", "ota.sh", "build.prop") and info.file_size <= 65536:
                 small.setdefault(base, zipped.read(info).decode("utf-8", "replace"))
     family, version = "", None
     if "ota.json" in small:
@@ -234,14 +242,106 @@ def ota_recipe(fd, size):
         version = version or _version(small.get(name))
     version = version or _version(ap.get("build", {}).get("VERSION"))
     if version is None:
-        # q65 packages carry the release in build.prop inside vela_ap.bin
-        # rather than in ota.json/version files. Keep this bounded to the AP.
-        match = re.search(rb"(?:ro\.build\.(?:id|version))=([0-9]+(?:\.[0-9]+){1,7})(?:\r?\n|\x00)", ap_data)
-        version = _version(match.group(1).decode("ascii", "ignore")) if match else None
+        # Families differ in where the release lives and which build.prop key
+        # carries it (ro.build.id, ro.build.version.incremental, ro.build.display.id,
+        # ...), so accept any ro.build.* assignment whose value looks like a
+        # release: first a packaged build.prop member, then the AP ROMFS bytes.
+        for raw in (small.get("build.prop", "").encode("utf-8", "replace"), ap_data):
+            # No trailing boundary: releases like "5.0.3-release" count; dotted
+            # requirement already excludes dates and raw unix timestamps.
+            match = re.search(rb"ro\.build\.[a-zA-Z_.]{1,40}=[ \t]*([0-9]+(?:\.[0-9]+){1,7})", raw)
+            version = _version(match.group(1).decode("ascii", "ignore")) if match else None
+            if version:
+                break
     version = version or "0"
     declared = sorted({m.decode("ascii") for m in DECLARED_MODEL.findall(ap_data)})[:64]
     return {"version": version, "family": family, "declaredModels": declared, "ap": ap,
             "partitions": records, "resourceLayout": archive["resourceLayout"]}
+
+
+def _inflate_member(data, record):
+    """Decompress one inventoried member from the envelope bytes."""
+    begin, packed = record["data_offset"], record["compressed_size"]
+    need(0 <= begin < begin + packed <= len(data), "成员数据越界")
+    if record["compression_method"] == 0:
+        output = data[begin:begin + packed]
+    elif record["compression_method"] == 8:
+        decoder = zlib.decompressobj(-15)
+        output = decoder.decompress(data[begin:begin + packed], record["size"] + 1)
+        need(decoder.eof and not decoder.unused_data and not decoder.unconsumed_tail,
+             "无效的成员压缩边界")
+    else:
+        raise ProbeError("不支持的成员压缩方式")
+    need(len(output) == record["size"] and zlib.crc32(output) == int(record["crc32"], 16),
+         "成员大小或 CRC 不匹配")
+    return output
+
+
+def _envelope_members(data):
+    """Members of a BES full-package envelope: a 0x60ZZ~ header with version,
+    a ZZZ~ resource table (count at +70, 128-byte records, CRC32 trailer) and
+    one absolute-offset single-member ZIP per entry. Records keep absolute
+    offsets so checked_member and the N67 YAFFS builder read the original bytes."""
+    need(len(data) >= 0x58 and data[:4] == BES_ENVELOPE_MAGIC, "不是 BES 整包信封")
+    base = struct.unpack_from("<I", data, 0x54)[0]
+    need(0 < base < len(data) and data[base:base + 4] == b"ZZZ~", "资源表缺失")
+    count = struct.unpack_from("<H", data, base + 70)[0]
+    end = base + 80 + count * 128
+    need(0 < count <= MAX_MEMBERS and end + 4 <= len(data), "资源表数量或范围无效")
+    need(zlib.crc32(data[base:end]) == struct.unpack_from("<I", data, end)[0], "资源表 CRC 不匹配")
+    records = []
+    for index in range(count):
+        at = base + 80 + index * 128
+        _flags, relative, length = struct.unpack_from("<III", data, at)
+        raw = data[at + 12:at + 128]
+        raw_path, separator, padding = raw.partition(b"\0")
+        need(separator and not any(padding), "资源路径不是零填充")
+        path = raw_path.decode("utf-8")
+        parts = path.split("/")
+        need(path.startswith("/") and all(part not in ("", ".", "..") for part in parts[1:]),
+             "资源路径不安全")
+        start, zip_end = base + relative, base + relative + length
+        need(0 < start < zip_end <= len(data), "资源 ZIP 越界")
+        head = data[start:start + 30]
+        need(len(head) == 30 and head[:4] == b"PK\x03\x04", "资源 ZIP 本地头缺失")
+        fields = struct.unpack("<4s5H3I2H", head)
+        nlen, elen = fields[-2], fields[-1]
+        name = data[start + 30:start + 30 + nlen].decode("utf-8", "replace")
+        need(PurePosixPath(path).name == name, "路径文件名与 ZIP 成员不一致")
+        with zipfile.ZipFile(io.BytesIO(data[start:zip_end])) as archive:
+            infos = archive.infolist()
+            need(len(infos) == 1 and infos[0].filename == name and infos[0].header_offset == 0,
+                 "资源 ZIP 必须恰好包含一个成员")
+            info = infos[0]
+        need(info.compress_type in (0, 8) and not info.flag_bits & ~0x808,
+             "固件成员包含链接、加密或不支持的压缩方式")
+        records.append({"index": index, "name": name, "header_offset": start,
+                        "data_offset": start + 30 + nlen + elen,
+                        "compressed_size": info.compress_size, "size": info.file_size,
+                        "compression_method": info.compress_type, "crc32": f"{info.CRC:08x}"})
+    return records
+
+
+def _envelope_recipe(data):
+    records = _envelope_members(data)
+    ap_entries = [record for record in records if record["name"] == "vela_ap.bin"]
+    need(len(ap_entries) == 1, "完整固件必须包含唯一 vela_ap.bin")
+    ap_data = _inflate_member(data, ap_entries[0])
+    ap = engine_ap(ap_data)
+    ap_entries[0]["sha256"] = ap["sha256"]
+    version = None
+    for record in records:
+        if record["name"] == "version.ini":
+            version = _version(_inflate_member(data, record).decode("utf-8", "replace"))
+            break
+    if version is None:
+        version = _version(data[4:24].split(b"\0", 1)[0].decode("ascii", "replace"))
+    if version is None:
+        match = re.search(rb"ro\.build\.[a-zA-Z_.]{1,40}=[ \t]*([0-9]+(?:\.[0-9]+){1,7})", ap_data)
+        version = _version(match.group(1).decode("ascii", "ignore")) if match else None
+    declared = sorted({m.decode("ascii") for m in DECLARED_MODEL.findall(ap_data)})[:64]
+    return {"version": version or "0", "family": "", "declaredModels": declared, "ap": ap,
+            "partitions": records, "resourceLayout": "multi-partition"}
 
 
 def inspect_firmware(source):
@@ -252,15 +352,25 @@ def inspect_firmware(source):
         result = {"version": 1, "bytes": before.st_size,
                   "executed": False, "modified": False, "compatibility": "unverified",
                   "guestDebuggingVerified": False, "versionWhitelistUsed": False}
-        if os.pread(fd, 4, 0) == b"PK\x03\x04":
+        head = os.pread(fd, 4, 0)
+        if head == b"PK\x03\x04":
             data, result["archive"] = inventory(fd, before.st_size)
             result["inputKind"] = "full-ota-zip"
+            result["ap"] = inspect_ap(data)
+        elif head == BES_ENVELOPE_MAGIC:
+            # The BES full-package envelope: report its own AP member and the
+            # embedded member count under the ZIP-compatible diagnostic shape.
+            recipe = _envelope_recipe(os.pread(fd, before.st_size, 0))
+            result["archive"] = {"members": len(recipe["partitions"]),
+                                 "resourceLayout": recipe["resourceLayout"]}
+            result["inputKind"] = "full-ota-zip"
+            result["ap"] = recipe["ap"]
         else:
             need(before.st_size <= MAX_AP, "非 ZIP 文件超过 AP 上限，需要识别其固件容器")
             data = os.pread(fd, before.st_size, 0)
             need(len(data) == before.st_size, "分析期间固件发生变化")
             result["inputKind"] = "ap-candidate"
-        result["ap"] = inspect_ap(data)
+            result["ap"] = inspect_ap(data)
         # The AP digest is the only identity that matters; no whole-file pass.
         result["sha256"] = result["ap"]["sha256"]
         result["nextStep"] = "导入后即按实例的硬件预设开机；不比对版本、不要求哈希匹配"

@@ -13,7 +13,7 @@ End users do not need these development dependencies.
 
 ## Output policy and Debug builds
 
-Every build puts its final artifacts directly in the repository's `dist/` directory. Only deliverable apps, DMGs and corresponding source archives belong there, never caches, logs, downloads or intermediate files. Work happens in a dedicated temporary directory outside the repository and is removed on success, failure or ordinary interruption (except SIGKILL, power loss or system crashes). No `.build/`, `.build-debug/` or `build/` workspace is retained.
+Every build puts its final artifacts directly in the repository's `dist/` directory. Only deliverable apps, DMGs and corresponding source archives belong there, never caches, logs, downloads or intermediate files. The repository's `build/` directory is an allowed persistent, reusable cache for downloads, extracted upstream sources, compiler caches and Swift scratch data, but it is never a delivery directory. One-off staging, packaged apps and DMG volumes use a dedicated temporary directory outside the repository and are removed on success, failure or ordinary interruption (except SIGKILL, power loss or system crashes).
 
 ```sh
 ./scripts/build.sh debug
@@ -40,7 +40,7 @@ The script builds the customized QEMU core, embedded Python and required depende
 | `AZKI_BUILD_JOBS` | Swift build parallelism; defaults to 2 |
 | `DEVELOPER_DIR` | Full Xcode developer directory to use |
 
-`AZKI_WORK_DIR` and `AZKI_BUILD_DIR` are no longer supported, preventing persistent work directories. Use `python3 -B scripts/build-engine.py` for a standalone engine: the defaults are `dist/Engine` and `dist/Engine-sources.tar.gz`, and both outputs must be direct children of `dist/`.
+Reuse `build/` for downloads and compilation caches when supported by the selected build command; never treat its cache or intermediate directories as deliverables. Use `python3 -B scripts/build-engine.py` for a standalone engine: the defaults are `dist/Engine` and `dist/Engine-sources.tar.gz`, and both outputs must be direct children of `dist/`. `AZKI_WORK_DIR` and `AZKI_BUILD_DIR` may only be used when explicitly supported by the selected script, and must never point final artifacts at `build/`.
 
 `VERSION` and `BUILD_NUMBER` populate `CFBundleShortVersionString` and `CFBundleVersion`. Local builds use the file value. GitHub Actions treats it as a base and increments automatically as base + run number − 1, writing only on the runner, never back to the repository; raise `BUILD_NUMBER` to skip ahead.
 

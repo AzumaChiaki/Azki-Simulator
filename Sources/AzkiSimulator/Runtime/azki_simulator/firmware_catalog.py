@@ -48,7 +48,7 @@ EXECUTION_PROFILES = INCLUDED_PROFILE_IDS
 # every other profile is "generated": the sandboxed runner derives storage from the pinned AP/OTA.
 PRODUCT_NAMES = {
     "n66": "小米手环 9", "n67": "小米手环 9 Pro", "o66": "小米手环 10", "p67": "小米手环 10 Pro", "q66": "小米手环 11",
-    "q65": "红米手表7"}
+    "p65": "红米手表6", "q65": "红米手表7"}
 BRANCH_NAMES = {
     "cn": "标准版", "nfc": "NFC 版", "tc": "陶瓷版", "lj": "耀影金版", "glt": "GLT", "u": "U", "": ""}
 
@@ -640,7 +640,8 @@ class FirmwareCatalog:
         """Instance hardware presets: every product model the catalog describes."""
         # q65 is metadata-only: its firmware is supplied by the user and is
         # intentionally not represented as a bundled profile.
-        return sorted({profile["model"] for profile in self.profiles.values()} | {"miwear.watch.q65"})
+        return sorted({profile["model"] for profile in self.profiles.values()} |
+                      {"miwear.watch.p65", "miwear.watch.q65"})
 
     def hardware_presets(self):
         """Instance hardware presets for the UI: model metadata, no firmware version."""
@@ -649,8 +650,10 @@ class FirmwareCatalog:
             rows.setdefault(profile["model"], {"model": profile["model"],
                                                "displayName": product_name(profile["model"]),
                                                "width": profile["width"], "height": profile["height"]})
+        rows.setdefault("miwear.watch.p65", {"model": "miwear.watch.p65", "displayName": "红米手表6", "width": 432, "height": 514})
         rows.setdefault("miwear.watch.q65", {"model": "miwear.watch.q65", "displayName": "红米手表7", "width": 432, "height": 514})
-        return [rows[model] for model in sorted(rows)]
+        tail = {"miwear.watch.p65": 0, "miwear.watch.q65": 1}
+        return [rows[model] for model in sorted(rows, key=lambda value: (value in tail, tail.get(value, 0), value))]
 
     def _object_path(self, digest, size, index):
         """Library (or permitted bundled) object path, else None."""
@@ -684,6 +687,7 @@ class FirmwareCatalog:
                     continue
                 sources[digest] = {"version": generic["version"], "ap": generic["apSHA256"],
                                    "apBytes": generic["apBytes"], "declaredModels": generic.get("declaredModels", []),
+                                   "boundModel": generic.get("boundModel"),
                                    "recipe": recipe}
             elif digest in self.imports and self.imports[digest]["kind"] == "ota":
                 profile = self.profiles[sorted(self.imports[digest]["profileIDs"])[0]]
@@ -699,12 +703,14 @@ class FirmwareCatalog:
         width, height = _geometry(model)
         ready = (self._object_path(source["ap"], source["apBytes"], index) is not None
                  and self._object_path(digest, index["objects"].get(digest, {}).get("bytes", -1), index) is not None)
+        isolated = model in ("miwear.watch.p65", "miwear.watch.q65")
         return {"id": profile_id, "displayName": display_name({"id": profile_id, "model": model,
                                                                 "version": source["version"]}) + " · " + digest[:8],
                 "device": model, "model": model, "firmwareVersion": source["version"],
+                "otaSHA256": digest,
                 "width": width, "height": height,
                 "availability": {"ready": ready, "assetsReady": ready,
-                                 "reason": "" if ready else "导入的固件文件已缺失，请重新导入",
+                                 "reason": ("" if ready else "导入的固件文件已缺失，请重新导入"),
                                  "missingRoles": [] if ready else ["ota"], "verification": "checked_at_launch"},
                 "source": "imported"}
 
@@ -721,15 +727,40 @@ class FirmwareCatalog:
         return any(digest.startswith(prefix) and source["version"] == version
                    for digest, source in self._generic_sources(self._index()).items())
 
+    def _candidate_models(self, generic, sha256):
+        """Profile IDs an unbound import offers: AP-declared models first."""
+        models = []
+        for code in sorted(generic.get("declaredModels") or []):
+            full = "miwear.watch." + code
+            if full in self.hardware_models:
+                models.append(full)
+            elif code in self.hardware_models:
+                models.append(code)
+        if not models:
+            models = self.hardware_models
+        return sorted(model + "@" + generic["version"] + "@" + sha256[:12] for model in models)
+
     def _generic_items(self, index, only=None):
         items = []
         for digest, source in sorted(self._generic_sources(index).items()):
             if only is not None and digest != only:
                 continue
-            declared = set(source.get("declaredModels", []))
-            # A q65 AP is a different BES1502P product and must never be
-            # offered as a runnable preset for the BES1503 band devices.
-            models = ["miwear.watch.q65"] if "q65" in declared else [m for m in self.hardware_models if m != "miwear.watch.q65"]
+            # Model isolation: an imported OTA appears only under the model the
+            # user bound it to at import time (boundModel). Older records fall
+            # back to the AP-declared models, then to the legacy expansion.
+            bound = source.get("boundModel")
+            if bound in self.hardware_models:
+                models = [bound]
+            else:
+                models = []
+                for code in sorted(source.get("declaredModels") or []):
+                    full = "miwear.watch." + code
+                    if full in self.hardware_models:
+                        models.append(full)
+                    elif code in self.hardware_models:
+                        models.append(code)
+                if not source.get("declaredModels") and bound is None:
+                    models = self.hardware_models
             for model in models:
                 items.append(self._generic_item(model, digest, source, index))
         return items
@@ -751,8 +782,7 @@ class FirmwareCatalog:
         index = self._index()
         sources = self._generic_sources(index)
         matches = [digest for digest, source in sources.items()
-                   if digest.startswith(prefix) and source["version"] == version
-                   and ((model == "miwear.watch.q65") == ("q65" in source.get("declaredModels", [])))]
+                   if digest.startswith(prefix) and source["version"] == version]
         _need(len(matches) == 1, "unknown_profile", "所选导入固件已不在固件库中，请重新导入", profileID=profile_id)
         digest = matches[0]
         source = sources[digest]
@@ -788,7 +818,7 @@ class FirmwareCatalog:
                 "catalogSHA256": self.catalog_sha256,
                 "executionApproved": False}
 
-    def import_file(self, source, profile_id=None):
+    def import_file(self, source, model=None):
         source = _path(source)
         self._index(create=True)
         root_fd = _owned_directory(self.library_root, create=True)
@@ -851,8 +881,10 @@ class FirmwareCatalog:
             from .firmware_probe import ProbeError, ota_recipe
             input_fd = os.open("input", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=stage_fd)
             try:
-                _need(os.pread(input_fd, 4, 0) == b"PK\x03\x04", "unknown_firmware",
-                      "请导入完整 OTA 固件包（ZIP，包含 vela_ap.bin 和资源）；单独的 AP 文件缺少启动所需的资源",
+                # A complete OTA is either a plain ZIP or the BES full-package
+                # envelope (0x60ZZ~ header, embedded per-member ZIP chain).
+                _need(os.pread(input_fd, 4, 0) in (b"PK\x03\x04", b"\x60ZZ~"), "unknown_firmware",
+                      "请导入完整 OTA 固件包（ZIP 或 BES 整包 bin，包含 vela_ap.bin 和资源）；单独的 AP 文件缺少启动所需的资源",
                       sha256=actual["sha256"])
                 try:
                     generic = ota_recipe(input_fd, actual["bytes"])
@@ -863,11 +895,19 @@ class FirmwareCatalog:
                 os.close(input_fd)
             ap_record = next(r for r in generic["partitions"] if r["name"].rsplit("/", 1)[-1] == "vela_ap.bin")
             entry = {"kind": "ota", "profileIDs": [], "members": [{"asset": generic["ap"]["sha256"], "record": ap_record}]}
-            declared = set(generic.get("declaredModels", []))
-            candidate_models = ["miwear.watch.q65"] if "q65" in declared else [m for m in self.hardware_models if m != "miwear.watch.q65"]
-            candidates = sorted(model + "@" + generic["version"] + "@" + actual["sha256"][:12]
-                                for model in candidate_models)
-            _need(profile_id is None or profile_id in candidates, "profile_mismatch", "此固件不属于所选配置", candidateIDs=candidates)
+            # Model binding only. The user's selected preset owns visibility:
+            # the import is bound to that model and appears nowhere else. No
+            # firmware capability is validated here — the structural inventory
+            # above is all the import requires; the run itself reports whether
+            # the firmware works on the instance hardware.
+            bound_model = None
+            if model:
+                _need(model in self.hardware_models, "unknown_profile",
+                      "此机型预设不存在，无法绑定导入的固件", model=model)
+                bound_model = model
+                entry["profileIDs"] = [model + "@" + generic["version"] + "@" + actual["sha256"][:12]]
+            candidates = ([model + "@" + generic["version"] + "@" + actual["sha256"][:12]] if bound_model else
+                          self._candidate_models(generic, actual["sha256"]))
             _need(existing_total + actual["bytes"] + sum(member["record"]["size"] for member in entry.get("members", [])) <= MAX_LIBRARY,
                   "library_quota", "固件包的临时展开将超过私有库容量限制")
             os.replace("input", actual["sha256"], src_dir_fd=stage_fd, dst_dir_fd=stage_fd)
@@ -901,6 +941,7 @@ class FirmwareCatalog:
                       "profileIDs": sorted(entry["profileIDs"]), "importedAtUnix": int(time.time()),
                       "generic": {"version": generic["version"], "family": generic["family"],
                                   "declaredModels": generic["declaredModels"],
+                                  "boundModel": bound_model,
                                   "apSHA256": generic["ap"]["sha256"], "apBytes": generic["ap"]["size"],
                                   "recipe": {"ap": generic["ap"], "partitions": generic["partitions"],
                                              "family": generic["family"]}}}
@@ -912,12 +953,24 @@ class FirmwareCatalog:
             anchored()
             _atomic_json(self.library_root / "index.json", index, directory_fd=root_fd)
             anchored()
-            chosen = [profile_id] if profile_id else candidates
+            # The receipt always carries the item matching every candidate ID:
+            # the Swift decoder rejects a receipt whose items do not cover its
+            # candidates, so build the bound item directly instead of relying
+            # on the catalog listing's filtering.
+            source_view = {"version": generic["version"], "ap": generic["ap"]["sha256"],
+                           "apBytes": generic["ap"]["size"], "declaredModels": generic["declaredModels"],
+                           "boundModel": bound_model,
+                           "recipe": {"ap": generic["ap"], "partitions": generic["partitions"],
+                                      "family": generic["family"]}}
+            if bound_model:
+                items = [self._generic_item(bound_model, actual["sha256"], source_view, index)]
+            else:
+                items = [item for item in self._generic_items(index, only=actual["sha256"])
+                         if item["id"] in candidates]
             return {"version": 1, "recognized": True, "imported": True, "inputKind": entry["kind"],
-                    "sha256": actual["sha256"], "needsSelection": profile_id is None and len(candidates) > 1,
-                    "candidateIDs": candidates,
-                    "items": [self._item(self.profiles[key], index) for key in chosen if key in self.profiles]
-                             + [item for item in self._generic_items(index, only=actual["sha256"]) if item["id"] in chosen]}
+                    "sha256": actual["sha256"],
+                    "needsSelection": bound_model is None and len(candidates) > 1,
+                    "candidateIDs": candidates, "items": items}
         finally:
             if stage_fd is not None:
                 for name, identity in created.items():
@@ -938,6 +991,165 @@ class FirmwareCatalog:
                 os.close(lock)
             if objects_fd is not None:
                 os.close(objects_fd)
+            os.close(root_fd)
+
+    def delete_import(self, sha256, force=False):
+        """Remove one imported OTA and the object files only it references.
+
+        The OTA object and any extracted member objects that no other import
+        shares are unlinked; objects still referenced by another import stay.
+        When the catalog has drifted or the import record is missing, delete is
+        still attempted (force): the object file named by the SHA-256 is reclaimed
+        if no other import depends on it, so a stale index never blocks removal.
+        The commit point is a single atomic index write.
+        """
+        _need(_sha(sha256), "invalid_sha", "固件标识无效")
+        if self.library_root is None:
+            raise CatalogError("library_required", "尚未配置私有固件库")
+        root_fd = _owned_directory(self.library_root)
+        lock = objects_fd = None
+        try:
+            lock = os.open(".import.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=root_fd)
+            info = os.fstat(lock)
+            _need(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid(),
+                  "unsafe_library", "私有固件库锁文件不安全")
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                os.fchmod(lock, 0o600)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise CatalogError("library_busy", "固件库正在导入或清理，请稍后重试") from error
+            # Abandoned staging from an interrupted import is cleared here; any
+            # other entry is the user's and never blocks a delete.
+            _recover_library(root_fd)
+            index = self._index()
+            import_records = [it for it in index["imports"]
+                              if isinstance(it, dict) and it.get("sha256") == sha256]
+            if not import_records:
+                if not force:
+                    _need(False, "not_found", "固件库中找不到该固件")
+                # Force: the catalog lost the record (or it was never indexed).
+                # Reclaim the object file only if nothing else still needs it.
+                referenced = set()
+                for it in index["imports"]:
+                    if not isinstance(it, dict):
+                        continue
+                    referenced.add(it.get("sha256"))
+                    for member in it.get("members", []):
+                        referenced.add(member.get("asset") if isinstance(member, dict) else None)
+                remove = [sha256] if (sha256 not in referenced and sha256 in index["objects"]) else []
+                objects_fd = _owned_directory(self.library_root / "objects", create=True)
+                try:
+                    for digest in remove:
+                        try:
+                            os.unlink(digest, dir_fd=objects_fd)
+                        except FileNotFoundError:
+                            pass
+                        index["objects"].pop(digest, None)
+                finally:
+                    os.close(objects_fd)
+                    objects_fd = None
+                index["imports"] = [it for it in index["imports"]
+                                    if not (isinstance(it, dict) and it.get("sha256") == sha256)]
+                index["generation"] += 1
+                _atomic_json(self.library_root / "index.json", index, directory_fd=root_fd)
+                return {"ok": True, "version": 1, "removed": remove, "forced": not remove}
+            # Only the objects owned exclusively by these records are reclaimed;
+            # any object another import also references stays intact. Generic
+            # OTA imports own their AP object too (generic.apSHA256); without
+            # it every delete would orphan a 10-15 MiB object file.
+            owned = {sha256}
+            for rec in import_records:
+                generic = rec.get("generic") if isinstance(rec, dict) else None
+                if isinstance(generic, dict) and _sha(generic.get("apSHA256")):
+                    owned.add(generic["apSHA256"])
+                for member in rec.get("members", []):
+                    if isinstance(member, dict) and _sha(member.get("asset")):
+                        owned.add(member["asset"])
+            protected = set()
+            for it in index["imports"]:
+                if not isinstance(it, dict) or it.get("sha256") == sha256:
+                    continue
+                protected.add(it.get("sha256"))
+                generic = it.get("generic") if isinstance(it, dict) else None
+                if isinstance(generic, dict) and _sha(generic.get("apSHA256")):
+                    protected.add(generic["apSHA256"])
+                for member in it.get("members", []):
+                    if isinstance(member, dict):
+                        protected.add(member.get("asset"))
+            remove = sorted(digest for digest in owned if digest in index["objects"] and digest not in protected)
+            objects_fd = _owned_directory(self.library_root / "objects", create=True)
+            try:
+                for digest in remove:
+                    try:
+                        os.unlink(digest, dir_fd=objects_fd)
+                    except FileNotFoundError:
+                        pass
+                    index["objects"].pop(digest, None)
+            finally:
+                os.close(objects_fd)
+                objects_fd = None
+            index["imports"] = [it for it in index["imports"]
+                                if not (isinstance(it, dict) and it.get("sha256") == sha256)]
+            index["generation"] += 1
+            _atomic_json(self.library_root / "index.json", index, directory_fd=root_fd)
+            return {"ok": True, "version": 1, "removed": remove}
+        finally:
+            if objects_fd is not None:
+                os.close(objects_fd)
+            if lock is not None:
+                os.close(lock)
+            os.close(root_fd)
+
+    def delete_all_imports(self):
+        """Remove every imported firmware and reclaim all library object files.
+
+        The bundled catalog lives in the Engine, not the library, so every object
+        here belongs to an import; clearing the index and the objects directory
+        leaves the library empty and ready for fresh imports. The commit point is
+        a single atomic index write.
+        """
+        if self.library_root is None:
+            raise CatalogError("library_required", "尚未配置私有固件库")
+        root_fd = _owned_directory(self.library_root)
+        lock = objects_fd = None
+        try:
+            lock = os.open(".import.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=root_fd)
+            info = os.fstat(lock)
+            _need(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid(),
+                  "unsafe_library", "私有固件库锁文件不安全")
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                os.fchmod(lock, 0o600)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise CatalogError("library_busy", "固件库正在导入或清理，请稍后重试") from error
+            _recover_library(root_fd)
+            index = self._index()
+            removed = []
+            objects_fd = _owned_directory(self.library_root / "objects", create=True)
+            try:
+                for digest in list(index.get("objects", {})):
+                    if not _sha(digest):
+                        continue
+                    try:
+                        os.unlink(digest, dir_fd=objects_fd)
+                    except FileNotFoundError:
+                        pass
+                    removed.append(digest)
+            finally:
+                os.close(objects_fd)
+                objects_fd = None
+            index["objects"] = {}
+            index["imports"] = []
+            index["generation"] += 1
+            _atomic_json(self.library_root / "index.json", index, directory_fd=root_fd)
+            return {"ok": True, "version": 1, "removed": removed}
+        finally:
+            if objects_fd is not None:
+                os.close(objects_fd)
+            if lock is not None:
+                os.close(lock)
             os.close(root_fd)
 
 

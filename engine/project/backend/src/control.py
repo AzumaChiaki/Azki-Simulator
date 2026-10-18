@@ -364,7 +364,7 @@ class WatchControl:
         if set(data) == {'x', 'y', 'down'}:
             self.touch(data['x'], data['y'], data['down'])
             return {}
-        if set(data) == {'command', 'button', 'clicks'} and data['command'] == 'q65.button':
+        if set(data) == {'command', 'button', 'clicks'} and data['command'] in ('q65.button', 'p65.button'):
             return self.device_button(data['button'], data['clicks'])
         if set(data) == {'command'} and data['command'] == 'pmu.adcRaw.get':
             return self.adc_raw()
@@ -392,10 +392,11 @@ class WatchControl:
         if (type(button) is not str or button not in ('lower', 'crown') or
                 type(clicks) is not int or clicks not in (1, 2) or
                 (button == 'crown' and clicks != 1)):
-            raise ValueError('q65.button requires lower with 1/2 clicks or crown with 1 click')
+            raise ValueError('device button requires lower with 1/2 clicks or crown with 1 click')
         with self.lock:
-            if self.qmp.execute('qom-get', {'path': '/machine', 'property': 'type'}) != 'azki-q65-machine':
-                raise RuntimeError('unsupported_hardware_input: q65 requires the isolated azki-q65 core')
+            machine_type = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'type'})
+            if machine_type not in ('azki-q65-machine', 'azki-p65-machine'):
+                raise RuntimeError('unsupported_hardware_input: device buttons require an isolated watch core')
             if self._servers_stop.is_set():
                 raise RuntimeError('Instance is stopping')
             mouse_button = 'right' if button == 'lower' else 'middle'

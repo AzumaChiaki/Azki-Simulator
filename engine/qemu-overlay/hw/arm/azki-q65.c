@@ -2779,7 +2779,8 @@ static void touch_irq(Best1503State *s)
     BesGpio *g = &s->gpio[2];
     uint32_t bit = 1u << 12;
     bool available = touch_powered(s) && s->touch.queue_count &&
-                     s->touch.mode == 9 && !s->touch.sleep_mode &&
+                     (s->touch.mode == 1 || s->touch.mode == 9) &&
+                     !s->touch.sleep_mode &&
                      !s->touch.bootloader;
     bool low = available && !s->touch.irq_rearm_pending;
     bool old = !!(g->input & bit), level = !low;
@@ -2804,7 +2805,8 @@ static void touch_irq_rearm(void *opaque)
     BesTouch *t = &s->touch;
     uint32_t bit = 1u << 12;
 
-    if (!touch_powered(s) || !t->queue_count || t->mode != 9 ||
+    if (!touch_powered(s) || !t->queue_count ||
+        (t->mode != 1 && t->mode != 9) ||
         t->sleep_mode || t->bootloader) {
         touch_irq(s);
         return;
@@ -2913,10 +2915,14 @@ static void touch_mouse(void *opaque, int x, int y, int z, int buttons)
     bool down = buttons & MOUSE_EVENT_LBUTTON;
     unsigned px = CLAMP(x, 0, 32767) * (LCD_WIDTH - 1u) / 32767;
     unsigned py = CLAMP(y, 0, 32767) * (LCD_HEIGHT - 1u) / 32767;
-    if (!touch_powered(s) || t->mode != 9 || t->sleep_mode || t->bootloader ||
+    /* D101 selects normal reporting and D109 selects the reporting mode
+     * used after panel wake. Both produce the same D000 contact packets;
+     * firmware builds differ in which mode they configure. */
+    bool reporting = t->mode == 1 || t->mode == 9;
+    if (!touch_powered(s) || !reporting || t->sleep_mode || t->bootloader ||
         (!down && !t->host_down) ||
         (down == t->host_down && px == t->x && py == t->y)) {
-        if (down && (!touch_powered(s) || t->mode != 9 || t->sleep_mode || t->bootloader)) {
+        if (down && (!touch_powered(s) || !reporting || t->sleep_mode || t->bootloader)) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "BES touch input inactive: powered=%u mode=%u sleep=%u bootloader=%u\n",
                           touch_powered(s), t->mode, t->sleep_mode, t->bootloader);
@@ -3034,6 +3040,8 @@ static bool touch_read_byte(Best1503State *s, uint16_t reg, uint8_t *value)
     case 0xd204: v = 0x93170001; break; /* IC type / project */
     case 0xd208: v = 1; break; /* version */
     case 0xd21c: v = 0x93170002; break; /* sum of the four info words */
+    case 0xd220: v = 1; break; /* firmware configuration version */
+    case 0xd224: v = 0xcaca9317; break; /* read-only part number / signature */
     case 0xd20c: v = 1; break;
     case 0xd1f4: v = 0x0014000a; break; /* 10 TX, 20 RX, no keys */
     case 0xd048:

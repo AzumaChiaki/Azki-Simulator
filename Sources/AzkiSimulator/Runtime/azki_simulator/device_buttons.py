@@ -9,7 +9,7 @@ def supports_buttons(plan):
     if type(plan) is not dict or type(plan.get('identity')) is not dict:
         return False
     profile = plan['identity'].get('profile')
-    return type(profile) is dict and profile.get('model') == 'miwear.watch.q65'
+    return type(profile) is dict and profile.get('model') in ('miwear.watch.p65', 'miwear.watch.q65')
 
 
 def click_button(adapter, arguments):
@@ -19,10 +19,11 @@ def click_button(adapter, arguments):
             (arguments['button'] == 'crown' and arguments['clicks'] != 1)):
         raise MError('invalid_button', '下键支持单击/双击，表冠仅支持单击')
     if adapter is None:
-        raise MError('not_running', '请先启动红米手表7')
+        raise MError('not_running', '请先启动设备')
     if not supports_buttons(adapter.plan):
-        raise MError('unsupported_hardware', '此按钮仅支持 miwear.watch.q65')
-    payload = runner_exchange(adapter, {'command': 'q65.button', **arguments}, write=True,
+        raise MError('unsupported_hardware', '此按钮仅支持红米手表6/7')
+    model = adapter.plan['identity']['profile'].get('model')
+    payload = runner_exchange(adapter, {'command': ('p65.button' if model == 'miwear.watch.p65' else 'q65.button'), **arguments}, write=True,
                               deadline=time.monotonic() + DEADLINE_SECONDS)
     result = _decode(payload)
     if type(result) is dict and set(result) == {'error'}:

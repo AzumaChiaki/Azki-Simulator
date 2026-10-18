@@ -13,11 +13,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from azki_simulator.bridge import SessionBridge, create_session, request, private_root, regular_bytes, MAX_MESSAGE
 
 
-BUNDLED_ACTIONS = ("library-catalog", "library-import", "library-probe", "prepare-bundled", "instance-storage-finish",
+BUNDLED_ACTIONS = ("library-catalog", "library-import", "library-delete", "library-delete-all", "library-probe", "prepare-bundled", "instance-storage-finish",
                    "instance-identity", "instance-settings", "instance-delete", "instance-reset", "sessions-cleanup")
 ACTION_FAILURES = {
     "library-catalog": "读取固件库失败，请稍后重试",
     "library-import": "导入固件失败，请确认所选文件是完整的 OTA 固件包后重试",
+    "library-delete": "删除固件失败，请确认该固件已停止相关实例后重试",
+    "library-delete-all": "清空固件库失败，请确认没有正在运行的实例后重试",
     "library-probe": "无法识别所选固件文件",
     "prepare-bundled": "准备启动实例失败；可在实例管理中重置该实例后重试，已保存的数据不受影响",
     "instance-storage-finish": "保存本次运行的数据失败；已保存的快照保持不变，下次启动会自动整理",
@@ -38,7 +40,11 @@ def main():
         library.add_argument("--library-root", type=Path, required=True)
         if action in ("library-import", "library-probe"):
             library.add_argument("--input", type=Path, required=True)
+        if action == "library-delete":
+            library.add_argument("--sha256", required=True, help="要删除的导入 OTA 对象的完整 SHA-256")
         if action == "library-import":
+            library.add_argument("--model",
+                                 help="绑定此导入到用户选择的实例机型（完整模型名，如 miwear.watch.p65）")
             library.add_argument("--profile-id")
         if action == "prepare-bundled":
             library.add_argument("--profile-id", required=True)
@@ -216,13 +222,21 @@ def bundled_action(args):
     runtime = runtime_readiness(engine)
     catalog = FirmwareCatalog(engine.parent / "Firmware", args.library_root,
                               distribution="public" if runtime.get("profile") == "public" else None)
+    if args.action == "library-delete":
+        # Remove one imported OTA and reclaim only its exclusively-owned objects.
+        # Force: a stale or missing index record never blocks removal, so a
+        # firmware the UI still lists can always be deleted.
+        return catalog.delete_import(args.sha256, force=True)
+    if args.action == "library-delete-all":
+        # Remove every imported firmware and reclaim all library object files.
+        return catalog.delete_all_imports()
     if args.action == "library-catalog":
         # items: firmware the user imported. presets: instance hardware presets,
         # which are device metadata and never a locked firmware version list.
         return {"ok": True, "version": 1, "items": catalog.list_items(),
                 "presets": catalog.hardware_presets(), "runtime": runtime}
     if args.action == "library-import":
-        return {"ok": True, "version": 1, **catalog.import_file(args.input, profile_id=args.profile_id)}
+        return {"ok": True, "version": 1, **catalog.import_file(args.input, model=args.model)}
     return prepare_profile(engine, args.library_root, args.profile_id, args.session_root,
                            reservation_nonce=getattr(args, "reservation_nonce", None),
                            instance_id=getattr(args, "instance_id", None),

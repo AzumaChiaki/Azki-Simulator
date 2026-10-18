@@ -13,6 +13,9 @@ struct AzkiSimulatorApp: App {
         }
         .defaultSize(width: 1_300, height: 860)
         .windowResizability(.contentMinSize)
+        Settings {
+            SimulatorSettingsView(library: library)
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("新建设备实例…") { library.creationRequested = true }

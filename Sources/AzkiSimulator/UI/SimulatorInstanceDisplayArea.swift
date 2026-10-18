@@ -73,7 +73,8 @@ import SwiftUI
             if let geometry = session.manifest?.displayGeometry {
                 let size = layout.canvasSize(geometry.size)
                 SimulatorNativeCanvas(image: session.image, geometry: geometry,
-                                      acceptsInput: session.canInput, onInput: session.sendInput)
+                                      acceptsInput: session.canInput, onInput: session.sendInput,
+                                      onDeviceButton: { session.sendDeviceButton($0) })
                     .frame(width: size.width, height: size.height)
                     .accessibilityIdentifier("simulator.canvas.\(instance.id.uuidString)")
             }

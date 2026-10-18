@@ -50,7 +50,10 @@ def _descriptor(identity, ap, model, _historical_reason):
         'protocol': 'miwear-psk1-q66' if family in ('q65', 'q66') else 'miwear-psk1-literal16',
         'verifyMode': 1, 'requiresSMPBond': True,
         'factoryFormat': 'legacy-fixed-8k' if legacy else 'n67-config-journal' if family == 'n67' else 'littlefs-8192x16',
-        'factoryPropertyFile': 'app_nv.prop' if family == 'p67' else 'factory.prop' if family in ('q65', 'q66') else None,
+        # P65 carries the same 128 KiB littlefs factory partition as Q65/Q66
+        # (p65-oobe evidence: the guest does not mount it as /misc but boots
+        # fine with a valid image present; the reference runner always wrote one).
+        'factoryPropertyFile': 'app_nv.prop' if family == 'p67' else 'factory.prop' if family in ('p65', 'q65', 'q66') else None,
         'factoryBytes': 8192 if legacy or family == 'n67' else 128 * 1024,
         'configBytes': 16384 if family == 'n67' else 0,
         'pskEncoding': 'ascii-hex32' if family in ('q65', 'q66') else 'hex-of-ascii16',
@@ -68,7 +71,7 @@ PROFILE_DESCRIPTORS = MappingProxyType({identity: _descriptor(identity, ap, mode
 
 
 # Any firmware build of these families: "<model>@<version>@<OTA SHA prefix>".
-_FIRMWARE_PROFILE = re.compile(r'(miwear\.watch\.(n66|n67|o66|p67|q65|q66)[a-z]{0,8})@[0-9][0-9.]{0,31}@[0-9a-f]{12}')
+_FIRMWARE_PROFILE = re.compile(r'(miwear\.watch\.(n66|n67|o66|p65|p67|q65|q66)[a-z]{0,8})@[0-9][0-9.]{0,31}@[0-9a-f]{12}')
 
 
 def descriptor_for(profile_id, ap_sha256=None):

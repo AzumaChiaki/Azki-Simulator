@@ -274,7 +274,12 @@ final class StandaloneRuntimeModel {
         defer { operationCount -= 1 }
         let receipt: FirmwareImportReceipt
         do {
-            receipt = try FirmwareImportReceipt.decode(await runHelper(["library-import", "--input", url.path]))
+            // Bind the import to the user's selected hardware profile: the
+            // imported OTA becomes visible only under that model, with no
+            // firmware capability validation beyond the structural inventory.
+            var arguments = ["library-import", "--input", url.path]
+            if let model = selectedFirmware?.model { arguments += ["--model", model] }
+            receipt = try FirmwareImportReceipt.decode(await runHelper(arguments))
         } catch {
             guard token == revision, !Task.isCancelled, !isStopping else { return }
             let importFailure = error.localizedDescription
@@ -317,6 +322,73 @@ final class StandaloneRuntimeModel {
             errorMessage = error.localizedDescription
             importFailureMessage = error.localizedDescription
         }
+    }
+
+    /// Remove one imported firmware from the library. The CLI deletes the OTA
+    /// and AP objects under the library lock, then rewrites the index. A
+    /// running instance keeps its open inode until it stops, so deletion is
+    /// safe while a device runs. Returns success; failures set errorMessage.
+    @discardableResult func deleteFirmware(sha256: String) async -> Bool {
+        // Library deletion is independent of any running device: the CLI's
+        // library lock serializes writers and unlinked objects stay alive for
+        // open handles. Blocking on isServing/isAttached here made the button
+        // silently do nothing while a VM was up.
+        guard !isBusy else {
+            errorMessage = "有固件库操作正在进行，请稍后重试。"
+            return false
+        }
+        let token = revision
+        operationCount += 1
+        errorMessage = nil
+        var failure: String?
+        do {
+            _ = try await runHelper(["library-delete", "--sha256", sha256])
+        } catch {
+            failure = error.localizedDescription
+        }
+        // Leave the busy window BEFORE refreshing: loadCatalog guards on
+        // isBusy, so refreshing inside this window silently skipped the
+        // reload and the deleted item stayed on screen.
+        operationCount -= 1
+        if let failure {
+            guard token == revision, !Task.isCancelled else { return false }
+            errorMessage = failure
+            return false
+        }
+        guard token == revision, !Task.isCancelled, !isStopping else { return false }
+        await loadCatalog()
+        return true
+    }
+
+    /// Remove every imported firmware from the library. The CLI unlinks all
+    /// library object files and empties the index in a single atomic write.
+    /// Running instances should be stopped first; this never touches the bundled
+    /// catalog or instance records.
+    @discardableResult func deleteAllFirmware() async -> Bool {
+        // Same rationale as deleteFirmware: safe alongside a running device.
+        guard !isBusy else {
+            errorMessage = "有固件库操作正在进行，请稍后重试。"
+            return false
+        }
+        let token = revision
+        operationCount += 1
+        errorMessage = nil
+        var failure: String?
+        do {
+            _ = try await runHelper(["library-delete-all"])
+        } catch {
+            failure = error.localizedDescription
+        }
+        // Same as deleteFirmware: refresh outside the busy window.
+        operationCount -= 1
+        if let failure {
+            guard token == revision, !Task.isCancelled else { return false }
+            errorMessage = failure
+            return false
+        }
+        guard token == revision, !Task.isCancelled, !isStopping else { return false }
+        await loadCatalog()
+        return true
     }
 
     /// Prepare happens internally after the user's Run action. It never starts

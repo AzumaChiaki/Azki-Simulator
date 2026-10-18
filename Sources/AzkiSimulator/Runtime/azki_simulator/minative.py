@@ -277,7 +277,7 @@ def _geometry(model):
         return 336, 480
     if model == "q66" or model.startswith(("miwear.watch.o66", "miwear.watch.q66")):
         return 212, 520
-    if model == "miwear.watch.q65":
+    if model in ("miwear.watch.p65", "miwear.watch.q65"):
         return 432, 514
     raise MError("unsupported_profile", "Model is outside the Mi Band scope")
 
@@ -565,7 +565,7 @@ def _catalog(project):
         raise MError("invalid_catalog", "Catalog is missing a scoped profile")
     for key in ids:
         row = known[key]
-        chip = "best1502p" if row.get("model") == "miwear.watch.q65" else "best1503"
+        chip = "best1502p" if row.get("model") in ("miwear.watch.p65", "miwear.watch.q65") else "best1503"
         if (row.get("ap", {}).get("chip") != chip
                 or "@".join(key.split("@")[:2]) != str(row.get("model")) + "@" + str(row.get("version"))):
             raise MError("invalid_catalog", "Profile and supported board identity disagree")
@@ -749,7 +749,7 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
     if not dependency_paths or not bridge_paths:
         raise MError("identity_incomplete", "Explicit interpreter/dependency and bridge identity paths are required")
     profile = rows[profile_id]
-    expected_chip = "best1502p" if profile["model"] == "miwear.watch.q65" else "best1503"
+    expected_chip = "best1502p" if profile["model"] in ("miwear.watch.p65", "miwear.watch.q65") else "best1503"
     if expected_chip == "best1502p":
         # Q65 has independent AP-derived storage, but no band ADC ABI.
         runtime_capabilities = {key: value for key, value in runtime_capabilities.items()

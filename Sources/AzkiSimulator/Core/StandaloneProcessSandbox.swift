@@ -281,13 +281,39 @@ nonisolated enum StandaloneProcessSandbox {
         switch command {
         case "library-catalog":
             guard arguments.count == 1 else { throw SimulatorError.transport("目录命令参数无效") }
+        case "library-delete":
+            // Removes an imported OTA object and rewrites the library index; it
+            // writes only inside the firmware library root.
+            guard arguments.count == 3, arguments[1] == "--sha256",
+                  FirmwareLibraryValidation.digest(arguments[2]) else {
+                throw SimulatorError.transport("删除参数无效")
+            }
+            writes.append(library)
+        case "library-delete-all":
+            // Clears every imported firmware and rewrites the library index; it
+            // writes only inside the firmware library root.
+            guard arguments.count == 1 else { throw SimulatorError.transport("清空参数无效") }
+            writes.append(library)
         case "library-import", "library-probe":
-            guard arguments.count == 3, arguments[1] == "--input" else { throw SimulatorError.transport("导入参数无效") }
+            // library-import optionally binds the OTA to the user's selected
+            // hardware model: ["library-import", "--input", PATH, "--model", MODEL].
+            guard arguments.count == 3 || arguments.count == 5,
+                  arguments[1] == "--input",
+                  arguments.count == 3 || arguments[3] == "--model" else {
+                throw SimulatorError.transport("导入参数无效")
+            }
             let url = try StandaloneSandboxFiles.canonicalURL(arguments[2])
             // Validate type/owner without loading a potentially large OTA.
             try validateInput(url)
             inputs.append(url)
-            if command == "library-import" { writes.append(library) }
+            if command == "library-import" {
+                if arguments.count == 5 {
+                    guard FirmwareLibraryValidation.identifier(arguments[4]) else {
+                        throw SimulatorError.transport("导入机型参数无效")
+                    }
+                }
+                writes.append(library)
+            }
         case "prepare-bundled":
             let arguments = ["--skip-oobe", "--no-skip-oobe"].contains(arguments.last ?? "")
                 ? Array(arguments.dropLast()) : arguments
@@ -422,7 +448,7 @@ nonisolated enum StandaloneProcessSandbox {
         // imported OTA of a supported preset) gets its AP-derived layout from
         // the helper, which decides whether the identity is enabled.
         return layouts[profile] != nil
-            || profile.range(of: #"^miwear\.watch\.(n66|n67|o66|p67|q65|q66)[a-z]{0,8}@[0-9][0-9.]{0,31}@[0-9a-f]{12}$"#,
+            || profile.range(of: #"^miwear\.watch\.(n66|n67|o66|p65|p67|q65|q66)[a-z]{0,8}@[0-9][0-9.]{0,31}@[0-9a-f]{12}$"#,
                              options: .regularExpression) != nil
     }
 

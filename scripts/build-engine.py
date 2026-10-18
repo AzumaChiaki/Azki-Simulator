@@ -49,6 +49,10 @@ class DownloadRateLimited(Exception):
     """The source temporarily rejected a request; the caller may fall back."""
 
 
+class DownloadTransientFailure(Exception):
+    """A retryable transport failure exhausted one range request."""
+
+
 def response_headers(text):
     # curl includes proxy and redirect headers; only the final response counts.
     for block in reversed(re.split(r'\r?\n\r?\n', text.strip())):
@@ -101,6 +105,16 @@ def parallel_download(url, temporary, size, metadata):
                     time.sleep(delay)
                     continue
                 if result.returncode:
+                    # curl 6/7/18/28/35/47/52/55/56 are connection or
+                    # transfer failures seen with public CDNs. Retry the
+                    # segment, then abandon ranges for a single request.
+                    transient = result.returncode in (6, 7, 18, 28, 35, 47, 52, 55, 56)
+                    if transient and attempt < 5:
+                        time.sleep(min(60.0, 2.0 ** (attempt - 1)))
+                        continue
+                    if transient:
+                        raise DownloadTransientFailure(
+                            f'Range download failed ({result.returncode}) after {attempt} attempts: {result.stderr.strip()}')
                     raise RuntimeError(f'Range download failed ({result.returncode}): {result.stderr.strip()}')
                 content_range=re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',headers.get('content-range',''))
                 if status!=206 or not content_range or tuple(map(int,content_range.groups()))!=(start,end,size):
@@ -125,7 +139,18 @@ def parallel_download(url, temporary, size, metadata):
             raise RuntimeError('Combined download has an incorrect length')
 
 
-def download(url, target):
+def _range_default(target):
+    # Public GNU mirrors commonly rate-limit concurrent ranges.  Keep range
+    # requests for the two large, stable upstream archives only; small Homebrew
+    # formula sources are more reliable as one retried request.
+    if os.environ.get('AZKI_DOWNLOAD_RANGES') == '1':
+        return True
+    return target.name in {f'qemu-{QEMU_VERSION}.tar.xz',
+                           f'Python-{PYTHON_VERSION}.tar.xz'}
+
+
+def _download_one(url, target, *, allow_ranges=None):
+    """Download one URL into target, leaving no partial file on failure."""
     if target.exists():return target
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary=target.with_name(target.name+'.part')
@@ -136,13 +161,14 @@ def download(url, target):
         status,metadata=response_headers(head.stdout)
         length=metadata.get('content-length','')
         size=int(length) if length.isdecimal() else 0
-        ranged=(head.returncode==0 and status==200 and size>16*1024*1024
+        ranged=(allow_ranges is not False and (allow_ranges is True or _range_default(target))
+                and head.returncode==0 and status==200 and size>16*1024*1024
                 and metadata.get('accept-ranges','').lower()=='bytes'
                 and metadata.get('content-encoding','identity').lower()=='identity')
         if ranged:
             try:
                 parallel_download(url,temporary,size,metadata)
-            except (RangeDownloadUnavailable, DownloadRateLimited) as error:
+            except (RangeDownloadUnavailable, DownloadRateLimited, DownloadTransientFailure) as error:
                 print(f'{error}; falling back to a single download',flush=True)
                 ranged=False
         if not ranged:
@@ -171,6 +197,27 @@ def download(url, target):
         return target
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def download(url, target, alternates=()):
+    """Download from URL candidates, preserving the first working artifact."""
+    urls = [url] if isinstance(url, str) else list(url)
+    urls += list(alternates)
+    seen = set()
+    last_error = None
+    for candidate in urls:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            return _download_one(candidate, target)
+        except Exception as error:
+            last_error = error
+            print(f'Download failed from {candidate}: {error}; trying next mirror', flush=True)
+            target.with_name(target.name + '.part').unlink(missing_ok=True)
+    if last_error is not None:
+        raise last_error
+    raise ValueError('No source URL was provided')
 
 
 def unpack(archive, parent):
@@ -266,7 +313,7 @@ def relocate(engine, brew, source_delivery):
         recipe=keg/'.brew'/f'{formula}.rb'
         if not recipe.is_file():raise RuntimeError('Installed source recipe missing: '+str(recipe))
         recipe_text=recipe.read_text()
-        urls=re.findall(r'^\s*url\s+[\"\']([^\"\']+)[\"\']',recipe_text,re.M)
+        urls=re.findall(r'^\s*(?:url|mirror)\s+[\"\']([^\"\']+)[\"\']',recipe_text,re.M)
         if not urls or '#{' in urls[0]:raise RuntimeError('Cannot resolve installed source URL: '+str(recipe))
         # The recipe inside this installed keg, rather than today's formula API,
         # records the exact library version used by this binary.
@@ -274,7 +321,7 @@ def relocate(engine, brew, source_delivery):
         shutil.copy2(recipe,d/'formula.rb')
         shutil.copy2(keg/'INSTALL_RECEIPT.json',d/'INSTALL_RECEIPT.json')
         url = urls[0]
-        archive = download(url, d/Path(url.split('?')[0]).name)
+        archive = download(url, d/Path(url.split('?')[0]).name, urls[1:])
         # Source package itself preserves complete license notices. Also expose
         # root license/copyright files inside Engine for binary recipients.
         notice_dir = engine/'licenses'/formula; notice_dir.mkdir(parents=True,exist_ok=True)
@@ -332,14 +379,23 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
     if platform.system()!='Darwin' or platform.machine()!='arm64':
         raise RuntimeError('macOS arm64 build host required')
     args=argparse.Namespace(jobs=jobs or min(os.cpu_count() or 2,8),build_python=build_python,tools_dir=tools_dir)
-    work.mkdir(parents=True,exist_ok=True)
+    # Persistent dependency cache under the repository build/ directory so that
+    # downloaded tarballs, extracted upstream sources, configured build trees and
+    # compiled wheels survive across runs. Only the final engine staging dirs
+    # (engine/source_output) stay ephemeral. Override with AZKI_ENGINE_CACHE.
+    cache = Path(os.environ.get('AZKI_ENGINE_CACHE') or (ROOT / 'build')).resolve()
+    cache.mkdir(parents=True, exist_ok=True)
+    for name in ('downloads', 'source', 'qemu-build', 'python-build',
+                 'python-install', 'wheels', 'python-packages',
+                 'corresponding-source', 'pip-cache', 'tmp'):
+        (cache / name).mkdir(parents=True, exist_ok=True)
     brew=shutil.which('brew')
     if not brew: raise RuntimeError('Homebrew build dependencies are required; see README')
     builder=args.build_python or Path(output([brew,'--prefix','python@3.12']))/'bin/python3.12'
     if not builder.is_file(): raise RuntimeError('Install python@3.12 for building wheels')
     env=os.environ.copy(); env['MACOSX_DEPLOYMENT_TARGET']='15.0'
-    temporary=work/'tmp';temporary.mkdir(exist_ok=True)
-    env['TMPDIR']=str(temporary);env['PIP_CACHE_DIR']=str(work/'pip-cache')
+    temporary=cache/'tmp'
+    env['TMPDIR']=str(temporary);env['PIP_CACHE_DIR']=str(cache/'pip-cache')
     # Some portable builder Pythons record their original, now absent compiler
     # paths in sysconfig. Use the selected Xcode tools for native extensions.
     for key,tool in (('CC','clang'),('CXX','clang++'),('AR','ar'),('RANLIB','ranlib')):
@@ -353,8 +409,8 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
     env['PKG_CONFIG_PATH']=os.pathsep.join(str(prefix/'opt'/f/'lib/pkgconfig') for f in ('glib','libffi','pcre2','zstd','dtc'))
     env['PKG_CONFIG_PATH']+=os.pathsep+sdk+'/usr/lib/pkgconfig'
     env['CPATH']=str(prefix/'include'); env['LIBRARY_PATH']=str(prefix/'lib')
-    downloads=work/'downloads'; sources=work/'source'; sources.mkdir(exist_ok=True)
-    delivery=work/'corresponding-source';delivery.mkdir(exist_ok=True)
+    downloads=cache/'downloads'; sources=cache/'source'; sources.mkdir(exist_ok=True)
+    delivery=cache/'corresponding-source';delivery.mkdir(exist_ok=True)
     q_archive=download(f'https://download.qemu.org/qemu-{QEMU_VERSION}.tar.xz',downloads/f'qemu-{QEMU_VERSION}.tar.xz')
     p_archive=download(f'https://www.python.org/ftp/python/{PYTHON_VERSION}/Python-{PYTHON_VERSION}.tar.xz',downloads/f'Python-{PYTHON_VERSION}.tar.xz')
     qsource=sources/f'qemu-{QEMU_VERSION}'; psource=sources/f'Python-{PYTHON_VERSION}'
@@ -363,7 +419,7 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
             unpack(archive,sources)
             (source/'.azki-extracted').touch()
     copytree(INPUT/'qemu-overlay',qsource)
-    qbuild=work/'qemu-build';qbuild.mkdir(exist_ok=True)
+    qbuild=cache/'qemu-build';qbuild.mkdir(exist_ok=True)
     if not (qbuild/'build.ninja').exists():
         run([qsource/'configure','--target-list=arm-softmmu','--with-devices-arm=mi-emu','--without-default-devices',
              '--disable-docs','--disable-tools','--disable-guest-agent','--disable-gtk','--disable-sdl','--disable-vnc',
@@ -372,16 +428,22 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
     run(['ninja','-C',qbuild,'-j',args.jobs,'qemu-system-arm'],env=env)
     # Build a non-framework Python with its normal prefix-relative layout.
     # No user Python, Homebrew, pip or network is needed on the target Mac.
-    pbuild=work/'python-build';pbuild.mkdir(exist_ok=True)
-    pyinstall=work/'python-install'
+    pbuild=cache/'python-build';pbuild.mkdir(exist_ok=True)
+    pyinstall=cache/'python-install'
     if not (pbuild/'Makefile').exists():
         run([psource/'configure','--prefix='+str(pyinstall),'--with-ensurepip=no','--disable-test-modules',
              '--with-openssl='+output([brew,'--prefix','openssl@3'])],cwd=pbuild,env=env)
     run(['make','-j',args.jobs],cwd=pbuild,env=env)
     run(['make','install'],cwd=pbuild,env=env)
-    wheels=work/'wheels';wheels.mkdir(exist_ok=True)
+    wheels=cache/'wheels';wheels.mkdir(exist_ok=True)
     package_sources=delivery/'python-packages';package_sources.mkdir(exist_ok=True)
     for package,version in PACKAGES.items():
+        # Reuse a previously built wheel for this exact package/version so the
+        # PyPI metadata fetch, sdist download and native build are all skipped.
+        cached=[p for p in wheels.glob('*.whl') if p.name.lower().startswith(package.lower()+'-') and version in p.name]
+        if cached:
+            print(f'Reusing cached wheel {cached[0].name}', flush=True)
+            continue
         # Always deliver the pinned source and build it with this recipe.  A
         # cached wheel may use different optional features or dependencies and
         # is not a substitute for its corresponding source distribution.

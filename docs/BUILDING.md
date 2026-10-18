@@ -13,7 +13,7 @@
 
 ## 输出规则与 Debug 编译
 
-所有编译的最终产物都直接放在仓库根目录 `dist/`，该目录只放应用、DMG 和对应源码交付包，不放缓存、日志、下载或中间文件。中间文件使用仓库外的专用临时目录，成功、失败或常规中断时都会清理（强制 SIGKILL、断电或系统崩溃除外）；不再保留 `.build/`、`.build-debug/` 或 `build/`。
+所有编译的最终产物都直接放在仓库根目录 `dist/`，该目录只放应用、DMG 和对应源码交付包，不放缓存、日志、下载或中间文件。仓库根目录 `build/` 可作为持久、可复用的构建缓存区，保存下载包、展开的上游源码、编译缓存和 Swift scratch，但绝不能作为交付目录。待打包 App、DMG volume 及一次性 staging 使用仓库外的专用临时目录，成功、失败或常规中断时都会清理（强制 SIGKILL、断电或系统崩溃除外）。
 
 ```sh
 ./scripts/build.sh debug
@@ -40,7 +40,7 @@ export PATH="$(brew --prefix python@3.12)/libexec/bin:$PATH"
 | `AZKI_BUILD_JOBS` | Swift 并行任务数，默认 2 |
 | `DEVELOPER_DIR` | 要使用的完整 Xcode 开发目录 |
 
-`AZKI_WORK_DIR` 和 `AZKI_BUILD_DIR` 已不再支持，避免遗留工作目录。独立引擎构建使用 `python3 -B scripts/build-engine.py`，默认最终输出为 `dist/Engine` 和 `dist/Engine-sources.tar.gz`；引擎与其源码包也必须直接位于 `dist/`。
+`build/` 可复用以减少重复下载和编译；不要把 `build/` 中的缓存或中间目录当作交付物。独立引擎构建使用 `python3 -B scripts/build-engine.py`，默认最终输出为 `dist/Engine` 和 `dist/Engine-sources.tar.gz`；引擎与其源码包也必须直接位于 `dist/`。`AZKI_WORK_DIR` 与 `AZKI_BUILD_DIR` 仅在脚本明确支持时使用，不能把最终产物写到 `build/`。
 
 `VERSION` 与 `BUILD_NUMBER` 分别写入 `CFBundleShortVersionString` 和 `CFBundleVersion`。本地构建直接使用文件中的值。GitHub Actions 把它作为起点，按“起点 + 运行序号 − 1”自动递增，只在构建机上写入，不回写仓库；需要跳号时调大 `BUILD_NUMBER` 即可。
 

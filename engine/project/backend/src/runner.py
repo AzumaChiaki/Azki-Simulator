@@ -253,6 +253,10 @@ def main():
     parser.add_argument('--resource', type=Path, nargs='?', metavar='IMAGE',
                         const=here / 'firmware/vela_resource.bin',
                         help='Load resource ROMFS (default image: firmware/vela_resource.bin in this project)')
+    parser.add_argument('--audio-image', type=Path,
+                        help='Load the product audio image (P65 only)')
+    parser.add_argument('--sensor-image', type=Path,
+                        help='Load the product sensor image (P65 only)')
     parser.add_argument('--bluetooth', choices=('reject', 'bluez', 'hci', 'virtual'), default='reject',
                         help='reject: startup fixture; bluez: virtual radio; hci: real phone via Linux adapter')
     parser.add_argument('--hci-socket', type=Path,
@@ -361,9 +365,9 @@ def main():
                     'pmu-calibration','panel-te-pin','touch-i2c','touch-power-pin',
                     'touch-reset-pin','touch-irq-pin','touch-module-id','touch-health-format','charger-i2c',
                     'charger-id','charger-map','pmu-adc-ntc','pmu-adc-ntc-room','config-offset','config-bytes',
-                    'nand-data-bytes'}
+                    'nand-data-bytes','ram-bytes'}
         geometry = board['geometry']
-        if board.get('chip') != 'best1503' or not allowed <= set(geometry) or set(geometry)-allowed-optional or any(
+        if board.get('chip') not in ('best1503', 'best1502p') or not allowed <= set(geometry) or set(geometry)-allowed-optional or any(
                 type(v) is not int or not 0 <= v <= 0xffffffff for v in geometry.values()):
             parser.error('Unsupported board profile or invalid memory geometry')
         if virtual_state is not None:
@@ -499,6 +503,10 @@ def main():
         parser.error(f'Firmware missing: {args.firmware}')
     if args.resource and not args.resource.is_file():
         parser.error(f'Resource image missing: {args.resource}')
+    if args.audio_image and not args.audio_image.is_file():
+        parser.error(f'Audio image missing: {args.audio_image}')
+    if args.sensor_image and not args.sensor_image.is_file():
+        parser.error(f'Sensor image missing: {args.sensor_image}')
     try:
         display_backend = qemu_display_backend(args.qemu, args.window)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
@@ -524,6 +532,27 @@ def main():
             args.factory_image.chmod(0o600)
             stream.write(image)
         print('Local setup properties installed; desktop boot still requires verification. No account binding.', flush=True)
+    if args.skip_binding and board.get('machine') == 'azki-p65':
+        # P65 never mounts the Q65 misc LittleFS as /misc: its rc.sysinit
+        # sources properties from /tmp/factory.prop and /etc/build.prop in the
+        # AP ROMFS. Mirror the verified reference fixture: patch a boot copy of
+        # the AP's /build.prop with the local OOBE properties; the original
+        # firmware file stays untouched.
+        from p65_setup import local_boot_image
+        boot_firmware = logdir / 'p65-local-setup-ap.bin'
+        if boot_firmware == args.firmware:
+            parser.error('--firmware must be the original image, not the generated boot copy')
+        try:
+            image = local_boot_image(args.firmware.read_bytes())
+        except (OSError, ValueError, RuntimeError) as error:
+            # Require a structurally valid P65 watch ROMFS; never fall back to
+            # an unmodified OOBE image or another model's firmware.
+            parser.error(str(error))
+        with boot_firmware.open('wb') as stream:
+            boot_firmware.chmod(0o600)
+            stream.write(image)
+        args.firmware = boot_firmware
+        print('P65 local OOBE properties prepared in /etc/build.prop (boot copy; original firmware unchanged).', flush=True)
     if instance_nor is not None and instance_nor['norInitialize']:
         try:
             initialize_startup_nor(instance_nor, virtual_state,
@@ -573,9 +602,13 @@ def main():
     frame_file = logdir / 'lcd-frame.raw'
     with tempfile.TemporaryDirectory(prefix='q66-qmp-') as temporary, ExitStack() as cleanup:
         qmp_path = Path(temporary) / 'qmp.sock'
-        machine = 'best1503'
-        for name, value in geometry.items():
-            machine += f',{name}={value}'
+        machine = board.get('machine', 'best1503')
+        isolated_p65 = machine == 'azki-p65'
+        # Generic BEST1503 consumes board geometry as QOM properties. The
+        # isolated P65 core has a fixed memory map and rejects those options.
+        if machine == 'best1503':
+            for name, value in geometry.items():
+                machine += f',{name}={value}'
         if args.bluetooth == 'virtual':
             from .virtual_peer.service import PeerService
             virtual_peer = PeerService(temporary,logdir,virtual_state,args.virtual_peer_output,args.virtual_peer_state_sha256).start()
@@ -600,18 +633,22 @@ def main():
             radio_socket = args.hci_socket.resolve()
             machine += ',bt-hci-chardev=radio'
             print('Real Bluetooth H4: ' + str(radio_socket), flush=True)
-        if boot_clock is not None:
+        if boot_clock is not None and not isolated_p65:
             # The PMU RTC (read directly by some firmware) starts at the same wall time.
             machine += f',rtc-seconds={boot_clock}'
         if args.resource:
             machine += ',resource-image=' + str(args.resource.resolve()).replace(',', ',,')
-        if instance_storage:
+        if args.audio_image:
+            machine += ',audio-image=' + str(args.audio_image.resolve()).replace(',', ',,')
+        if args.sensor_image:
+            machine += ',sensor-image=' + str(args.sensor_image.resolve()).replace(',', ',,')
+        if instance_storage and not isolated_p65:
             machine += instance_machine_options(instance_storage)
             print('Private instance NAND transaction: ' + instance_storage['dataImage'], flush=True)
-        if instance_nor:
+        if instance_nor and not isolated_p65:
             machine += instance_nor_machine_options(instance_nor)
             print('Private instance NOR transaction: ' + instance_nor['norImage'], flush=True)
-        if args.data_image:
+        if args.data_image and not isolated_p65:
             machine += ',data-image=' + str(args.data_image.resolve()).replace(',', ',,')
             print('Local UI NAND seed: ' + str(args.data_image.resolve()), flush=True)
         if args.factory_image:
@@ -626,7 +663,7 @@ def main():
                 machine += f',revision-id={value}'
             elif value:
                 machine += ',' + name.replace('_', '-') + '=on'
-        if instance_settings is not None:
+        if instance_settings is not None and not isolated_p65:
             # Host-authored board inputs resolved against this instance's
             # hardware preset; a rejected value stops the boot instead of
             # silently running with a different device.
@@ -707,16 +744,24 @@ def main():
                             raise RuntimeError('GDB server port could not be determined')
                         print(f"GDB server: target remote 127.0.0.1:{gdb_endpoint['port']}"
                               + ('; CPU held at reset until the debugger continues.' if args.gdb_wait else ''), flush=True)
-                    (logdir / 'control.json').write_text(json.dumps(dict(
+                    # best1502p machines (azki-p65) have no band ADC ABI: the
+                    # parent strips the pmuAdcRaw capability from their plan
+                    # and its control validator rejects a hardware_inputs
+                    # record, so only best1503 runners publish one.
+                    control_record = dict(
                         qmp=str(qmp_path), framebuffer=str(frame_file), pid=proc.pid,
-                        input_socket=str(input_socket) if has_input else None,
-                        hardware_inputs={'pmu.adcRaw': {
+                        input_socket=str(input_socket) if has_input else None)
+                    if not isolated_p65:
+                        control_record['hardware_inputs'] = {'pmu.adcRaw': {
                             'supported': adc_raw, 'schema': 1, 'channels': 8,
                             'minimum': 0, 'maximum': 65535,
                             'unit': 'uncalibrated-raw',
-                            'readEvidence': 'guest-ispi-fifo-dequeue'}},
-                        **({'virtual_peer':virtual_peer.descriptor()} if virtual_peer is not None else {}),
-                        **({'gdb': gdb_endpoint} if gdb_endpoint is not None else {})), indent=2) + '\n')
+                            'readEvidence': 'guest-ispi-fifo-dequeue'}}
+                    if virtual_peer is not None:
+                        control_record['virtual_peer'] = virtual_peer.descriptor()
+                    if gdb_endpoint is not None:
+                        control_record['gdb'] = gdb_endpoint
+                    (logdir / 'control.json').write_text(json.dumps(control_record, indent=2) + '\n')
                     if args.lcd_frame_capture:
                         print('LCD framebuffer: ' + str(frame_file), flush=True)
                     if args.serve is not None:
@@ -727,7 +772,12 @@ def main():
                         native_window = NativeWindow(control)
                         native_window.start()
                         print('Python window started (direct QEMU LCD; 30 FPS refresh).', flush=True)
-                    runtime_settings = instance_settings_runtime(instance_settings) if instance_settings is not None else []
+                    # azki-p65 does not expose the generic battery-charger
+                    # QOM property used by BEST1503 sessions. Keep settings
+                    # for host bookkeeping, but never issue unsupported QMP
+                    # writes to the isolated P65 core.
+                    runtime_settings = (instance_settings_runtime(instance_settings)
+                                        if instance_settings is not None and not isolated_p65 else [])
                     # Guest-progress seconds: wall time minus time the CPU was
                     # held by a debugger (or -S). Without --gdb this is wall time.
                     halted_total, halted_since, state_check_due = 0.0, None, 0

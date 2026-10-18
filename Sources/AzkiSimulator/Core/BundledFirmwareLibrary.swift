@@ -15,6 +15,7 @@ nonisolated struct BundledFirmwareItem: Codable, Identifiable, Equatable, Sendab
     let device: String
     let model: String
     let firmwareVersion: String
+    let otaSHA256: String
     let width: Int
     let height: Int
     let availability: Availability
@@ -23,6 +24,7 @@ nonisolated struct BundledFirmwareItem: Codable, Identifiable, Equatable, Sendab
     func validate() throws {
         guard FirmwareLibraryValidation.identifier(id),
               [displayName, device, model, firmwareVersion].allSatisfy({ FirmwareLibraryValidation.text($0, limit: 240) }),
+              FirmwareLibraryValidation.digest(otaSHA256),
               [(192, 490), (212, 520), (336, 480), (432, 514)].contains(where: { $0 == (width, height) }),
               FirmwareLibraryValidation.text(availability.reason, limit: 1_024, empty: true),
               availability.missingRoles.count <= 32,

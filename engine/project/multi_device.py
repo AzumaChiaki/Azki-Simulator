@@ -8,7 +8,7 @@ import re
 import struct
 import sys
 
-from device_catalog import ROOT, digest, load_catalog, prepare_storage, select
+from device_catalog import ROOT, digest, load_catalog, prepare_storage, select, zip_member_records
 
 BACKEND = ROOT/'backend'
 
@@ -74,6 +74,27 @@ def board_profile(profile, resource_bytes, storage_kind='romfs'):
     if profile['model'] == 'miwear.watch.q65':
         from backend.src.q65_runner import board_profile as q65_board
         return q65_board(profile)
+    if profile['model'] == 'miwear.watch.p65':
+        ap = profile['ap']
+        ap_data = Path(profile['ap_path']).read_bytes()
+        if len(ap_data) != ap['size']:
+            raise ValueError('P65 AP byte count differs from selected metadata')
+        geometry = {'ap-offset': 0xc0000, 'reset-sp': ap['reset_sp'],
+                    'flash-bytes': 0x1000000, 'factory-offset': 0xfe0000,
+                    'nv-offset': 0xcc0000, 'nand-data-offset': 220 * 1024**2,
+                    'nand-data-bytes': 292 * 1024**2, 'ram-bytes': 0x1a0000}
+        board = {'profile_id': profile['id'], 'chip': 'best1502p', 'machine': 'azki-p65',
+                 'ap_sha256': ap['sha256'], 'local_setup_bypass': True,
+                 'geometry': geometry, 'factory_bytes': 128 * 1024,
+                 'nor_geometry': {'profileID': profile['id'], 'apSHA256': ap['sha256'],
+                                  'apBytes': ap['size'], 'apOffset': 0xc0000,
+                                  'flashBytes': 0x1000000, 'offset': 0xcc0000,
+                                  'bytes': 0x340000, 'factoryOffset': 0xfe0000},
+                 'evidence': {'source': 'P65 BEST1502P AP-derived geometry',
+                              'apOffset': '0xc0000', 'factoryData': '0xcc0000/0x40000'}}
+        from backend.src.instance_data import validate_nor_geometry
+        validate_nor_geometry(board, ap_sha256=ap['sha256'], ap_bytes=ap['size'])
+        return board
     if ap['chip']!='best1503':
         raise ValueError(ap['backend_requirement'])
     ap_data = Path(profile['ap_path']).read_bytes()
@@ -238,7 +259,8 @@ def main():
         if profile['model'] == 'miwear.watch.q65':
             from backend.src.q65_runner import run
             return run(profile, args)
-        if profile['ap']['chip']!='best1503': raise ValueError(profile['ap']['backend_requirement'])
+        if profile['model'] != 'miwear.watch.p65' and profile['ap']['chip']!='best1503':
+            raise ValueError(profile['ap']['backend_requirement'])
         qemu_sha256 = None  # No startup full-core hash; release manifest owns provenance.
         resource,resource_sha,storage_kind=prepare_storage(profile)
         board=board_profile(profile,resource.stat().st_size,storage_kind)
@@ -291,9 +313,49 @@ def main():
     from src.qmp import QMP
     from src import runner
     runner.QMP=lambda path:QMP(path,timeout=2)
+    if profile['model'] == 'miwear.watch.p65':
+        from firmware_resources import checked_member
+        package = Path(profile['ota_path']).read_bytes()
+        # Some firmware-library entries were imported before their partition
+        # manifest was persisted. Re-index the selected OTA itself in that
+        # case; the actual member names and sizes are authoritative, and no
+        # model-name validation is introduced here.
+        ota_records = profile.get('partitions') or []
+        if not any(record.get('name') in ('vela_audio_img.bin', 'vela_audio.bin')
+                   for record in ota_records) or not any(
+                       record.get('name') in ('vela_sensor_img.bin', 'vela_sensor.bin')
+                       for record in ota_records):
+            ota_records = zip_member_records(profile['ota_path'])
+        # P65 OTAs name the audio/sensor sub-images without the _img suffix used
+        # by other models (Q65 ships vela_audio_img.bin); some builds ship
+        # vela_audio.bin. Only a ROMFS audio image is consumable by the
+        # machine's audio-image option; P65's raw BES audio partition
+        # (vela_audio.bin, magic 0x1cec57be) is not ROMFS and the reference
+        # runner never passes it for P65, so it is skipped. The sensor image
+        # is a raw BES image (magic 0xbe57ec1c) and always maps.
+        args.audio_image = None
+        audio_records = [r for r in ota_records if r['name'] == 'vela_audio_img.bin']
+        if len(audio_records) == 1 and 0 < audio_records[0]['size'] <= 5 * 1024**2:
+            image_path = logdir / audio_records[0]['name']
+            image_path.write_bytes(checked_member(package, audio_records[0], verify_sha=False))
+            image_path.chmod(0o600)
+            args.audio_image = image_path
+        sensor_records = [r for r in ota_records
+                          if r['name'] in ('vela_sensor_img.bin', 'vela_sensor.bin')]
+        if len(sensor_records) != 1 or not 0 < sensor_records[0]['size'] <= 4 * 1024**2:
+            parser.error('P65 OTA must contain one bounded sensor image among '
+                         'vela_sensor_img.bin/vela_sensor.bin')
+        image_path = logdir / sensor_records[0]['name']
+        image_path.write_bytes(checked_member(package, sensor_records[0], verify_sha=False))
+        image_path.chmod(0o600)
+        args.sensor_image = image_path
     sys.argv=[str(BACKEND/'run.py'),'--bluetooth','virtual' if virtual_requested else 'reject',
         '--firmware',profile['ap_path'],'--resource',str(resource),'--board-profile',str(board_path),
         '--qemu',str(BACKEND/'build/qemu-system-arm'),'--log-dir',str(logdir)]
+    if profile['model'] == 'miwear.watch.p65':
+        if args.audio_image:
+            sys.argv += ['--audio-image', str(args.audio_image)]
+        sys.argv += ['--sensor-image', str(args.sensor_image)]
     sys.argv.append('--skip-oobe' if args.skip_oobe else '--no-skip-oobe')
     if board['local_setup_bypass']:sys.argv+=['--skip-binding']
     if instance_storage:

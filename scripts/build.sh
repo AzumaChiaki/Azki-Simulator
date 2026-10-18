@@ -11,20 +11,25 @@ output="$(azki_dist_output)"
 version="$(tr -d '\n\r' < "$root/VERSION")"
 number="$(tr -d '\n\r' < "$root/BUILD_NUMBER")"
 name="Azki-Simulator-$version-build$number-$configuration"
-for target in "$output/Azki Simulator.app" "$output/$name-engine-sources.tar.gz" "$output/$name-source.tar.gz"; do
-  test ! -e "$target" || { echo "Output exists: $target; move or clean it first." >&2; exit 2; }
-done
 azki_temporary_work
+# Everything is produced inside the disposable work directory first; dist is
+# only touched at the final commit below, so a failed build never disturbs
+# the previously shipped artifacts.
+stage="$azki_work/stage"
+mkdir -p "$stage"
 python3 -B - "$root" "$azki_work" <<'PY'
 import pathlib, runpy, sys
 root, work = map(pathlib.Path, sys.argv[1:])
 module = runpy.run_path(str(root / 'scripts/build-engine.py'))
 module['build_engine'](work / 'engine-build', work / 'Engine', work / 'engine-sources.tar.gz')
 PY
-AZKI_BUILD_CONFIGURATION="$configuration" "$root/scripts/build-app.sh" "$azki_work/Engine"
+AZKI_BUILD_CONFIGURATION="$configuration" "$root/scripts/build-app.sh" "$azki_work/Engine" "$stage"
 COPYFILE_DISABLE=1 /usr/bin/tar -czf "$azki_work/source.tar.gz" -C "$root" \
   --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' \
   Package.swift VERSION BUILD_NUMBER LICENSE README.md README.en.md docs Assets Sources engine scripts .github .gitignore
-mv -- "$azki_work/engine-sources.tar.gz" "$output/$name-engine-sources.tar.gz"
-mv -- "$azki_work/source.tar.gz" "$output/$name-source.tar.gz"
+mv -- "$azki_work/engine-sources.tar.gz" "$stage/$name-engine-sources.tar.gz"
+mv -- "$azki_work/source.tar.gz" "$stage/$name-source.tar.gz"
+# Commit point: the whole build succeeded, so replace dist atomically-ish.
+find "$output" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+for item in "$stage"/*; do mv -- "$item" "$output/"; done
 printf '\nApp: %s\n' "$output/Azki Simulator.app"

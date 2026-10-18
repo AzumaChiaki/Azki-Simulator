@@ -34,7 +34,7 @@ import SwiftUI
               seconds.isFinite, seconds.rounded() == seconds, (1...Double(StandaloneRunLimits.maximumSeconds)).contains(seconds) else { return nil }
         return Int(seconds)
     }
-    private var q65ButtonsAvailable: Bool {
+    private var watchButtonsAvailable: Bool {
         guard controlsAvailable, !runtime.isStopping, session.isRunning,
               case .array(let capabilities)? = session.status?["capabilities"] else { return false }
         return capabilities.contains(.string("device-button"))
@@ -79,20 +79,20 @@ import SwiftUI
                     .keyboardShortcut(".", modifiers: .command)
                     .help(runtime.isStopping ? "正在停止…" : "停止设备（⌘.）；启动或检查进行中时会取消该操作")
                     .accessibilityIdentifier("simulator.stop")
-                    if (runtime.modelConstraint ?? runtime.selectedFirmware?.model) == "miwear.watch.q65" {
-                        action("点击表冠", icon: "button.programmable", enabled: q65ButtonsAvailable) {
+                    if ["miwear.watch.p65", "miwear.watch.q65"].contains(runtime.modelConstraint ?? runtime.selectedFirmware?.model) {
+                        action("点击表冠", icon: "button.programmable", enabled: watchButtonsAvailable) {
                             session.perform("device-button", arguments: ["button": .string("crown"), "clicks": .number(1)])
                         }
-                        .accessibilityIdentifier("simulator.q65.crown")
-                        action("单击下键", icon: "hand.tap", enabled: q65ButtonsAvailable) {
+                        .accessibilityIdentifier("simulator.watch.crown")
+                        action("单击下键", icon: "hand.tap", enabled: watchButtonsAvailable) {
                             session.perform("device-button", arguments: ["button": .string("lower"), "clicks": .number(1)])
                         }
-                        .accessibilityIdentifier("simulator.q65.lower.single")
-                        action("双击下键", icon: "hand.tap", enabled: q65ButtonsAvailable) {
+                        .accessibilityIdentifier("simulator.watch.lower.single")
+                        action("双击下键", icon: "hand.tap", enabled: watchButtonsAvailable) {
                             session.perform("device-button", arguments: ["button": .string("lower"), "clicks": .number(2)])
                         }
                         .help("依次执行两次单击下键")
-                        .accessibilityIdentifier("simulator.q65.lower.double")
+                        .accessibilityIdentifier("simulator.watch.lower.double")
                     }
                     if runtime.instanceID != nil {
                         action("重置实例", icon: "arrow.counterclockwise.circle", enabled: !runtime.isStopping) {

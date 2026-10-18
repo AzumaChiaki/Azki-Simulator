@@ -87,7 +87,8 @@ import SwiftUI
                 Text(session.stateLabel).foregroundStyle(SimulatorTheme.secondary)
             }
             if let geometry = session.manifest?.displayGeometry {
-                SimulatorNativeCanvas(image: session.image, geometry: geometry, acceptsInput: session.canInput, onInput: session.sendInput)
+                SimulatorNativeCanvas(image: session.image, geometry: geometry, acceptsInput: session.canInput,
+                                      onInput: session.sendInput, onDeviceButton: { session.sendDeviceButton($0) })
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .accessibilityIdentifier("simulator.detached-canvas")
             } else {

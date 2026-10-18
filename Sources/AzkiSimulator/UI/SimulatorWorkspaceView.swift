@@ -399,7 +399,8 @@ import UniformTypeIdentifiers
 
     private func devicePane(_ geometry: SimulatorDisplayGeometry) -> some View {
         SimulatorSection(title: "设备画面", icon: "applewatch") {
-            SimulatorNativeCanvas(image: session.image, geometry: geometry, acceptsInput: session.canInput, onInput: session.sendInput)
+            SimulatorNativeCanvas(image: session.image, geometry: geometry, acceptsInput: session.canInput,
+                                  onInput: session.sendInput, onDeviceButton: { session.sendDeviceButton($0) })
                 .frame(width: geometry.size.width, height: geometry.size.height)
                 .accessibilityIdentifier("simulator.canvas")
         }

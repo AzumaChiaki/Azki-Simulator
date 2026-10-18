@@ -21,6 +21,12 @@ nonisolated enum SimulatorDataLocations {
         support.appendingPathComponent((namespace ?? "com.azki.AzkiSimulator") + "/FirmwareLibrary", isDirectory: true)
     }
 
+    /// The whole app storage directory (instances, firmware library, run
+    /// snapshots). The development namespace keeps a signed copy separate.
+    static var appSupportRoot: URL {
+        support.appendingPathComponent(namespace ?? "com.azki.AzkiSimulator", isDirectory: true)
+    }
+
     private static var namespace: String? { developmentNamespace(bundleIdentifier: Bundle.main.bundleIdentifier) }
     private static var support: URL { FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0] }
 }

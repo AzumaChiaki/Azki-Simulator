@@ -72,7 +72,7 @@ VIRTUAL_PROFILES = {
 # Families whose synthetic identity format the virtual peer knows. The format
 # follows the hardware family and SKU, not one firmware build: any firmware of
 # these presets (catalog or imported) gets the virtual connection.
-VIRTUAL_FAMILIES = ("n66", "n67", "o66", "p67", "q65", "q66")
+VIRTUAL_FAMILIES = ("n66", "n67", "o66", "p65", "p67", "q65", "q66")
 
 
 def derived_nor_layout(project, profile_id, storage_kind):

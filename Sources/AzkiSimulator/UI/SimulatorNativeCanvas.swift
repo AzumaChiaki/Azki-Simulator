@@ -6,15 +6,22 @@ struct SimulatorNativeCanvas: NSViewRepresentable {
     let geometry: SimulatorDisplayGeometry
     let acceptsInput: Bool
     let onInput: (SimulatorInputEvent) -> Void
+    /// Physical watch-button clicks from the control area: "crown" (middle
+    /// click) and "lower" (right click). Nil or unsupported hardware ignores
+    /// those buttons entirely.
+    var onDeviceButton: ((String) -> Void)? = nil
 
     init(image: CGImage?, geometry: SimulatorDisplayGeometry = .pixels212x520,
-         acceptsInput: Bool, onInput: @escaping (SimulatorInputEvent) -> Void) {
+         acceptsInput: Bool, onInput: @escaping (SimulatorInputEvent) -> Void,
+         onDeviceButton: ((String) -> Void)? = nil) {
         self.image = image; self.geometry = geometry; self.acceptsInput = acceptsInput; self.onInput = onInput
+        self.onDeviceButton = onDeviceButton
     }
 
     func makeNSView(context: Context) -> SimulatorCanvasNSView { SimulatorCanvasNSView(frame: .zero) }
     func updateNSView(_ view: SimulatorCanvasNSView, context: Context) {
         view.onInput = onInput
+        view.onDeviceButton = onDeviceButton
         view.displayGeometry = geometry
         view.acceptsInput = acceptsInput
         view.image = image
@@ -23,6 +30,7 @@ struct SimulatorNativeCanvas: NSViewRepresentable {
         view.cancelContact()
         view.removeWindowObservers()
         view.onInput = nil
+        view.onDeviceButton = nil
     }
 }
 
@@ -30,6 +38,7 @@ struct SimulatorNativeCanvas: NSViewRepresentable {
 /// window, UIKit bridge or executable is part of the rendering surface.
 @MainActor final class SimulatorCanvasNSView: NSView {
     var onInput: ((SimulatorInputEvent) -> Void)?
+    var onDeviceButton: ((String) -> Void)?
     var acceptsInput = false { didSet { if !acceptsInput { cancelContact() } } }
     var displayGeometry: SimulatorDisplayGeometry = .pixels212x520 {
         didSet {
@@ -98,6 +107,22 @@ struct SimulatorNativeCanvas: NSViewRepresentable {
     override func mouseUp(with event: NSEvent) { endContact(at: convert(event.locationInWindow, from: nil)) }
     override func mouseExited(with event: NSEvent) { cancelContact() }
     override func cancelOperation(_ sender: Any?) { cancelContact() }
+
+    /// Middle click = the optical crown pressed as a button (single click).
+    override func otherMouseDown(with event: NSEvent) {
+        guard acceptsInput, event.buttonNumber == 2, let onDeviceButton else {
+            super.otherMouseDown(with: event); return
+        }
+        onDeviceButton("crown")
+    }
+
+    /// Right click = the watch's lower hardware key (single click).
+    override func rightMouseDown(with event: NSEvent) {
+        guard acceptsInput, let onDeviceButton else {
+            super.rightMouseDown(with: event); return
+        }
+        onDeviceButton("lower")
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
