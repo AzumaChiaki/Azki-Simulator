@@ -99,30 +99,122 @@ def _locate_romfs(image):
         raise ValueError('could not identify a unique valid AP ROMFS with /build.prop')
     return candidates[0]
 
-def local_boot_image(original):
+def _find_inode(image, base, size, wanted):
+    found = []
+
+    def walk(offset, path):
+        while offset:
+            inode = _entry(image, base, size, offset)
+            name = inode['name']
+            target = path + '/' + name if path else '/' + name
+            if inode['kind'] == 1 and name not in ('.', '..'):
+                walk(inode['spec'], target)
+            elif target == wanted and inode['kind'] == 2:
+                found.append(inode)
+            offset = inode['next'] & ~15
+
+    walk(0x20, '')
+    if len(found) != 1:
+        raise ValueError('ROMFS does not contain exactly one ' + wanted)
+    return found[0]
+
+def _zero_space(image, base, start, need):
+    """First run of zero bytes at a ROMFS-aligned offset at or after start.
+
+    ROMFS pads entry names relative to the inode start, so a placement is only
+    usable when its filesystem offset, not its absolute image offset, is
+    sixteen-byte aligned.
+    """
+    zeros = bytes(need)
+    offset = start
+    while True:
+        offset = image.find(zeros, offset)
+        if offset < 0:
+            raise ValueError('AP image has no zero-filled space for local setup files')
+        aligned = base + _align16(max(0, offset - base))
+        if aligned + need <= len(image) and not any(image[aligned:aligned + need]):
+            return aligned
+        offset = aligned + 16
+
+def _append_inode(image, base, size, name, content):
+    """Append one regular inode; fall back to the next zero-filled region.
+
+    ROMFS only requires inodes to live inside the superblock size, so an
+    out-of-line copy in firmware padding is valid once the size grows to it.
+    """
+    header = struct.pack('>4I', 2, 0, len(content), 0) + name.encode() + b'\0'
+    header = header.ljust(_align16(len(header)), b'\0')
+    body = header + content
+    total = _align16(len(body))
+    offset = size
+    if base + offset + total > len(image) or any(image[base + offset:base + offset + total]):
+        offset = _zero_space(image, base, base + size, total) - base
+    if base + offset + total > len(image) or any(image[base + offset:base + offset + total]):
+        raise ValueError('AP ROMFS has insufficient zero-filled padding for local setup properties')
+    image[base + offset:base + offset + len(header)] = header
+    image[base + offset + len(header):base + offset + len(body)] = content
+    struct.pack_into('>I', image, base + offset + 12,
+                     checksum(bytes(image[base + offset:base + offset + len(header)])))
+    return offset, max(size, offset + total)
+
+def _relink_inode(image, base, inode, target):
+    """Turn the original inode into a ROMFS hardlink to the appended copy."""
+    struct.pack_into('>4I', image, base + inode['offset'], inode['next'] & ~15, target, 0, 0)
+    raw = bytes(image[base + inode['offset']:base + inode['offset'] + inode['entry_size']])
+    struct.pack_into('>I', image, base + inode['offset'] + 12, checksum(raw))
+
+def _property_script(script, properties):
+    """Insert property writes after kvdb_init and before kvdbd starts.
+
+    Rejected for now: extending /init.d/rc.sysinit in the boot copy makes the
+    guest take a BusFault during early PMU init (no display, no watch face),
+    even though the rewritten ROMFS still parses and every inode checksum
+    verifies. Kept so the experiment is not repeated blindly.
+    """
+    lines = script.split(b'\n')
+    injected, done = [], False
+    for line in lines:
+        injected.append(line)
+        if not done and line.strip() == b'kvdb_init':
+            for index, (key, value) in enumerate(properties.items()):
+                redirect = b' > ' if index == 0 else b' >> '
+                injected.append(b'echo ' + key.encode() + b'=' + value.encode()
+                                + redirect + b'/tmp/factory.prop')
+            done = True
+    if not done:
+        raise ValueError('AP rc.sysinit has no kvdb_init stage to extend')
+    return b'\n'.join(injected)
+
+def local_boot_image(original, extra_properties=None):
     if not isinstance(original, (bytes, bytearray)) or len(original) < ROMFS_MIN_SIZE:
         raise ValueError('AP image is empty or truncated')
+    overrides = {}
+    if extra_properties is not None:
+        if type(extra_properties) is not dict or not extra_properties:
+            raise ValueError('AP setup property override is not a non-empty mapping')
+        for key, value in extra_properties.items():
+            if (type(key) is not str or type(value) is not str
+                    or not 1 <= len(key) <= 64 or not 1 <= len(value) <= 96
+                    or '=' in key or any(not 33 <= ord(char) <= 126 for char in key)
+                    or any(not 32 <= ord(char) <= 126 for char in value)
+                    or key in LOCAL_PROPERTIES):
+                raise ValueError('AP setup property override is invalid')
+        overrides = dict(extra_properties)
+    properties_map = dict(LOCAL_PROPERTIES)
+    properties_map.update(overrides)
     image = bytearray(original)
     base, romfs_size, build_inode, content_inode = _locate_romfs(image)
     properties = bytes(image[base + content_inode['data']:base + content_inode['data'] + content_inode['length']])
     lines = set(properties.splitlines())
-    if all(f'{key}={value}'.encode() in lines for key, value in LOCAL_PROPERTIES.items()):
+    if all(f'{key}={value}'.encode() in lines for key, value in properties_map.items()):
         raise ValueError('AP image already contains the local OOBE properties')
     if b'ro.product.device.devicetype=watch' not in lines:
         raise ValueError('AP ROMFS build.prop is not a watch image')
-    appended = b'\n' + ''.join(f'{key}={value}\n' for key, value in LOCAL_PROPERTIES.items()).encode()
+    appended = b'\n' + ''.join(f'{key}={value}\n' for key, value in properties_map.items()).encode()
     new_properties = properties + appended
-    new_size = _align16(romfs_size + 32 + len(new_properties))
-    if base + new_size > len(image) or any(image[base + romfs_size:base + new_size]):
-        raise ValueError('AP ROMFS has insufficient zero-filled padding for local setup properties')
-    new_entry = bytearray(struct.pack('>4I', 2, 0, len(new_properties), 0) + b'build.prop\0'.ljust(16, b'\0'))
-    struct.pack_into('>I', new_entry, 12, checksum(bytes(new_entry)))
-    image[base + romfs_size:base + romfs_size + 32] = new_entry
-    image[base + romfs_size + 32:base + romfs_size + 32 + len(new_properties)] = new_properties
-    next_entry = build_inode['next'] & ~15
-    struct.pack_into('>4I', image, base + build_inode['offset'], next_entry, romfs_size, 0, 0)
-    old_raw = bytes(image[base + build_inode['offset']:base + build_inode['offset'] + build_inode['entry_size']])
-    struct.pack_into('>I', image, base + build_inode['offset'] + 12, checksum(old_raw))
-    struct.pack_into('>II', image, base + 8, new_size, 0)
+    size = romfs_size
+    offset, size = _append_inode(image, base, size, 'build.prop', new_properties)
+    _relink_inode(image, base, build_inode, offset)
+    struct.pack_into('>II', image, base + 8, size, 0)
     struct.pack_into('>I', image, base + 12, checksum(bytes(image[base:base + 512])))
     return bytes(image)

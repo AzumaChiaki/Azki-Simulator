@@ -134,4 +134,7 @@ def inspect(payload, serial, address, did=None, *, model='miwear.watch.q66nfc', 
             'expectedModel': model, 'deviceNonceBytes': len(info[6]),
             'didPresent': bool(info.get(7)), 'verifyMode': info.get(1), 'oobMode': info.get(5),
             'didMatchesSyntheticSeed': did is not None and info.get(7) == did.encode(),
+            # TEMP DEBUG: dump guest-reported raw identifiers for diagnosis
+            'debugReportedSerial': info[2].decode('utf-8', 'backslashreplace') if isinstance(info[2], bytes) else repr(info[2]),
+            'debugReportedDid': info.get(7).decode('utf-8', 'backslashreplace') if isinstance(info.get(7), bytes) else (repr(info.get(7)) if 7 in info else 'absent'),
             'freshBindingVerified': False, 'authKeyEstablished': False}

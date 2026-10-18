@@ -124,7 +124,7 @@ class GuestOperations:
         return self.start_install(package, **request)
 
     def start_select(self, identifier, *, expected_session_id, expected_generation, timeout=45):
-        if not isinstance(identifier, str) or re.fullmatch(r'(?:[0-9]{12}|L[0-9]{11})', identifier) is None:
+        if not isinstance(identifier, str) or re.fullmatch(r'(?:[0-9]{9,12}|L[0-9]{11})', identifier) is None:
             raise ValueError('invalid watchface identity')
         if type(timeout) not in (int, float) or not 5 <= timeout <= 120:
             raise ValueError('invalid selection timeout')

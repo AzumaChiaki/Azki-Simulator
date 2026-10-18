@@ -157,7 +157,7 @@ def validate_arguments(command, arguments):
                 or type(arguments["sha256"]) is not str or not SHA.fullmatch(arguments["sha256"])):
             raise MError("invalid_guest_package", "安装文件身份无效")
     elif command == "guest-select":
-        if type(arguments["identifier"]) is not str or not re.fullmatch(r"(?:[0-9]{12}|L[0-9]{11})", arguments["identifier"]):
+        if type(arguments["identifier"]) is not str or not re.fullmatch(r"(?:[0-9]{9,12}|L[0-9]{11})", arguments["identifier"]):
             raise MError("invalid_guest_operation", "表盘 ID 无效")
         request["identifier"] = arguments["identifier"]
     elif command == "guest-operation":

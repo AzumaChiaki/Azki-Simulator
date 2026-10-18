@@ -249,6 +249,21 @@ def psk_bytes(state):
     return state['psk'].encode('ascii') if descriptor['pskEncoding'] == 'ascii-hex32' else bytes.fromhex(state['psk'])
 
 
+def boot_properties(state):
+    """Identity properties a guest property daemon reads from /etc/build.prop.
+
+    P65 never mounts the Q65/Q66 factory LittleFS: its kvdbd sources only
+    /tmp/factory.prop and the AP ROMFS /etc/build.prop, and nothing authors
+    the former in this machine. Without these keys the firmware reports an
+    erased 20-byte PSN and a negative DID inside BindInfo, so the synthetic
+    identity can never match. Only plain identity text is delivered here; the
+    binding key is established by the authentication exchange itself.
+    """
+    validate_state(state)
+    identity = state['identity']
+    return {'ro.factory.psn': identity['serial'], 'ro.factory.did': identity['did']}
+
+
 def _fresh(state):
     validate_state(state)
     if state['binding'] is not None:

@@ -131,7 +131,7 @@ class AuthenticationCentral(LocalCentral):
                     if k in ('accepted','serialMatchesSyntheticSeed','addressMatchesSyntheticSeed',
                              'modelMatchesSyntheticSeed','modelMatchesFirmwareProfile','didMatchesSyntheticSeed','guestError','verifyMode','oobMode')
                     and type(v) in (bool,int)}
-                for key in ('reportedModel','expectedModel'):
+                for key in ('reportedModel','expectedModel','debugReportedSerial','debugReportedDid'):
                     if type(info.get(key)) is str:self.failure_diagnostic[key]=info[key]
             details={'SMP MITM not implemented':'mitm_unsupported',
                 'Unsupported SMP legacy negotiation':'legacy_negotiation_unsupported',

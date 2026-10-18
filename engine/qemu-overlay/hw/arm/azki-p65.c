@@ -33,6 +33,7 @@
 #include "ui/input.h"
 #include "chardev/char-fe.h"
 #include "azki-p65-gpu.h"
+#include "bes-nor-store.h"
 
 typedef struct Best1503State Best1503State;
 
@@ -179,6 +180,11 @@ typedef struct {
     unsigned rx_pos, rx_len, tx_len;
     uint32_t program_address;
     unsigned program_remaining;
+    uint32_t program_start;
+    unsigned program_length;
+    BesNorStore nor_store;
+    uint32_t write_min_offset, write_max_offset;
+    uint32_t config_offset, config_bytes;
     bool write_enabled;
     uint8_t burst_wrap;
     uint8_t *nand_data, *nand_spare;
@@ -254,6 +260,8 @@ struct Best1503State {
     bool sensor_ready, sensor_held, sensor_needs_reset;
     unsigned sensor_reset_generation;
     MemoryRegion flash, flash_exec, flash_nc, flash_nc_exec;
+    /* TEMP DEBUG: traced XIP windows over the factory_data MTD partition. */
+    MemoryRegion factory_window[4];
     MemoryRegion sram, sram_exec, bt_ram, bt_ram_exec, bt_patch, bt_cpudump;
     MemoryRegion psram, psram_exec, psram_cached, psram_cached_exec;
     MemoryRegion boot_vectors;
@@ -290,6 +298,9 @@ struct Best1503State {
     char *audio_image;
     char *sensor_image;
     char *factory_image;
+    char *nor_image;
+    bool nor_writeback, nor_exit_registered;
+    Notifier nor_exit;
     BesIspi ispi;
     BesSpiConfig spi0;
     BesPsram psram_ctrl;
@@ -1305,8 +1316,10 @@ static const MemoryRegionOps dma_2d_ops = {
  * C8:60:17 occurs in the target image's supported-device table at 0xbcd0.
  * It represents an 8 MiB chip, or 16 MiB with dual-chip mode. This is a
  * modeled device choice, not identification of the watch's physical flash.
- * Only the tail NV area permits volatile erase/program; application pages
- * and unimplemented commands deliberately bus-fault. No host file writes.
+ * Only the tail NV area permits erase/program; application pages
+ * and unimplemented commands deliberately bus-fault. NAND instance data may
+ * opt into bounded data/OOB writeback, and private compact NOR writeback
+ * persists the P65 tail; AP and resource files stay read-only.
  */
 static void nand_update_drq(BesNor *nor)
 {
@@ -1325,6 +1338,50 @@ static void nand_update_drq(BesNor *nor)
         }
     }
     qemu_set_irq(nor->nand_drq, nor->rx_pos < nor->rx_len || nor->nand_remaining);
+}
+
+static bool nor_writable(BesNor *nor, uint32_t address, unsigned count)
+{
+    uint64_t end = (uint64_t)address + count;
+    off_t compact_offset;
+    return count && nor->backing && end <= memory_region_size(nor->backing) &&
+        (!nor->nor_store.enabled ||
+         bes_nor_layout_translate(&nor->nor_store.layout, address, count, &compact_offset)) &&
+        ((address >= nor->write_min_offset && end <= nor->write_max_offset) ||
+         (nor->config_bytes && address >= nor->config_offset &&
+          end <= (uint64_t)nor->config_offset + nor->config_bytes));
+}
+
+/* Fatal storage failures have exactly one marker, including during atexit. */
+static G_NORETURN void nor_store_failure(BesNor *nor, const char *reason)
+{
+    nor->nor_store.failed = true;
+    error_report("NOR instance writeback failed: %s", reason);
+    bes_nor_store_close(&nor->nor_store);
+    fflush(NULL);
+    _exit(1);
+}
+
+static void nor_flush(BesNor *nor, uint32_t address, unsigned count)
+{
+    if (!bes_nor_store_flush(&nor->nor_store, address, count,
+                            (uint8_t *)memory_region_get_ram_ptr(nor->backing) + address)) {
+        nor_store_failure(nor, "private NOR write or fsync failed");
+    }
+}
+
+static void nor_check_complete(BesNor *nor)
+{
+    if (nor->nor_store.enabled && nor->program_remaining) {
+        nor_store_failure(nor, "incomplete NOR program transaction");
+    }
+}
+
+static void best1503_nor_exit(Notifier *notifier, void *unused)
+{
+    Best1503State *s = container_of(notifier, Best1503State, nor_exit);
+    nor_check_complete(&s->nor[0]);
+    bes_nor_store_close(&s->nor[0].nor_store);
 }
 
 static bool nor_command(BesNor *nor, uint32_t value)
@@ -1446,7 +1503,7 @@ static bool nor_command(BesNor *nor, uint32_t value)
         uint32_t address = (value >> 8) | (nor->regs[0x30 / 4] << 24);
         unsigned page = dual ? 512 : 256;
         if (extended || !nor->write_enabled || !nor->backing || !len ||
-            address < 0xfc0000 || (uint64_t)address + len > 16 * MiB ||
+            !nor_writable(nor, address, len) ||
             (address & (page - 1)) + len > page || nor->program_remaining ||
             nor->tx_len > len) {
             return false;
@@ -1455,11 +1512,16 @@ static bool nor_command(BesNor *nor, uint32_t value)
         for (unsigned i = 0; i < nor->tx_len; i++) {
             flash[address + i] &= nor->tx[i]; /* NOR only programs 1 to 0. */
         }
+        nor->program_start = address;
+        nor->program_length = len;
         nor->program_address = address + nor->tx_len;
         nor->program_remaining = len - nor->tx_len;
+        if (!nor->program_remaining) {
+            nor_flush(nor, nor->program_start, nor->program_length);
+        }
         nor->write_enabled = false;
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "BES NOR volatile NV program: address=0x%08x size=%u queued=%u\n",
+                      "BES NOR NV program: address=0x%08x size=%u queued=%u\n",
                       address, len, nor->tx_len);
         len = 0;
         break;
@@ -1469,11 +1531,12 @@ static bool nor_command(BesNor *nor, uint32_t value)
         unsigned count = dual ? 8192 : 4096;
         address &= ~(count - 1);
         if (extended || !nor->write_enabled || !nor->backing ||
-            address < 0xfc0000 || (uint64_t)address + count > 16 * MiB) {
+            !nor_writable(nor, address, count)) {
             return false;
         }
         memset((uint8_t *)memory_region_get_ram_ptr(nor->backing) + address,
                0xff, count);
+        nor_flush(nor, address, count);
         nor->write_enabled = false;
         qemu_log_mask(LOG_GUEST_ERROR,
                       "BES NOR volatile NV erase: address=0x%08x size=%u\n",
@@ -1662,6 +1725,9 @@ static MemTxResult nor_write(void *opaque, hwaddr offset, uint64_t value,
                 flash[nor->program_address++] &= value >> (8 * i);
             }
             nor->program_remaining -= size;
+            if (!nor->program_remaining) {
+                nor_flush(nor, nor->program_start, nor->program_length);
+            }
             return MEMTX_OK;
         }
         for (unsigned i = 0; i < size && nor->tx_len < sizeof(nor->tx); i++) {
@@ -4514,6 +4580,82 @@ static void best1503_peripheral_reset(void *opaque)
     lcdc_update_irq(&s->lcdc);
 }
 
+/* TEMP DEBUG: trace every AP-core access into the writable NOR tail
+ * (0xcc0000..0x1000000: factory_data + audio partitions) across all flash
+ * alias windows. Reads return the backing RAM content; writes are logged and
+ * applied so behavior is unchanged apart from logging. Accesses from the
+ * sensor/audio core are ignored to keep the log usable. */
+static bool factory_trace_ap_only(target_ulong pc)
+{
+    return (pc & 0xff000000u) == 0x0c000000u;
+}
+
+static uint64_t factory_window_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Best1503State *s = opaque;
+    uint64_t value = 0;
+    hwaddr off = 0xcc0000 + addr;
+    uint8_t *flash = memory_region_get_ram_ptr(&s->flash);
+    target_ulong pc = 0;
+    CPUState *cpu = current_cpu;
+    if (cpu && cpu->cc && cpu->cc->get_pc) {
+        pc = cpu->cc->get_pc(cpu);
+    }
+    if (off + size <= 16 * MiB) {
+        memcpy(&value, flash + off, size);
+    }
+    if (factory_trace_ap_only(pc)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "BES factory_data XIP read: offset=0x%06x size=%u pc=0x%08x\n",
+                      (unsigned)off, size, (unsigned)pc);
+    }
+    return value;
+}
+
+static void factory_window_write(void *opaque, hwaddr addr, uint64_t value,
+                                 unsigned size)
+{
+    Best1503State *s = opaque;
+    hwaddr off = 0xcc0000 + addr;
+    uint8_t *flash = memory_region_get_ram_ptr(&s->flash);
+    target_ulong pc = 0;
+    CPUState *cpu = current_cpu;
+    if (cpu && cpu->cc && cpu->cc->get_pc) {
+        pc = cpu->cc->get_pc(cpu);
+    }
+    if (off + size <= 16 * MiB) {
+        memcpy(flash + off, &value, size);
+    }
+    if (factory_trace_ap_only(pc) || 1) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "BES factory_data XIP write: offset=0x%06x size=%u "
+                      "value=0x%0*llx pc=0x%08x\n",
+                      (unsigned)off, size, size * 2, (unsigned long long)value,
+                      (unsigned)pc);
+    }
+}
+
+static const MemoryRegionOps factory_window_ops = {
+    .read = factory_window_read,
+    .write = factory_window_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl = {.min_access_size = 1, .max_access_size = 4},
+};
+
+static void map_factory_windows(Best1503State *s)
+{
+    static const hwaddr bases[] = {0x2c000000, 0x28000000, 0x0c000000,
+                                   0x08000000};
+    for (unsigned i = 0; i < 4; i++) {
+        g_autofree char *name = g_strdup_printf("bes.factory-data.trace%u", i);
+        memory_region_init_io(&s->factory_window[i], OBJECT(s),
+                              &factory_window_ops, s, name, 0x340000);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            bases[i] + 0xcc0000,
+                                            &s->factory_window[i], 1);
+    }
+}
+
 static void map_ram(Best1503State *s, MemoryRegion *mr, const char *name,
                     hwaddr base, uint64_t size)
 {
@@ -4825,6 +4967,21 @@ static void best1503_init(MachineState *machine)
 {
     Best1503State *s = (Best1503State *)machine;
     DeviceState *cpu;
+    BesNorLayout nor_layout = { 0 };
+    if (s->nor_image || s->nor_writeback) {
+        if (!s->nor_image || !s->nor_writeback || s->factory_image) {
+            nor_store_failure(&s->nor[0], "NOR writeback requires nor-image, nor-writeback and no factory-image");
+        }
+        /* The isolated P65 core has one fixed catalog geometry: AP at
+         * 0xc0000, NV tail at 0xcc0000, factory data at 0xfe0000, no
+         * separate config extent. */
+        if (!bes_nor_layout_init(&nor_layout, 16 * MiB, 0xc0000, 0xcc0000,
+                                 0xfe0000, 0, 0)) {
+            nor_store_failure(&s->nor[0], "NOR writeback requires an exact catalog geometry");
+        }
+    }
+    s->nor[0].write_min_offset = 0xcc0000;
+    s->nor[0].write_max_offset = 16 * MiB;
     if (s->bt_hci_chardev) {
         Chardev *backend = qemu_chr_find(s->bt_hci_chardev);
         if (!backend || !s->bt_tx_capture || s->bt_hci_reset_fixture ||
@@ -4944,6 +5101,21 @@ static void best1503_init(MachineState *machine)
 
     map_ram(s, &s->flash, "bes.flash", 0x2c000000, 16 * MiB);
     memset(memory_region_get_ram_ptr(&s->flash), 0xff, 16 * MiB);
+    if (s->nor_writeback) {
+        uint8_t *flash = memory_region_get_ram_ptr(&s->flash);
+        if (!bes_nor_store_open(&s->nor[0].nor_store, s->nor_image,
+                                &nor_layout, flash)) {
+            nor_store_failure(&s->nor[0], "NOR image must be an exclusive owner-0600 regular file of the exact compact layout size");
+        }
+        s->nor_exit.notify = best1503_nor_exit;
+        qemu_add_exit_notifier(&s->nor_exit);
+        s->nor_exit_registered = true;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "BES NOR instance storage loaded: offset=0x%08x tail-size=%u config-offset=0x%08x config-size=%u compact-size=%u\n",
+                      nor_layout.tail_offset, nor_layout.flash_bytes - nor_layout.tail_offset,
+                      nor_layout.config_offset, nor_layout.config_bytes,
+                      bes_nor_layout_bytes(&nor_layout));
+    }
     if (s->factory_image) {
         g_autofree char *contents = NULL;
         gsize length;
@@ -4966,6 +5138,7 @@ static void best1503_init(MachineState *machine)
     map_alias(s, &s->flash_exec, "bes.flash.exec", &s->flash, 0x0c000000);
     map_alias(s, &s->flash_nc, "bes.flash.nc", &s->flash, 0x28000000);
     map_alias(s, &s->flash_nc_exec, "bes.flash.nc.exec", &s->flash, 0x08000000);
+    map_factory_windows(s);
     map_ram(s, &s->sram, "bes.sram", 0x20000000, 0x1a0000);
     map_alias(s, &s->sram_exec, "bes.sram.exec", &s->sram, 0x00200000);
     sensor_map_image(s);
@@ -5314,13 +5487,43 @@ static void best1503_init(MachineState *machine)
             }
         }
     }
+    /* Neither compact extent may be overlaid by kernel input (the P65 tail
+     * begins at nv-offset 0xcc0000 and there is no config extent). In
+     * addition, direct guest stores must not bypass the NOR command write
+     * boundary. */
+    if (s->nor_writeback) {
+        memory_region_set_readonly(&s->flash, true);
+    }
     armv7m_load_kernel(s->armv7m.cpu, machine->kernel_filename,
-                       0x2c0c0000, 16 * MiB - 0xc0000);
+                       0x2c0c0000,
+                       (s->nor_writeback ? 0xcc0000 : 16 * MiB) - 0xc0000);
 }
 
 static bool best1503_get_bt_peer(Object *obj, Error **errp)
 {
     return ((Best1503State *)obj)->bt_peer;
+}
+
+static char *best1503_get_nor_image(Object *obj, Error **errp)
+{
+    return g_strdup(((Best1503State *)obj)->nor_image);
+}
+
+static void best1503_set_nor_image(Object *obj, const char *value, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    g_free(s->nor_image);
+    s->nor_image = g_strdup(value);
+}
+
+static bool best1503_get_nor_writeback(Object *obj, Error **errp)
+{
+    return ((Best1503State *)obj)->nor_writeback;
+}
+
+static void best1503_set_nor_writeback(Object *obj, bool value, Error **errp)
+{
+    ((Best1503State *)obj)->nor_writeback = value;
 }
 
 static void best1503_set_bt_peer(Object *obj, bool value, Error **errp)
@@ -5596,6 +5799,13 @@ static void best1503_set_lcd_frame_file(Object *obj, const char *value, Error **
 
 static void best1503_finalize(Object *obj)
 {
+    Best1503State *s = (Best1503State *)obj;
+    nor_check_complete(&s->nor[0]);
+    if (s->nor_exit_registered) {
+        qemu_remove_exit_notifier(&s->nor_exit);
+    }
+    bes_nor_store_close(&s->nor[0].nor_store);
+    g_free(s->nor_image);
     BesLcdc *l = &((Best1503State *)obj)->lcdc;
 #ifndef _WIN32
     if (l->shared_frame) {
@@ -5634,6 +5844,12 @@ static void best1503_class_init(ObjectClass *oc, const void *data)
         "Original sensor-hub BES image, executed by an independently reset Cortex-M33");
     object_class_property_add_str(oc, "factory-image", best1503_get_factory_image,
                                   best1503_set_factory_image);
+    object_class_property_add_str(oc, "nor-image", best1503_get_nor_image,
+                                  best1503_set_nor_image);
+    object_class_property_add_bool(oc, "nor-writeback", best1503_get_nor_writeback,
+                                   best1503_set_nor_writeback);
+    object_class_property_set_description(oc, "nor-writeback",
+        "Persist exclusive private compact catalog NOR; caller owns rollback transaction");
     object_class_property_add_bool(oc, "touch", best1503_get_touch, best1503_set_touch);
     object_class_property_add_bool(oc, "bt-hci-reject-fixture",
         best1503_get_bt_hci_reject_fixture, best1503_set_bt_hci_reject_fixture);

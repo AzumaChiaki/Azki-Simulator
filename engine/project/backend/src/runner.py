@@ -542,8 +542,12 @@ def main():
         boot_firmware = logdir / 'p65-local-setup-ap.bin'
         if boot_firmware == args.firmware:
             parser.error('--firmware must be the original image, not the generated boot copy')
+        guest_properties = None
+        if virtual_state is not None:
+            from .virtual_peer.state import boot_properties
+            guest_properties = boot_properties(virtual_state)
         try:
-            image = local_boot_image(args.firmware.read_bytes())
+            image = local_boot_image(args.firmware.read_bytes(), guest_properties)
         except (OSError, ValueError, RuntimeError) as error:
             # Require a structurally valid P65 watch ROMFS; never fall back to
             # an unmodified OOBE image or another model's firmware.
@@ -645,7 +649,9 @@ def main():
         if instance_storage and not isolated_p65:
             machine += instance_machine_options(instance_storage)
             print('Private instance NAND transaction: ' + instance_storage['dataImage'], flush=True)
-        if instance_nor and not isolated_p65:
+        if instance_nor:
+            # The isolated P65 core implements the same compact catalog NOR
+            # writeback as the generic BEST1503 machine; its NAND stays RAM-only.
             machine += instance_nor_machine_options(instance_nor)
             print('Private instance NOR transaction: ' + instance_nor['norImage'], flush=True)
         if args.data_image and not isolated_p65:

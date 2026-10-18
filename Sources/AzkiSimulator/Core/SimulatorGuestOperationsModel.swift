@@ -338,7 +338,7 @@ final class SimulatorGuestOperationsModel {
         return Int(number)
     }
     private static func validWatchfaceID(_ id: String) -> Bool {
-        id.range(of: "^(?:[0-9]{12}|L[0-9]{11})$", options: .regularExpression) != nil
+        id.range(of: "^(?:[0-9]{9,12}|L[0-9]{11})$", options: .regularExpression) != nil
     }
     private func confirmedPackageKind(_ operation: SimulatorJSON, receipt: SimulatorJSON, field: String) throws -> PackageKind {
         let kind = try Self.packageKind(operation, field: field)
