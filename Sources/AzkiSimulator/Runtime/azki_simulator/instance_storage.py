@@ -1328,21 +1328,28 @@ def instance_arguments(binding, *, run_directory=None):
 def _stopped_health(session, plan, binding):
     broker = session / "native-broker"
     if not broker.exists():
-        if any(session.glob("m-*")):
-            raise ValueError("Run directory exists without native ownership evidence")
-        return False, "prepared-session-never-started"
-    config = _json(broker / "config.json")
-    if not (broker / "state.json").exists() and not (broker / "launch.json").exists():
-        return False, "native-guest-not-launched"
-    state = _json(broker / "state.json")
-    run = config.get("run", "")
-    if (config.get("approvalDigest") != plan["approvalDigest"]
-            or re.fullmatch(r"m-[0-9a-f]{12}", run) is None
-            or state.get("id") != config.get("id") or state.get("run") != run
-            or state.get("state") not in ("exited", "failed") or state.get("cleanup") != "reaped"):
-        raise ValueError("模拟器进程尚未确认退出，本次数据暂不提交；已保存的快照保持不变")
-    if state["state"] == "failed":
-        return False, "native-guest-launch-or-cleanup-failed"
+        if not (session / "developer-run.json").exists():
+            if any(session.glob("m-*")):
+                raise ValueError("Run directory exists without host completion evidence")
+            return False, "prepared-session-never-started"
+        from .developer_storage import read_completion
+        state = read_completion(session, plan, binding)
+        if state["state"] == "failed":
+            return False, "developer-guest-launch-or-cleanup-failed"
+        run = state["run"]
+    else:
+        config = _json(broker / "config.json")
+        if not (broker / "state.json").exists() and not (broker / "launch.json").exists():
+            return False, "native-guest-not-launched"
+        state = _json(broker / "state.json")
+        run = config.get("run", "")
+        if (config.get("approvalDigest") != plan["approvalDigest"]
+                or re.fullmatch(r"m-[0-9a-f]{12}", run) is None
+                or state.get("id") != config.get("id") or state.get("run") != run
+                or state.get("state") not in ("exited", "failed") or state.get("cleanup") != "reaped"):
+            raise ValueError("模拟器进程尚未确认退出，本次数据暂不提交；已保存的快照保持不变")
+        if state["state"] == "failed":
+            return False, "native-guest-launch-or-cleanup-failed"
     try:
         result = _bounded_json(session / run / "result.json", private=True)
     except (OSError, ValueError):
@@ -1382,7 +1389,7 @@ def _virtual_result(session, binding):
                                           instance_id=binding["instanceID"])
     if binding.get("virtualPeerEnabled") is not True:
         return raw, digest
-    config = _json(session / "native-broker/config.json")
+    config = _json(session / "native-broker/config.json") if (session / "native-broker").exists() else _json(session / "developer-run.json")
     # _stopped_health established exact run identity; repeat the path constraint
     # rather than ever accepting an output path from the guest's JSON.
     run_name = config.get("run", "")
@@ -1411,7 +1418,7 @@ def _virtual_result(session, binding):
 
 
 def finish_session_storage(library_root, session_root, instance_id):
-    """Publish only after native-owned cleanup and exact run-result validation.
+    """Publish only after host-owned cleanup and exact run-result validation.
 
     Success means one crash-consistent NAND/OOB/optional NOR/private-state revision, not a
     guest filesystem unmount, successful migration, or completed OTA.
@@ -1514,7 +1521,8 @@ def finish_session_storage(library_root, session_root, instance_id):
             # Informational: the firmware's own settings as committed now.
             try:
                 from .instance_settings import record_observed
-                run = _json(session / "native-broker" / "config.json").get("run", "")
+                record_path = session / "native-broker/config.json" if (session / "native-broker").exists() else session / "developer-run.json"
+                run = _json(record_path).get("run", "")
                 if re.fullmatch(r"m-[0-9a-f]{12}", run):
                     record_observed(library_root, instance_id, session / run)
             except (OSError, ValueError):

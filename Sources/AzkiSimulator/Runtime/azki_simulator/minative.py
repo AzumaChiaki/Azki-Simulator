@@ -1119,6 +1119,7 @@ class MinativeAdapter:
         self._finished = False
         self._observed_board = None
         self._detail = None
+        self._developer_process_identity = None
 
     @property
     def run_root(self):
@@ -1341,6 +1342,9 @@ class MinativeAdapter:
                             raise MError("invalid_control", "Runner evidence did not finish publication") from error
                         continue
                     with self._lock:
+                        if self.native_broker is None and not self.fixture_only:
+                            self._developer_process_identity = {
+                                "runnerPID": self._runner_pid(), "corePID": value["pid"]}
                         self._control = value
                         if not self._stop_requested:
                             self._state = "running"
@@ -1499,6 +1503,13 @@ class MinativeAdapter:
         outcome = classify_result(result, self.process.returncode, stopped=self._stop_requested)
         self._state = "failed" if self._reason else outcome["state"]
         self._reason = self._reason or outcome["reason"]
+        if self.native_broker is None and self.plan["identity"].get("instanceStorage"):
+            try:
+                from .developer_storage import publish_completion
+                publish_completion(self)
+            except (OSError, ValueError):
+                self._state = "failed"
+                self._reason = "developer_storage_completion_unconfirmed"
         if self._state == "failed":
             self._detail = _failure_detail(result, self.run / "adapter-runner.log")
         if self._log:
