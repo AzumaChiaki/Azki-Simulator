@@ -466,10 +466,14 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                         BesGpuRead read)
 {
     uint32_t *r = w->regs;
+    /* Observed P67 solid-path DST_IN on a premultiplied BGRA8888 layer.
+     * Public vg_lite_draw emits A02 paint and no imageMode bits; A25 and
+     * the source registers can still describe an earlier image draw. */
+    bool dst_in_mode = r[0xa00] == 0x10000402;
     bool multiply_mode = r[0xa00] == 0x10002181 || r[0xa00] == 0x10002102;
     bool path = r[0xa00] != 0x2181 && r[0xa00] != 0x10001181 &&
                 r[0xa00] != 0x10002181;
-    bool image = r[0xa00] != 0x10000102;
+    bool image = r[0xa00] != 0x10000102 && !dst_in_mode;
     bool color_mode = r[0xa00] == 0x10001102 || r[0xa00] == 0x10001181;
     /* Public VG_LITE_PATTERN_PAD clamps texture samples to the image edge. */
     bool pad_source = (r[0xa25] & 0x1000) != 0;
@@ -493,7 +497,8 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
     bool premultiplied_source = packed_source ||
         (bgra8888_source && (r[0xa00] & 0x10000000));
     if ((r[0xa00] != 0x2181 && r[0xa00] != 0x2102 &&
-         r[0xa00] != 0x10000102 && !color_mode && !multiply_mode) ||
+         r[0xa00] != 0x10000102 && !color_mode && !multiply_mode && !dst_in_mode) ||
+        (dst_in_mode && r[0xa10] != 0x103) ||
         (!path && r[0xa34]) || r[0xad1]) {
         return gpu_sw_fail(w, "unsupported draw/blend/global-alpha mode");
     }
@@ -513,7 +518,7 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
     }
     unsigned sw = r[0xa2f] & 0xffff, sh = r[0xa2f] >> 16, stride = r[0xa2b];
     unsigned source_bpp = bgra8888_source ? 4 : (packed_source || rgb888_source) ? 3 : rgb565_source ? 2 : 1;
-    if (packed_source || rgb888_source) {
+    if (image && (packed_source || rgb888_source)) {
         if (stride & 3) { return gpu_sw_fail(w, "unaligned packed source stride"); }
         stride = stride / 4 * 3;
     }
@@ -561,6 +566,26 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
         for (unsigned x = 0; x < t->width; x++) {
             unsigned cov = coverage[y * t->width + x];
             if (!cov) {
+                continue;
+            }
+            if (dst_in_mode) {
+                /* DST_IN: premultiplied destination RGBA * paint alpha.
+                 * Coverage interpolates that blend with the old pixel:
+                 * factor = (1 - coverage) + coverage * paint_alpha.
+                 * In particular, zero alpha erases a fully covered pixel;
+                 * it must not take the source-over transparent early exit.
+                 * Keep 16-sample precision until the final rounded store. */
+                unsigned factor = (16 - cov) * 255 + cov * constant.a;
+                uint8_t *pixel = t->pixels + y * t->stride + x * t->bpp;
+                BesGpuColor old = gpu_sw_target_load(t, pixel);
+                BesGpuColor masked = {
+                    (old.r * factor + 2040) / 4080,
+                    (old.g * factor + 2040) / 4080,
+                    (old.b * factor + 2040) / 4080,
+                    (old.a * factor + 2040) / 4080,
+                };
+                gpu_sw_target_store(t, pixel, masked);
+                w->pixels++;
                 continue;
             }
             unsigned a = (constant.a * cov + 8) / 16;
