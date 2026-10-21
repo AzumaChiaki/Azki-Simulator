@@ -485,6 +485,13 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
     bool rgb888_source = (source_format & ~0x30020u) == 0x21000100 &&
                          (source_format & 0x30000) != 0x30000;
     bool colored_source = indexed || packed_source || rgb565_source || bgra8888_source || rgb888_source;
+    /* Stock BES/LVGL normal/multiply image draws set A00 bit 28 and pass
+     * premultiplied BGRA texels (for example 7f000080 for half-red). Preserve
+     * their RGB contribution across filtering; multiplying by alpha again
+     * darkens both imported images and offscreen system layers. The legacy
+     * A00=0x2181 straight-alpha path and ARGB CLUT remain unchanged. */
+    bool premultiplied_source = packed_source ||
+        (bgra8888_source && (r[0xa00] & 0x10000000));
     if ((r[0xa00] != 0x2181 && r[0xa00] != 0x2102 &&
          r[0xa00] != 0x10000102 && !color_mode && !multiply_mode) ||
         (!path && r[0xa34]) || r[0xad1]) {
@@ -609,7 +616,7 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                                 }
                                 double opacity = color.a * weight;
                                 sample += opacity;
-                                double color_weight = packed_source ? 255 * weight : opacity;
+                                double color_weight = premultiplied_source ? 255 * weight : opacity;
                                 colors[0] += color.r * color_weight;
                                 colors[1] += color.g * color_weight;
                                 colors[2] += color.b * color_weight;
