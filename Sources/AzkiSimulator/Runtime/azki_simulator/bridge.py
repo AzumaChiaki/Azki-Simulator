@@ -319,7 +319,17 @@ def decode_frame(header: bytes, pixels: bytes, expected: tuple[int, int]):
     return seq, width, height, bytes(rgb)
 
 
-def read_frame(root: Path, expected: tuple[int, int] = (212, 520)) -> tuple[int, int, int, bytes]:
+def read_frame_raw(root: Path, expected: tuple[int, int] = (212, 520),
+                   previous_sequence: int | None = None) -> tuple[int, int, int, bytes] | None:
+    """Read stable little-endian RGB565 pixels without RGB/PNG conversion.
+
+    A matching sequence skips only the pixel copy, after the same ownership,
+    regular-file, size, format and exact-geometry checks as a complete read.
+    Callers must scope previous_sequence to this session, not just a device ID.
+    """
+    if previous_sequence is not None and (type(previous_sequence) is not int or
+                                         not 0 <= previous_sequence <= 0xffffffff):
+        raise BridgeError("invalid_frame", "Previous frame sequence must be an unsigned 32-bit integer")
     path = root / "frame.raw"
     for _ in range(3):
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -340,13 +350,24 @@ def read_frame(root: Path, expected: tuple[int, int] = (212, 520)) -> tuple[int,
                 raise BridgeError("invalid_frame", "Frame length does not match the declared geometry")
             if seq == 0 or seq & 1:
                 continue
+            if seq == previous_sequence:
+                if os.pread(fd, 32, 0) != header:
+                    continue
+                return None
             pixels = os.pread(fd, stride * height, 32)
             if os.pread(fd, 32, 0) != header or len(pixels) != stride * height:
                 continue
-            return decode_frame(header, pixels, expected)
+            return seq, width, height, pixels
         finally:
             os.close(fd)
     raise BridgeError("frame_not_ready", "Frame is being updated")
+
+
+def read_frame(root: Path, expected: tuple[int, int] = (212, 520)) -> tuple[int, int, int, bytes]:
+    """Compatibility RGB888 snapshot using the same validated raw reader."""
+    seq, width, height, pixels = read_frame_raw(root, expected)
+    header = struct.pack("<8s6I", b"Q66FRAME", 1, seq, width, height, width * 2, 1)
+    return decode_frame(header, pixels, expected)
 
 
 def png_bytes(width, height, rgb):

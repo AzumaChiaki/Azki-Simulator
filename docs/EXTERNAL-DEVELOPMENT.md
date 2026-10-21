@@ -37,6 +37,27 @@ socket paths. Retain failed sessions for diagnostics instead of deleting their
 data or constructing ownership files manually. Firmware Native registrations
 held only in RAM are not made persistent by disk snapshot support.
 
+## Raw LCD frames
+
+External integrations may import `azki_simulator.bridge.read_frame_raw(root,
+expected=(212, 520), previous_sequence=None)` from this app's Runtime. It returns
+`(sequence, width, height, pixels)`, where `pixels` is the guest's tightly packed,
+row-major **little-endian RGB565** data (`width * height * 2` bytes). This avoids
+Python RGB888 conversion and PNG compression on the interactive display path.
+It does not request a new guest render or increase the firmware's frame rate.
+
+An unsigned 32-bit `previous_sequence` may return `None` for an unchanged frame.
+The reader still checks the owned, non-symlinked, single-link regular file,
+bounded exact length, format, exact selected geometry and two stable even
+headers before returning `None`. A new frame also requires a complete pixel copy
+between matching headers. Scope sequence caches to the **session identity**;
+after a restart, the same instance UUID can publish reused sequence numbers.
+
+`read_frame(root, expected)` continues to return RGB888 snapshots with the same
+quantization as before, and existing PNG screenshot consumers remain compatible.
+Run `python3 -m unittest discover -s tests -p test_frame_raw.py -v` for the format,
+ownership, link, length and concurrent-update regression tests.
+
 ## Completion evidence
 
 The verified developer adapter publishes `developer-run.json` at the session
