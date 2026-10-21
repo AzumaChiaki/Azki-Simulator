@@ -14,7 +14,7 @@ from azki_simulator.bridge import SessionBridge, create_session, request, privat
 
 
 BUNDLED_ACTIONS = ("library-catalog", "library-import", "library-delete", "library-delete-all", "library-probe", "prepare-bundled", "instance-storage-finish",
-                   "instance-identity", "instance-settings", "instance-delete", "instance-reset", "sessions-cleanup")
+                   "instance-identity", "instance-settings", "instance-parameters", "instance-delete", "instance-reset", "sessions-cleanup")
 ACTION_FAILURES = {
     "library-catalog": "读取固件库失败，请稍后重试",
     "library-import": "导入固件失败，请确认所选文件是完整的 OTA 固件包后重试",
@@ -25,6 +25,7 @@ ACTION_FAILURES = {
     "instance-storage-finish": "保存本次运行的数据失败；已保存的快照保持不变，下次启动会自动整理",
     "instance-identity": "读取实例身份失败",
     "instance-settings": "读取或保存实例设置失败",
+    "instance-parameters": "读取或应用设备参数失败",
     "instance-delete": "删除实例数据失败",
     "instance-reset": "整理实例数据失败；已保存的数据未被删除",
     "sessions-cleanup": "清理临时会话失败",
@@ -65,6 +66,11 @@ def main():
         if action == "instance-settings":
             library.add_argument("--instance-id", required=True)
             library.add_argument("--set", help="Replace the instance settings with this JSON document")
+        if action == "instance-parameters":
+            library.add_argument("--instance-id", required=True)
+            library.add_argument("--profile-id", required=True)
+            library.add_argument("--session", type=Path, help="Exact selected instance session; omit for stopped settings")
+            library.add_argument("--set", help='One typed field JSON, e.g. {"live.heartRate":90}; never auto-restart')
         if action == "instance-storage-finish":
             library.add_argument("--session", type=Path, required=True)
             library.add_argument("--instance-id", required=True)
@@ -205,6 +211,15 @@ def bundled_action(args):
                 raise instance_settings.SettingsError("设置内容过大")
             instance_settings.save(args.library_root, args.instance_id, json.loads(args.set))
         return instance_settings.describe(args.library_root, args.instance_id)
+    if args.action == "instance-parameters":
+        from azki_simulator.device_parameters import execute
+        if args.set is not None and len(args.set.encode("utf-8")) > 65536:
+            raise ValueError("参数内容过大")
+        values = json.loads(args.set) if args.set is not None else None
+        if args.set is not None and not isinstance(values, dict):
+            raise ValueError("参数写入必须是 JSON 对象")
+        return {"ok": True, **execute(args.engine_root, args.library_root, args.instance_id,
+            args.profile_id, args.session, values)}
     if args.action == "instance-delete":
         from azki_simulator import instance_settings
         return instance_settings.discard(args.library_root, args.instance_id)

@@ -79,3 +79,71 @@ before/after atomic publication.
 Build the app with the documented workflow in [BUILDING.md](BUILDING.md). Keep
 Engine, firmware images, private instance data and local completion records out
 of the source commit.
+
+## Discoverable device parameters
+
+The Runtime also exposes `instance-parameters`. It resolves the exact imported
+profile, then combines supported board inputs with saved instance settings and
+post-stop firmware property observations. It never opens a window, starts a
+core, downloads firmware, or changes another instance.
+
+```sh
+"$ENGINE/python/bin/python3.12" -I -S -B "$RUNTIME/azki-simulator.py" \
+  instance-parameters --engine-root "$ENGINE" --library-root "$LIBRARY" \
+  --instance-id "$INSTANCE" --profile-id "$PROFILE"
+```
+
+Add `--session "$SESSION"` for authenticated live input readback. The session
+must match both the requested UUID and exact profile before any IPC. Add
+`--set '{"live.heartRate":90}'` to change one advertised field. A restart setting
+example is `--set '{"boot.health.heartRate":90}'`; saving it does not restart an
+instance. Do not send the same incremental action again after an uncertain
+reply. Only the fixed existing board input and settings interfaces are used.
+
+Responses have `schema_version: 1`, `instance`, `model`, `running`, `parameters`
+and `notes`. Each parameter has `id`, `label`, `group`, `type`, `value`,
+`available`, `readOnly`, `applyMode` (`live` or `restart`), and `description`.
+Numeric fields include `minimum`, `maximum`, `step`; enumerations use
+`options: [{value,label}]`. Unsupported fields explain `reason`. Null resets
+only fields marked `nullable`; `writeOnly` actions have no current value.
+
+`valueSource` distinguishes modeled hardware input, next-start configuration,
+and the firmware's last stopped property dump. `requestedValue` is a saved
+configuration, while `observedValue` is present only when the firmware property
+dump actually reported it; `observedAt` is Unix seconds. Live pulse/battery
+inputs are not firmware-display measurements. Battery percentage writes change
+voltage and the firmware follows its own estimation curve; its visible percent
+may change gradually. Raw ADC counters indicate register consumption, not that
+an application displayed the requested result.
+
+Successful writes return `applied`, `restart_required`, `guestObserved: false`
+and a fresh `parameters` schema. `receipt` contains the underlying live reply.
+A `refresh_error` after a successful write must not trigger automatic resending.
+
+External launchers should use the returned `start_options`: pass `skipOOBE` as
+`--skip-oobe` / `--no-skip-oobe` and, when explicitly configured,
+`virtualIdentity` as `--virtual-serial` / `--virtual-address` to
+`prepare-bundled`. Existing native app preferences are separate and unchanged.
+
+| Native app controls | External schema / behavior |
+| --- | --- |
+| Device model, firmware, LCD dimensions | Read-only resolved identity/geometry; create a corresponding instance to change model |
+| Instance display name | SDK instance-management metadata; no firmware property |
+| Skip first setup | `boot.skipOOBE`, next start; existing settings/data preserved |
+| Virtual serial/address | `identity.current` last saved public identity; `boot.virtualIdentity` validated JSON, next start |
+| Worn, pulse, cadence | `live.*` when the exact running board reports support; `boot.health.*` for next start |
+| Walk now / walk at boot | `live.addSteps` one-shot input; `boot.health.walkSteps` |
+| Battery level/raw voltage, charger | `live.batteryLevel`/`batteryRaw`/`charger`; `boot.battery.*`; no claimed displayed battery percentage |
+| Temperature | `live.temperatureC` only for verified board/thermistor mapping |
+| PMU sampling channels | Eight `adc.*` words with read counts and input versions, only when the pinned core advertises support |
+| Clock/date | `boot.clock.mode` and `boot.clock.offsetSeconds` |
+| Language, 12/24 hour, timezone | Dynamically returned `property.persist.*` values |
+| Every observed/custom persistent property | Union of firmware observations and saved overrides; `boot.propertyOverrides` allows adding/removing validated custom keys |
+| Touch and swipe | Existing real LCD `input` interface; no synthetic Home page or fabricated physical key |
+| Virtual guest connection | Read-only capability; dedicated pairing/install protocol performs operations |
+| External Bluetooth advertising | Read-only unavailable with reason: managed by native CoreBluetooth permission host |
+| GDB enable/wait/port | Read-only with reason: native host launch feature, not exposed by developer runner |
+| Native connection timeout | Read-only with reason: native host preference; SDK install retains its explicit timeout option |
+| Log follow/viewport zoom/panels | Host UI preferences, not device parameters |
+
+Run `python3 -m unittest discover -s tests -p test_device_parameters.py -v`.
