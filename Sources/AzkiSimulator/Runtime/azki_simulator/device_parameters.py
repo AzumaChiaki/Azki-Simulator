@@ -15,7 +15,7 @@ from pathlib import Path
 
 from . import instance_settings as settings
 from .bridge import request, private_root, regular_bytes, MAX_MESSAGE
-from .minative import MError, battery_inputs, health_sensors
+from .minative import MError, battery_inputs, health_sensors, board_hardware
 from .instance_storage import public_instance_identity, requested_virtual_identity
 
 HOST_FILE = "external-settings.json"
@@ -159,7 +159,7 @@ def describe(library, instance, item, call=None):
             extra["options"] = _options(settings.CHARGERS)
         add("boot." + section + "." + key, label, kind, saved.get(section, {}).get(key), "启动传感器", available=bool(cap),
             reason=None if cap else "此机型没有对应模拟硬件", description="空值使用固件/模拟器默认；只在下次启动时生效", **extra)
-    add("boot.battery.gauge", "电量计型号", "string", battery.get("gauge"), "启动传感器", readonly=True,
+    add("boot.battery.gauge", "电量计型号", "string", (board_hardware(model) or {}).get("batteryGauge"), "启动传感器", readonly=True,
         reason="由硬件预设决定；不接受与机型不一致的电量计")
     clock = saved["clock"]
     add("boot.clock.mode", "开机时间模式", "enum", clock["mode"], "时间", options=_options(("host", "offset", "firmware")), valueSource="next-start-config")

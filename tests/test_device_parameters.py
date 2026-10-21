@@ -36,6 +36,8 @@ class DeviceParametersTests(unittest.TestCase):
     def test_stopped_live_disabled_and_boot_capability(self):
         self.assertFalse(self.row('live.heartRate')['available']); self.assertTrue(self.row('boot.health.heartRate')['available'])
         self.assertFalse(self.schema()['running'])
+        self.assertEqual('hp4560',self.row('boot.battery.gauge')['value'])
+        self.assertTrue(self.row('boot.battery.gauge')['readOnly'])
     def test_no_false_battery_percentage_observation(self):
         row=self.row('live.batteryLevel',self.schema(self.call))
         self.assertIsNone(row['value']);self.assertIsNone(row['observedValue']);self.assertTrue(row['writeOnly'])
