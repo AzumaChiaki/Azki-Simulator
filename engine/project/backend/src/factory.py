@@ -73,6 +73,12 @@ def random_properties():
 
 def product_definition(model):
     """Read model, PID and board identity from this target's original ROMFS."""
+    # q66ys has no bundled ROMFS of its own (metadata-only preset); its
+    # identity is pinned here from the vendor spec instead of the AP table.
+    if model == 'miwear.watch.q66ys':
+        return {'miwear_model': model, 'miwear_pid': '40471', 'board_id': 7,
+                'device_name': 'Xiaomi Smart Band 11', 'device_model': 'M2617B1',
+                'isnfc': True}
     firmware = Path(__file__).resolve().parents[1] / 'firmware/vela_ap.bin'
     data = firmware.read_bytes()
     marker = data.find(b'"product_info":')

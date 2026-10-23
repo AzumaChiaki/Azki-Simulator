@@ -50,7 +50,8 @@ PRODUCT_NAMES = {
     "n66": "小米手环 9", "n67": "小米手环 9 Pro", "o66": "小米手环 10", "p67": "小米手环 10 Pro", "q66": "小米手环 11",
     "p65": "红米手表6", "q65": "红米手表7"}
 BRANCH_NAMES = {
-    "cn": "标准版", "nfc": "NFC 版", "tc": "陶瓷版", "lj": "耀影金版", "glt": "GLT", "u": "U", "": ""}
+    "cn": "标准版", "nfc": "NFC 版", "tc": "陶瓷版", "lj": "耀影金版", "glt": "GLT", "u": "U",
+    "ys": "原神定制版", "": ""}
 
 
 def display_name(profile):
@@ -639,9 +640,10 @@ class FirmwareCatalog:
     def hardware_models(self):
         """Instance hardware presets: every product model the catalog describes."""
         # q65 is metadata-only: its firmware is supplied by the user and is
-        # intentionally not represented as a bundled profile.
+        # intentionally not represented as a bundled profile. q66ys shares the
+        # q66 hardware family and is likewise user-supplied only.
         return sorted({profile["model"] for profile in self.profiles.values()} |
-                      {"miwear.watch.p65", "miwear.watch.q65"})
+                      {"miwear.watch.p65", "miwear.watch.q65", "miwear.watch.q66ys"})
 
     def hardware_presets(self):
         """Instance hardware presets for the UI: model metadata, no firmware version."""
@@ -652,8 +654,17 @@ class FirmwareCatalog:
                                                "width": profile["width"], "height": profile["height"]})
         rows.setdefault("miwear.watch.p65", {"model": "miwear.watch.p65", "displayName": "红米手表6", "width": 432, "height": 514})
         rows.setdefault("miwear.watch.q65", {"model": "miwear.watch.q65", "displayName": "红米手表7", "width": 432, "height": 514})
+        # q66ys shares the q66 body (212x520) and inherits every q66 behavior
+        # by prefix; only its identity differs. It sits right below the
+        # ceramic (tc) edition, ahead of the alphabetical q66u placement.
+        rows.setdefault("miwear.watch.q66ys", {"model": "miwear.watch.q66ys", "displayName": "小米手环 11 原神定制版",
+                                               "width": 212, "height": 520})
         tail = {"miwear.watch.p65": 0, "miwear.watch.q65": 1}
-        return [rows[model] for model in sorted(rows, key=lambda value: (value in tail, tail.get(value, 0), value))]
+        # Alphabetical order places q66ys after q66u; the Genshin edition
+        # belongs directly below the ceramic (tc) edition, so remap its key.
+        keys = {"miwear.watch.q66ys": "miwear.watch.q66tc~"}
+        return [rows[model] for model in sorted(
+            rows, key=lambda value: (value in tail, tail.get(value, 0), keys.get(value, value)))]
 
     def _object_path(self, digest, size, index):
         """Library (or permitted bundled) object path, else None."""

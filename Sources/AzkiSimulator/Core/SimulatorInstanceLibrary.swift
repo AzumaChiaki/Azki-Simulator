@@ -104,13 +104,23 @@ final class SimulatorInstanceLibrary {
     /// always the user's own import, so a preset never implies a version.
     var deviceModels: [BundledDevicePreset] {
         let tail: [String: Int] = ["miwear.watch.p65": 0, "miwear.watch.q65": 1]
-        return catalog.devicePresets.sorted {
+        let sorted = catalog.devicePresets.sorted {
             let left = tail[$0.model]
             let right = tail[$1.model]
             if (left != nil) != (right != nil) { return left == nil }
             if let left, let right, left != right { return left < right }
             return $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
         }
+        // The Genshin edition belongs directly below the ceramic edition,
+        // not wherever localized display-name order happens to place it.
+        guard let genshin = sorted.first(where: { $0.model == "miwear.watch.q66ys" }) else { return sorted }
+        var result = sorted.filter { $0.model != "miwear.watch.q66ys" }
+        if let ceramicIndex = result.firstIndex(where: { $0.model == "miwear.watch.q66tc" }) {
+            result.insert(genshin, at: result.index(after: ceramicIndex))
+        } else {
+            result.append(genshin)
+        }
+        return result
     }
 
     @discardableResult func create(model: String, name: String) -> SimulatorInstanceContext? {
