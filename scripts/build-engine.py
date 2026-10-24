@@ -7,6 +7,7 @@ README. Final outputs live in dist; temporary work is cleaned. No guest is execu
 from __future__ import annotations
 
 import argparse
+import filecmp
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
@@ -236,8 +237,16 @@ def unpack(archive, parent):
 
 
 def copytree(source, target):
-    shutil.copytree(source, target, dirs_exist_ok=True,
+    shutil.copytree(source, target, dirs_exist_ok=True, copy_function=copy_if_changed,
                     ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.DS_Store'))
+
+
+def copy_if_changed(source, target):
+    # A fresh checkout gives every overlay file a new mtime; leaving identical
+    # files untouched keeps a cached QEMU build tree incremental.
+    if not (os.path.isfile(target) and filecmp.cmp(source, target, shallow=False)):
+        shutil.copy2(source, target)
+    return target
 
 
 def macho(path):

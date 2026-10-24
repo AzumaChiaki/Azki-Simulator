@@ -3,16 +3,27 @@ name: Build and release DMG
 on:
   push:
     branches: [main]
+    # Documentation-only pushes would otherwise cut an identical Release.
+    paths-ignore: ['**/*.md', 'docs/**']
+  # Pull requests are built and tested but never published.
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      clean:
+        description: Build without the cached engine dependencies
+        type: boolean
+        default: false
 
 # Publishing a Release needs write access to repository contents only.
 permissions:
   contents: write
 
 # Never cancel a run that may be uploading Release assets; queue instead.
+# A newer push to the same pull request supersedes its previous build.
 concurrency:
   group: dmg-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -46,10 +57,36 @@ jobs:
       - name: Install build dependencies
         run: brew install python@3.12 meson ninja pkgconf glib gettext libffi pcre2 zstd dtc
       - name: Select build Python
-        run: echo "$(brew --prefix python@3.12)/libexec/bin" >> "$GITHUB_PATH"
+        id: deps
+        run: |
+          echo "$(brew --prefix python@3.12)/libexec/bin" >> "$GITHUB_PATH"
+          # Cached build trees link against these Homebrew libraries.
+          echo "brew=$(brew list --versions python@3.12 glib gettext libffi pcre2 zstd dtc openssl@3 | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - name: Run tests
+        run: python3 -B -m unittest discover -s tests -p 'test_*.py'
+      # QEMU and CPython dominate build time. The key prefix pins everything
+      # that is not tracked by the incremental build (recipe, toolchain and
+      # Homebrew libraries); within it the newest tree is reused and only
+      # changed engine sources are rebuilt. Saved only after a full success.
+      - name: Restore engine dependency cache
+        if: ${{ !inputs.clean }}
+        uses: actions/cache@v6
+        with:
+          path: build  # build-engine.py's default dependency cache
+          key: engine-${{ runner.arch }}-xcode26.2-${{ hashFiles('scripts/build-engine.py') }}-${{ steps.deps.outputs.brew }}-${{ hashFiles('engine/**') }}
+          restore-keys: engine-${{ runner.arch }}-xcode26.2-${{ hashFiles('scripts/build-engine.py') }}-${{ steps.deps.outputs.brew }}-
       - name: Build app, DMG and corresponding sources
         run: ./scripts/build-dmg.sh dist
+      - name: Upload pull request DMG
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dmg-pr${{ github.event.number }}
+          path: dist/*.dmg
+          retention-days: 7
+          compression-level: 0
       - name: Publish Release
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.number.outputs.tag }}
