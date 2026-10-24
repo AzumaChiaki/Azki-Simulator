@@ -29,6 +29,7 @@ typedef struct {
 typedef struct { double x0, y0, x1, y1; } BesGpuEdge;
 typedef struct { double x; int winding; } BesGpuCross;
 typedef struct { unsigned r, g, b, a; } BesGpuColor;
+typedef struct { unsigned left, top, right, bottom; } BesGpuBounds;
 
 /* Keep channels explicit inside the renderer. VGLite's constant color A02
  * is ABGR, but its index-image CLUT entries are ARGB. They are not the same
@@ -392,24 +393,32 @@ static int gpu_sw_cross_compare(const void *a, const void *b)
     return (x > y) - (x < y);
 }
 
-static uint8_t *gpu_sw_coverage(BesGpuWork *w, BesGpuTarget *t,
+static bool gpu_sw_bounds(BesGpuWork *w, BesGpuTarget *t,
+                          const uint8_t *data, unsigned bytes, bool path,
+                          BesGpuBounds *b)
+{
+    if (!path && bytes != 8) {
+        return gpu_sw_fail(w, "invalid rectangle DATA");
+    }
+    /* Rectangle DATA is already the firmware's clipped rectangle. Paths
+     * use the explicit tessellation/scissor bounds. Keep those semantics
+     * while avoiding a whole-target allocation and scan for every glyph. */
+    unsigned x = path ? w->regs[0xa39] & 0xffff : lduw_le_p(data);
+    unsigned y = path ? w->regs[0xa39] >> 16 : lduw_le_p(data + 2);
+    unsigned width = path ? w->regs[0xa3a] & 0xffff : lduw_le_p(data + 4);
+    unsigned height = path ? w->regs[0xa3a] >> 16 : lduw_le_p(data + 6);
+    *b = (BesGpuBounds) {MIN(t->width, x), MIN(t->height, y),
+        MIN(t->width, x + width), MIN(t->height, y + height)};
+    return true;
+}
+
+static uint8_t *gpu_sw_coverage(BesGpuWork *w, const BesGpuBounds *b,
                                const uint8_t *data, unsigned bytes, bool path)
 {
-    uint8_t *coverage = g_malloc0(t->width * t->height);
+    unsigned width = b->right - b->left, height = b->bottom - b->top;
+    uint8_t *coverage = g_malloc0(MAX(1, width * height));
     if (!path) {
-        if (bytes != 8) {
-            gpu_sw_fail(w, "invalid rectangle DATA");
-            g_free(coverage);
-            return NULL;
-        }
-        unsigned x = lduw_le_p(data), y = lduw_le_p(data + 2);
-        unsigned right = MIN(t->width, x + lduw_le_p(data + 4));
-        unsigned bottom = MIN(t->height, y + lduw_le_p(data + 6));
-        for (; y < bottom; y++) {
-            if (x < right) {
-                memset(coverage + y * t->width + x, 16, right - x);
-            }
-        }
+        memset(coverage, 16, width * height);
         return coverage;
     }
     g_autofree BesGpuEdge *edges = g_new(BesGpuEdge, BES_GPU_EDGES);
@@ -419,14 +428,12 @@ static uint8_t *gpu_sw_coverage(BesGpuWork *w, BesGpuTarget *t,
         g_free(coverage);
         return NULL;
     }
-    if ((w->edge_budget += (uint64_t)count * t->height * 4) > 32 * 1024 * 1024) {
+    if ((w->edge_budget += (uint64_t)count * height * 4) > 32 * 1024 * 1024) {
         gpu_sw_fail(w, "path work limit");
         g_free(coverage);
         return NULL;
     }
-    unsigned left = w->regs[0xa39] & 0xffff, top = w->regs[0xa39] >> 16;
-    unsigned right = MIN(t->width, left + (w->regs[0xa3a] & 0xffff));
-    unsigned bottom = MIN(t->height, top + (w->regs[0xa3a] >> 16));
+    unsigned left = b->left, top = b->top, right = b->right, bottom = b->bottom;
     for (unsigned y = top; y < bottom; y++) {
         for (unsigned sy = 0; sy < 4; sy++) {
             double yy = y + (sy + 0.5) / 4;
@@ -453,7 +460,7 @@ static uint8_t *gpu_sw_coverage(BesGpuWork *w, BesGpuTarget *t,
                     for (unsigned sx = 0; sx < 4; sx++) {
                         double xx = x + (sx + 0.5) / 4;
                         if (xx >= cross[i].x && xx < cross[i + 1].x) {
-                            coverage[y * t->width + x]++;
+                            coverage[(y - top) * width + x - left]++;
                         }
                     }
                 }
@@ -509,11 +516,18 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
         }
     }
     BesGpuTarget *t = gpu_sw_target(w, read);
-    if (!t || ++w->draws > 256 ||
-        (w->budget += t->width * t->height) > 8 * 1024 * 1024) {
+    BesGpuBounds bounds;
+    if (!t || ++w->draws > 256) {
         return gpu_sw_fail(w, w->error ? w->error : "draw work limit");
     }
-    g_autofree uint8_t *coverage = gpu_sw_coverage(w, t, data, bytes, path);
+    if (!gpu_sw_bounds(w, t, data, bytes, path, &bounds)) {
+        return false;
+    }
+    unsigned coverage_width = bounds.right - bounds.left;
+    if ((w->budget += (uint64_t)coverage_width * (bounds.bottom - bounds.top)) > 8 * 1024 * 1024) {
+        return gpu_sw_fail(w, "draw work limit");
+    }
+    g_autofree uint8_t *coverage = gpu_sw_coverage(w, &bounds, data, bytes, path);
     if (!coverage) {
         return false;
     }
@@ -563,9 +577,9 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
         }
     }
     BesGpuColor constant = gpu_sw_color_abgr(r[0xa02]);
-    for (unsigned y = 0; y < t->height; y++) {
-        for (unsigned x = 0; x < t->width; x++) {
-            unsigned cov = coverage[y * t->width + x];
+    for (unsigned y = bounds.top; y < bounds.bottom; y++) {
+        for (unsigned x = bounds.left; x < bounds.right; x++) {
+            unsigned cov = coverage[(y - bounds.top) * coverage_width + x - bounds.left];
             if (!cov) {
                 continue;
             }
