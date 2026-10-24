@@ -515,6 +515,15 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
     smoke="import sys; from pathlib import Path; assert Path(sys.prefix).resolve()==Path(sys.executable).resolve().parent.parent; sys.path.insert(0,sys.argv[1]); import PIL.Image, littlefs, ctypes, socket, zlib; print('Engine Python imports ready')"
     run([engine/'python/bin/python3.12','-I','-S','-B','-c',smoke,site],env={**env,'PYTHONDONTWRITEBYTECODE':'1'})
     run([build/'qemu-system-arm','--version'],env=env)
+    # Startup validation requires every directory on disk to be implied by the
+    # manifest file list; empty directories have no file entries and would be
+    # rejected as "unregistered", so prune them before the manifest is built.
+    changed=True
+    while changed:
+        changed=False
+        for p in sorted(engine.rglob('*'),reverse=True):
+            if p.is_dir() and not any(p.iterdir()):
+                p.rmdir();changed=True
     for p in engine.rglob('*'):
         if p.is_file():p.chmod(p.stat().st_mode & ~0o022)
     files=[{'path':p.relative_to(engine).as_posix(),'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'executable':bool(p.stat().st_mode&0o111)} for p in sorted(engine.rglob('*')) if p.is_file()]

@@ -135,8 +135,12 @@ def _run(profile, args, logdir):
                                 instance_nor_result_geometry)
     if profile['model'] != 'miwear.watch.q65' or profile['ap']['chip'] != 'best1502p':
         raise ValueError('Q65 requires its exact BEST1502P profile')
-    if args.gdb is not None or args.instance_settings:
-        raise ValueError('Q65 debugger/instance settings are not implemented')
+    if args.instance_settings:
+        raise ValueError('Q65 instance settings are not implemented')
+    if args.gdb is not None and not 0 <= args.gdb <= 65535:
+        raise ValueError('Invalid Q65 debugger port')
+    if args.gdb_wait and args.gdb is None:
+        raise ValueError('--gdb-wait requires --gdb')
     virtual_state = peer = None
     if args.virtual_peer_state:
         from .virtual_peer.state import load_state
@@ -216,6 +220,13 @@ def _run(profile, args, logdir):
             command += ['-serial', f'file:{logdir / ("uart" + str(index) + ".log")}']
         if peer is not None:
             command += ['-chardev', f'socket,id=radio,path={peer.hci_path}']
+        if args.gdb is not None:
+            # Loopback only. Port 0 lets QEMU pick a free loopback port; the
+            # actual endpoint is resolved over QMP below and published in
+            # control.json, matching the azki-p65 runner behavior.
+            command += ['-gdb', f'tcp:127.0.0.1:{args.gdb}']
+            if args.gdb_wait:
+                command.append('-S')
         write_json(logdir / 'launch.json', {'command': command})
         control = connection = None
         with (logdir / 'stderr.log').open('w') as stderr:
@@ -232,8 +243,21 @@ def _run(profile, args, logdir):
                 control = WatchControl(connection, temporary, log_directory=logdir, frame_file=frame)
                 input_path = Path(temporary) / 'input.sock'
                 control.serve_input(input_path)
+                gdb_endpoint = None
+                if args.gdb is not None:
+                    gdb_endpoint = {'host': '127.0.0.1', 'port': args.gdb, 'waitForAttach': bool(args.gdb_wait)}
+                    for chardev in control.execute('query-chardev'):
+                        if chardev.get('label') == 'gdb':
+                            match = re.search(r'tcp:127\.0\.0\.1:([0-9]{1,5})(?:,|$)', chardev.get('filename', ''))
+                            if match:
+                                gdb_endpoint['port'] = int(match[1])
+                    if not 0 < gdb_endpoint['port'] <= 65535:
+                        raise RuntimeError('GDB server port could not be determined')
+                    print(f"GDB server: target remote 127.0.0.1:{gdb_endpoint['port']}"
+                          + ('; CPU held at reset until the debugger continues.' if args.gdb_wait else ''), flush=True)
                 write_json(logdir / 'control.json', dict(qmp=str(qmp_path), framebuffer=str(frame),
                            pid=proc.pid, input_socket=str(input_path),
+                           **({'gdb': gdb_endpoint} if gdb_endpoint is not None else {}),
                            **({'virtual_peer': peer.descriptor()} if peer is not None else {})))
                 print('Q65 BEST1502P running with AP/resource/audio/sensor from selected OTA', flush=True)
                 while proc.poll() is None and not interrupted:

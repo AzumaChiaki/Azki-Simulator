@@ -181,16 +181,45 @@ final class StandaloneRuntimeModel {
 
     /// The broker retires the helper shortly after the guest exits, so the
     /// final status may never be polled. The run's own result is authoritative.
-    nonisolated static func guestPowerOutcome(session: URL) -> String? {
+    nonisolated private static func runResult(session: URL) -> [String: Any]? {
         let broker = session.appendingPathComponent("native-broker/config.json")
         guard let config = try? StandaloneSandboxFiles.regular(broker, limit: 4_096, privateOnly: true),
               let run = (try? JSONSerialization.jsonObject(with: config) as? [String: Any])?["run"] as? String,
               StandaloneBrokerConfiguration.validRun(run),
               let data = try? StandaloneSandboxFiles.regular(session.appendingPathComponent(run + "/result.json"),
-                                                             limit: 1_048_576, privateOnly: true),
-              let outcome = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["outcome"] as? String,
+                                                             limit: 1_048_576, privateOnly: true) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    nonisolated static func guestPowerOutcome(session: URL) -> String? {
+        let result = runResult(session: session)
+        guard let outcome = result?["outcome"] as? String,
               ["guest_poweroff", "guest_reboot"].contains(outcome) else { return nil }
         return outcome
+    }
+
+    /// A visible reason for unexpected session ends. Guest faults and host
+    /// errors otherwise only retire the process with a neutral status line.
+    nonisolated private static func abnormalEndMessage(_ result: [String: Any]) -> String? {
+        guard let outcome = result["outcome"] as? String else { return nil }
+        switch outcome {
+        case "guest_fault":
+            var lines = ["设备异常崩溃：固件遇到硬错误，进程已回收。"]
+            if let seconds = result["runtime_seconds"] as? Double {
+                lines.append(String(format: "本次运行时长：%.1f 秒。", seconds))
+            }
+            if let faults = result["fault_addresses"] as? [String], !faults.isEmpty {
+                lines.append("出错地址：" + faults.joined(separator: ", "))
+            }
+            lines.append("实例数据按崩溃时的状态保留；可点击「运行」重新开机。")
+            return lines.joined(separator: "\n")
+        case "host_error":
+            let detail = (result["qmp_error"] as? String) ?? ""
+            return "设备启动失败：" + (detail.isEmpty ? "宿主组件出错，请查看会话诊断。" : detail)
+                + "\n修正后可重新点击「运行」。"
+        default:
+            return nil
+        }
     }
 
     var canStartPrepared: Bool { (prepared != nil || bundledPrepared != nil) && !isBusy && !isServing && !runtimeSession.isAttached }
@@ -752,6 +781,7 @@ final class StandaloneRuntimeModel {
         process.terminationHandler = { [weak self] completed in
             Task { @MainActor [weak self] in
                 guard let self, self.helper === completed, !self.isStopping else { return }
+                let runResult = self.sessionURL.flatMap(Self.runResult(session:))
                 let guestPower = self.sessionURL.flatMap(Self.guestPowerOutcome(session:))
                 let failure = guestPower != nil ? nil : Self.helperFailureMessage(completed, output: self.helperOutput,
                     duringStartup: self.startingHelper === completed)
@@ -764,11 +794,17 @@ final class StandaloneRuntimeModel {
                     await self.continueAfterGuestPower(guestPower)
                     return
                 }
-                self.statusMessage = stopped
-                    ? (failure == nil ? "会话已结束，本应用创建的进程已回收" : "会话 helper 意外退出，本应用创建的进程已回收")
-                    : "会话已结束，但客体回收尚未确认；请重试停止"
-                if let failure { self.errorMessage = failure + (stopped ? "" : "\n客体进程组回收尚未确认") }
-                else if !stopped { self.errorMessage = "客体进程组回收尚未确认" }
+                let abnormal = runResult.flatMap(Self.abnormalEndMessage)
+                if let abnormal {
+                    self.statusMessage = "设备已异常结束；实例数据已保留，可重新点击「运行」"
+                    self.errorMessage = abnormal
+                } else {
+                    self.statusMessage = stopped
+                        ? (failure == nil ? "会话已结束，本应用创建的进程已回收" : "会话 helper 意外退出，本应用创建的进程已回收")
+                        : "会话已结束，但客体回收尚未确认；请重试停止"
+                    if let failure { self.errorMessage = failure + (stopped ? "" : "\n客体进程组回收尚未确认") }
+                    else if !stopped { self.errorMessage = "客体进程组回收尚未确认" }
+                }
             }
         }
     }

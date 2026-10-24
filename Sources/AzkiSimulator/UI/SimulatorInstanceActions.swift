@@ -135,6 +135,7 @@ import SwiftUI
                     .disabled(!SimulatorInstanceActions.importFirmware(instance))
                     .accessibilityIdentifier("simulator.import-firmware")
                 Button("截图", systemImage: "camera") { SimulatorInstanceActions.screenshot(instance) }
+                    .help("保存当前设备画面截图")
                     .disabled(instance.runtime.runtimeSession.image == nil)
                 Button(instance.recording.isRecording ? "停止录屏" : "录屏",
                        systemImage: instance.recording.isRecording ? "stop.circle" : "record.circle") {
@@ -149,11 +150,13 @@ import SwiftUI
                     Button("表冠", systemImage: "button.programmable") {
                         instance.runtime.runtimeSession.sendDeviceButton("crown")
                     }
+                    .help("按下表冠（旋转表盘/打开应用抽屉）")
                     .disabled(!SimulatorInstanceActions.watchButtonsAvailable(instance))
                     .accessibilityIdentifier("simulator.watch.crown")
                     Button("下键", systemImage: "hand.tap") {
                         instance.runtime.runtimeSession.sendDeviceButton("lower")
                     }
+                    .help("按下下键（返回/息屏）")
                     .disabled(!SimulatorInstanceActions.watchButtonsAvailable(instance))
                     .accessibilityIdentifier("simulator.watch.lower.single")
                 }

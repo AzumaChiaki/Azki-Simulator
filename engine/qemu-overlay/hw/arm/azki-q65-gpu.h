@@ -492,9 +492,13 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
     bool solid_rectangle = (r[0xa00] == 0x10000001 ||
                             r[0xa00] == 0x10000102) && bytes == 8;
     bool path = !solid_rectangle && r[0xa00] != 0x2181 && r[0xa00] != 0x10001181 &&
-                r[0xa00] != 0x10002181;
+                r[0xa00] != 0x10002181 && r[0xa00] != 0x10001081;
     bool image = !solid_rectangle && r[0xa00] != 0x10000102;
-    bool color_mode = r[0xa00] == 0x10001102 || r[0xa00] == 0x10001181;
+    /* 4.100.080 crown-press animation blits use 0x10001081: the public
+     * vg_lite_blit word 0x10000001 | imageMode(0x1000 NORMAL) with the
+     * ahb-read-split bit (1<<7) and no SRC_OVER blend bit. */
+    bool color_mode = r[0xa00] == 0x10001102 || r[0xa00] == 0x10001181 ||
+                      r[0xa00] == 0x10001081;
     bool indexed = r[0xa25] == 0x01000900 || r[0xa25] == 0x01020900;
     bool packed_source = r[0xa25] == 0x41020100 || r[0xa25] == 0x41000100;
     bool rgb565_source = r[0xa25] == 0x01000105 ||
@@ -506,13 +510,16 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
     /* Public convert_source_format: BGRA8888 = 7. Activity pages composite
      * their offscreen BGRA8888 canvas back into the RGB565 display target. */
     /* VGLite format 7 is BGRA8888.  The activity page uses the
-     * 0x01011107 sampler variant in addition to the startup variants. */
+     * 0x01011107 sampler variant in addition to the startup variants.
+     * 4.100.080 icon blits use 0x01020107: BILINEAR (0x20000) with the
+     * default pattern, sampled variant byte 0x20. */
     bool bgra8888_source = (r[0xa25] & 0xff) == 0x07 &&
                            (r[0xa25] >> 24) == 0x01 &&
                            ((r[0xa25] >> 16) & 0xff) <= 0x03 &&
                            (((r[0xa25] >> 8) & 0xff) == 0x01 ||
                             ((r[0xa25] >> 8) & 0xff) == 0x11 ||
-                            ((r[0xa25] >> 8) & 0xff) == 0x21);
+                            ((r[0xa25] >> 8) & 0xff) == 0x21 ||
+                            ((r[0xa25] >> 8) & 0xff) == 0x20);
     /* The Rive paints in Q65's control center use LINEAR with PAD. Their
      * one-row BGRA ramps extend across the path in the other dimension. */
     bool linear_pad = r[0xa25] == 0x01011107;
