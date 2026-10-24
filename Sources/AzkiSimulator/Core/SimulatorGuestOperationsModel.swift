@@ -56,6 +56,8 @@ final class SimulatorGuestOperationsModel {
     @ObservationIgnored private var isRefreshing = false
     @ObservationIgnored private var completedOperationID: String?
     @ObservationIgnored private var inventoryAttempted: Set<PackageKind> = []
+    @ObservationIgnored private var pollTask: Task<Void, Never>?
+    @ObservationIgnored private var pollGeneration = 0
 
     var isBusy: Bool { isRequestInFlight || isResolvingCompletion || operationState == "running" }
     var canConnect: Bool {
@@ -104,9 +106,31 @@ final class SimulatorGuestOperationsModel {
         self.command = command
         self.packagesAvailable = packagesAvailable
         installPackage = install
+        if enabled { ensurePolling() } else { stopPolling() }
+    }
+
+    private func ensurePolling() {
+        guard pollTask == nil else { return }
+        let generation = pollGeneration
+        pollTask = Task { @MainActor [weak self] in
+            while let self, !Task.isCancelled, self.isAvailable, self.pollGeneration == generation {
+                await self.refresh()
+                do { try await Task.sleep(for: .milliseconds(750)) }
+                catch { break }
+            }
+            guard let self, self.pollGeneration == generation else { return }
+            self.pollTask = nil
+        }
+    }
+
+    private func stopPolling() {
+        pollGeneration += 1
+        pollTask?.cancel()
+        pollTask = nil
     }
 
     func invalidate() {
+        stopPolling()
         revision = UUID()
         hostSessionID = nil
         peerProfileID = nil

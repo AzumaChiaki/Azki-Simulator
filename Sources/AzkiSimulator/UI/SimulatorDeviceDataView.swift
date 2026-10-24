@@ -49,12 +49,12 @@ import SwiftUI
             }
             if let liveUnavailable, session.isRunning { note(liveUnavailable) }
             if let message {
-                Text(message).font(.system(size: 12)).foregroundStyle(messageIsError ? .red : SimulatorTheme.secondary)
+                Text(message).font(.system(size: 12)).foregroundStyle(messageIsError ? .red : .secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             note(footer)
             HStack(spacing: 8) {
-                Text("语言、时区、时间格式、开机时间和系统属性：").font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
+                Text("语言、时区、时间格式、开机时间和系统属性：").font(.system(size: 12)).foregroundStyle(.secondary)
                 Button("系统设置…", action: editSystemSettings).disabled(!enabled || runtime.instanceID == nil)
                     .accessibilityIdentifier("simulator.firmware-settings")
             }
@@ -181,7 +181,7 @@ import SwiftUI
     // MARK: - Pieces
 
     private func header(_ text: String) -> some View {
-        Text(text).font(.system(size: 11, weight: .semibold)).foregroundStyle(SimulatorTheme.secondary)
+        Text(text).font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
     }
 
     private func group(_ title: String) -> some View {
@@ -193,14 +193,14 @@ import SwiftUI
     private func label(_ text: String) -> some View { Text(text).frame(minWidth: 72, alignment: .leading) }
 
     private func current(_ text: String) -> some View {
-        Text(text).font(.system(size: 12, design: .monospaced)).foregroundStyle(SimulatorTheme.secondary)
+        Text(text).font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary)
             .frame(minWidth: 130, alignment: .leading)
     }
 
     private func field(_ text: Binding<String>, unit: String, label: String) -> some View {
         HStack(spacing: 4) {
             TextField("", text: text).textFieldStyle(.roundedBorder).frame(width: 80).accessibilityLabel(label)
-            Text(unit).font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
+            Text(unit).font(.system(size: 12)).foregroundStyle(.secondary)
         }
     }
 
@@ -211,7 +211,7 @@ import SwiftUI
     }
 
     private func note(_ text: String) -> some View {
-        Text(text).font(.system(size: 12)).foregroundStyle(SimulatorTheme.secondary)
+        Text(text).font(.system(size: 12)).foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
     }
 

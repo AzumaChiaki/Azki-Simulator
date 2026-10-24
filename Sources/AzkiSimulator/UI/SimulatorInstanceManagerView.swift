@@ -1,216 +1,375 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 @MainActor struct SimulatorInstanceManagerView: View {
     @Bindable var library: SimulatorInstanceLibrary
+    @Environment(\.openWindow) private var openWindow
     @State private var creating = false
     @State private var renaming: SimulatorInstanceContext?
     @State private var editingIdentity: SimulatorInstanceContext?
     @State private var deleting: SimulatorInstanceContext?
-    @State private var displaySelection = SimulatorDisplaySelection()
-    @State private var workspaceID = UUID()
-
-    private var availableIDs: Set<UUID> { Set(library.instances.map(\.id)) }
-    private var displayableIDs: Set<UUID> {
-        Set(library.instances.filter { $0.runtime.runtimeSession.isRunning || $0.runtime.runtimeSession.image != nil }.map(\.id))
-    }
+    @State private var resetting: SimulatorInstanceContext?
+    @State private var inspectorPresented = true
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var logsPresented = false
+    @State private var importFirmware = false
 
     var body: some View {
-        HSplitView {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Text("设备实例").font(.headline)
-                    Spacer()
-                    Button { presentCreation() } label: { Image(systemName: "plus") }
-                        .help(creationUnavailableReason ?? "创建新实例（⌘N）")
-                        .accessibilityIdentifier("simulator.create-instance")
-                        .disabled(!library.storageAvailable || library.deviceModels.isEmpty)
-                }.padding(.horizontal, 12).padding(.top, 16)
-                Text("\(library.instances.count) 台设备 · \(library.runningCount) 台运行中")
-                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12)
-                List(selection: $library.selectedID) {
-                    ForEach(library.instances) { instance in
-                        VStack(alignment: .leading, spacing: 5) {
-                            HStack {
-                                Image(systemName: instance.runtime.isServing ? "play.circle.fill" : "applewatch")
-                                    .foregroundStyle(instance.runtime.isServing ? .green : .secondary)
-                                Text(instance.record.name).lineLimit(2)
-                                Spacer(minLength: 0)
-                                // Per-instance state: one instance's trouble shows on its own row only.
-                                if instance.runtime.isBusy {
-                                    ProgressView().controlSize(.mini)
-                                        .help(instance.runtime.isStopping ? "正在停止" : "正在处理")
-                                } else if Self.hasError(instance) {
-                                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                                        .help("此实例有未处理的错误；选中查看，或右键「重置实例」")
-                                        .accessibilityLabel("有错误")
-                                }
-                            }
-                            Text(instance.record.model).font(.caption2).foregroundStyle(.secondary)
-                            Text(instance.runtime.isStopping ? "正在停止" : instance.runtime.runtimeSession.stateLabel)
-                                .font(.caption).foregroundStyle(.secondary)
-                        }.frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.vertical, 5).tag(instance.id)
-                            .contentShape(Rectangle())
-                            .overlay {
-                                SimulatorInstanceDragSource(
-                                    payload: .init(workspaceID: workspaceID, instanceID: instance.id),
-                                    canDrag: displayableIDs.contains(instance.id),
-                                    canShow: displayableIDs.contains(instance.id) && !displaySelection.visibleIDs.contains(instance.id),
-                                    select: {
-                                        library.selectedID = instance.id
-                                        displaySelection.select(instance.id, availableIDs: availableIDs, displayableIDs: displayableIDs)
-                                    }, show: { pinDisplay(instance.id, origin: "context-menu") },
-                                    rename: { renaming = instance },
-                                    reset: { Task { await library.resetInstance(instance.id) } },
-                                    delete: { deleting = instance })
-                                    .accessibilityHidden(true)
-                            }
-                            .contextMenu {
-                                Button("重命名…") { renaming = instance }
-                                    .accessibilityIdentifier("simulator.rename-instance.\(instance.id.uuidString)")
-                                if !displaySelection.visibleIDs.contains(instance.id), displayableIDs.contains(instance.id) {
-                                    Button("显示画面") { pinDisplay(instance.id, origin: "context-menu") }
-                                }
-                                Button("重置实例") { Task { await library.resetInstance(instance.id) } }
-                                Divider()
-                                Button("删除实例…", role: .destructive) { deleting = instance }
-                                    .accessibilityIdentifier("simulator.delete-instance.\(instance.id.uuidString)")
-                            }
-                            .accessibilityIdentifier("simulator.instance.\(instance.id.uuidString)")
-                    }
-                }
-                HStack {
-                    Button("虚拟设备身份…") { editingIdentity = library.selected }
-                        .disabled(library.selected == nil || !library.storageAvailable)
-                        .accessibilityIdentifier("simulator.edit-virtual-identity")
-                    Spacer(minLength: 8)
-                    Button("删除实例…", role: .destructive) { deleting = library.selected }
-                        .disabled(library.selected == nil || !library.storageAvailable)
-                        .help("停止并删除所选实例；已导入的固件会保留")
-                        .accessibilityIdentifier("simulator.delete-instance")
-                }
-                .padding(.horizontal, 12).padding(.bottom, 12)
-            }.frame(minWidth: 180, idealWidth: 200, maxWidth: 240)
-            ZStack {
-                if let failure = library.storageFailure {
-                    ContentUnavailableView {
-                        Label("无法读取设备实例", systemImage: "exclamationmark.triangle")
-                    } description: {
-                        Text(failure + "\n原有记录不会被改写；修复后点击重试。")
-                    } actions: {
-                        Button("重试") { library.reloadInstances() }
-                        Button("在 Finder 中显示") {
-                            NSWorkspace.shared.activateFileViewerSelecting([SimulatorInstanceRecordStore.defaultRootURL])
-                        }
-                    }
-                } else if library.instances.isEmpty {
-                    ContentUnavailableView {
-                        Label("创建你的第一台设备", systemImage: "applewatch")
-                    } description: {
-                        if !library.catalog.hasLoadedCatalog || library.catalog.isBusy {
-                            Text("正在读取设备型号…")
-                        } else if library.deviceModels.isEmpty {
-                            Text(library.catalog.libraryStatus)
-                        } else {
-                            Text("选择硬件型号即可创建；固件在实例里导入。")
-                        }
-                    } actions: {
-                        Button("新建设备…") { presentCreation() }
-                            .disabled(creationUnavailableReason != nil)
-                        if library.catalog.hasLoadedCatalog && !library.catalog.isBusy && library.deviceModels.isEmpty {
-                            Button("重新读取固件库") { Task { await library.catalog.loadCatalog() } }
-                        }
-                    }
-                } else if library.selected == nil {
-                    ContentUnavailableView("选择设备实例", systemImage: "sidebar.left")
-                }
-                ForEach(library.instances) { instance in
-                    VStack(spacing: 0) {
-                    SimulatorDeviceConnectionView(library: library, instance: instance, bluetooth: instance.bluetooth)
-                    SimulatorWorkspaceView(runtime: instance.runtime, sharing: instance.sharing,
-                        presentation: .controlsAndLogs, isActive: library.selectedID == instance.id,
-                        instanceName: instance.record.name, recording: instance.recording)
-                    }
-                        .opacity(library.selectedID == instance.id ? 1 : 0)
-                        .allowsHitTesting(library.selectedID == instance.id)
-                        .disabled(library.selectedID != instance.id)
-                        .accessibilityHidden(library.selectedID != instance.id)
-                        .onChange(of: instance.runtime.selectedProfileID) { _, _ in library.persistSelection(instance) }
-                        .onChange(of: instance.runtime.runtimeSession.isRunning, initial: true) { _, running in
-                            if running { pinDisplay(instance.id, origin: "running") }
-                            else { instance.bluetooth.stop() }
-                        }
-                        .onChange(of: instance.runtime.isStopping) { _, stopping in
-                            if stopping { instance.bluetooth.stop() }
-                        }
-                }
-            }.frame(minWidth: 420, idealWidth: 460, maxWidth: 560, minHeight: 620)
-            SimulatorInstanceDisplayArea(library: library, selection: $displaySelection, workspaceID: workspaceID)
-                .frame(minWidth: 240, idealWidth: 580, maxWidth: .infinity, minHeight: 620)
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            sidebar
+                .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
+        } detail: {
+            detail
         }
+        .navigationSplitViewStyle(.balanced)
+        .modifier(SimulatorInspectorAttachment(library: library, presented: $inspectorPresented))
+        .background {
+            ForEach(library.instances) { instance in
+                SimulatorInstanceRuntimeHost(library: library, instance: instance)
+            }
+        }
+        .focusedSceneValue(\.simulatorLibrary, library)
+        .focusedSceneValue(\.simulatorInstance, library.selected)
+        .focusedSceneValue(\.simulatorInspectorPresented, $inspectorPresented)
+        .focusedSceneValue(\.simulatorLogsPresented, $logsPresented)
+        .focusedSceneValue(\.simulatorImportFirmware, $importFirmware)
+        .modifier(SimulatorScenePresentations(
+            library: library, sceneInstance: nil, importFirmware: $importFirmware,
+            creating: $creating, editingIdentity: $editingIdentity, deleting: $deleting, resetting: $resetting
+        ))
         .task {
-            // Launch: clear stale sessions and reset every instance (non-fatal,
-            // per instance), while the catalog loads for the creation sheet.
             library.beginLaunchMaintenance()
             await library.catalog.loadCatalog()
         }
-        .onChange(of: library.creationRequested) { _, requested in
-            guard requested else { return }
-            library.creationRequested = false
-            if creationUnavailableReason == nil { presentCreation() }
+        .onChange(of: library.selectedID) { _, id in
+            if id == nil { columnVisibility = .all }
         }
-        .onChange(of: library.selectedID, initial: true) { _, id in
-            displaySelection.select(id, availableIDs: availableIDs, displayableIDs: displayableIDs)
+        .sheet(item: $renaming) { SimulatorInstanceRenameSheet(library: library, instance: $0) }
+        .toolbar {
+            SimulatorInstanceActionToolbar(
+                library: library, instance: library.selected,
+                onCreate: { creating = true }, onImport: { importFirmware = true }
+            )
         }
-        .onChange(of: library.instances.map(\.id)) { _, _ in
-            displaySelection.reconcile(availableIDs: availableIDs)
-        }
-        .sheet(isPresented: $creating) {
-            SimulatorInstanceCreationSheet(library: library)
-        }
-        .sheet(item: $renaming) { instance in
-            SimulatorInstanceRenameSheet(library: library, instance: instance)
-        }
-        .sheet(item: $editingIdentity) { instance in
-            SimulatorInstanceIdentitySheet(library: library, instance: instance)
-        }
-        .confirmationDialog("删除设备实例", isPresented: Binding(get: { deleting != nil },
-            set: { if !$0 { deleting = nil } }), titleVisibility: .visible, presenting: deleting) { instance in
-            Button("删除「\(instance.record.name)」", role: .destructive) {
-                let id = instance.id
-                deleting = nil
-                Task { await library.delete(id) }
+    }
+
+    private var sidebar: some View {
+        List(selection: $library.selectedID) {
+            ForEach(library.instances) { instance in
+                sidebarRow(instance)
+                    .tag(instance.id)
+                    .contextMenu { instanceMenu(instance) }
+                    .accessibilityIdentifier("simulator.instance.\(instance.id.uuidString)")
             }
-            Button("取消", role: .cancel) { deleting = nil }
-        } message: { instance in
-            Text("将停止并移除「\(instance.record.name)」，同时删除这台设备的独立数据盘、固件设置和配对记录。已导入的固件包会保留，可重新创建实例。")
         }
-        .alert("设备实例", isPresented: Binding(get: { library.errorMessage != nil },
-            set: { if !$0 { library.errorMessage = nil } })) {
-            Button("确定") { library.errorMessage = nil }
-        } message: { Text(library.errorMessage ?? "") }
+        .listStyle(.sidebar)
+        .navigationTitle("设备实例")
+        .navigationSubtitle("\(library.instances.count) 台设备 · \(library.runningCount) 台运行中")
     }
 
-    private func pinDisplay(_ id: UUID, origin: String) {
-        guard displayableIDs.contains(id) else { return }
-        let added = displaySelection.pin(id, availableIDs: availableIDs)
-        NSLog("[AzkiDisplayDrag] pin origin=%@ instance=%@ added=%d", origin, id.uuidString, added ? 1 : 0)
+    private func sidebarRow(_ instance: SimulatorInstanceContext) -> some View {
+        Label {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(instance.record.name).lineLimit(2)
+                    if instance.runtime.isBusy {
+                        ProgressView().controlSize(.mini)
+                            .help(instance.runtime.isStopping ? "正在停止" : "正在处理")
+                    } else if Self.hasError(instance) {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                            .help("此实例有未处理的错误；选中查看，或使用「重置实例」")
+                            .accessibilityLabel("有错误")
+                    }
+                }
+                Text(deviceTitle(instance)).foregroundStyle(.secondary).font(.caption)
+                Text(instance.runtime.isStopping ? "正在停止" : instance.runtime.runtimeSession.stateLabel)
+                    .foregroundStyle(.secondary).font(.caption)
+            }
+        } icon: {
+            Image(systemName: instance.runtime.isServing ? "play.circle.fill" : "applewatch")
+                .foregroundStyle(instance.runtime.isServing ? Color.green : Color.secondary)
+        }
     }
 
-    private func presentCreation() { creating = true }
+    @ViewBuilder private func instanceMenu(_ instance: SimulatorInstanceContext) -> some View {
+        Button("重命名…") { renaming = instance }
+            .accessibilityIdentifier("simulator.rename-instance.\(instance.id.uuidString)")
+        Button("虚拟设备身份…") { editingIdentity = instance }
+        Button("在新窗口打开画面") { openWindow(id: "device-display", value: instance.id) }
+        Button("重置实例…") { resetting = instance }
+        Divider()
+        Button("删除实例…", role: .destructive) { deleting = instance }
+            .accessibilityIdentifier("simulator.delete-instance.\(instance.id.uuidString)")
+    }
 
-    private var creationUnavailableReason: String? {
-        if !library.storageAvailable { return "实例存储不可用" }
-        if library.deviceModels.isEmpty {
-            return library.catalog.hasLoadedCatalog ? "固件库没有可用的设备型号" : "正在读取设备型号"
+    @ViewBuilder private var detail: some View {
+        if let instance = library.selected {
+            SimulatorDeviceDetailView(instance: instance, logsPresented: $logsPresented)
+                .navigationTitle(instance.record.name)
+                .navigationSubtitle(instance.runtime.runtimeSession.stateLabel)
+        } else if let failure = library.storageFailure {
+            ContentUnavailableView {
+                Label("无法读取设备实例", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(failure + "\n原有记录不会被改写；修复后点击重试。")
+            } actions: {
+                Button("重试") { library.reloadInstances() }
+                Button("在访达中显示") {
+                    NSWorkspace.shared.activateFileViewerSelecting([SimulatorInstanceRecordStore.defaultRootURL])
+                }
+            }
+        } else if library.instances.isEmpty {
+            ContentUnavailableView {
+                Label("创建你的第一台设备", systemImage: "applewatch")
+            } description: {
+                if !library.catalog.hasLoadedCatalog || library.catalog.isBusy {
+                    Text("正在读取设备型号…")
+                } else if library.deviceModels.isEmpty {
+                    Text(library.catalog.libraryStatus)
+                } else {
+                    Text("选择硬件型号即可创建；固件在实例里导入。")
+                }
+            } actions: {
+                Button("新建设备…") { creating = true }
+                    .disabled(SimulatorInstanceActions.canCreateReason(library) != nil)
+                    .accessibilityIdentifier("simulator.create-instance.empty")
+                if library.catalog.hasLoadedCatalog && !library.catalog.isBusy && library.deviceModels.isEmpty {
+                    Button("重新读取固件库") { Task { await library.catalog.loadCatalog() } }
+                }
+            }
+        } else {
+            ContentUnavailableView("选择设备实例", systemImage: "sidebar.left")
         }
-        return nil
+    }
+
+    private func deviceTitle(_ instance: SimulatorInstanceContext) -> String {
+        library.deviceModels.first { $0.model == instance.record.model }.map(SimulatorInstanceLibrary.deviceName)
+            ?? instance.record.model
     }
 
     private static func hasError(_ instance: SimulatorInstanceContext) -> Bool {
         instance.runtime.errorMessage != nil || instance.runtime.runtimeSession.errorMessage != nil
             || instance.sharing.errorMessage != nil
+    }
+}
+
+private struct SimulatorScenePresentations: ViewModifier {
+    var library: SimulatorInstanceLibrary
+    var sceneInstance: SimulatorInstanceContext?
+    @Binding var importFirmware: Bool
+    @Binding var creating: Bool
+    @Binding var editingIdentity: SimulatorInstanceContext?
+    @Binding var deleting: SimulatorInstanceContext?
+    @Binding var resetting: SimulatorInstanceContext?
+    @Environment(\.controlActiveState) private var controlActiveState
+
+    private var isKey: Bool { controlActiveState == .key }
+    private var presentedInstance: SimulatorInstanceContext? { sceneInstance ?? library.selected }
+
+    func body(content: Content) -> some View {
+        content
+            .fileImporter(isPresented: $importFirmware, allowedContentTypes: [.item]) { result in
+                guard let instance = presentedInstance else { return }
+                switch result {
+                case .success(let url):
+                    guard SimulatorInstanceActions.importFirmware(instance) else {
+                        instance.runtime.errorMessage = "设备状态已变化，请先停止设备再导入固件。"
+                        return
+                    }
+                    Task { await instance.runtime.importFirmware(url) }
+                case .failure(let error):
+                    if (error as NSError).code != NSUserCancelledError {
+                        instance.runtime.errorMessage = error.localizedDescription
+                    }
+                }
+            }
+            .onChange(of: library.creationRequested) { _, requested in
+                guard requested, isKey else { return }
+                library.creationRequested = false
+                if SimulatorInstanceActions.canCreateReason(library) == nil { creating = true }
+            }
+            .onChange(of: library.requestedIdentityID) { _, id in
+                guard isKey, let id else { return }
+                library.requestedIdentityID = nil
+                editingIdentity = library.instances.first { $0.id == id }
+            }
+            .onChange(of: library.requestedResetID) { _, id in
+                guard isKey, let id else { return }
+                library.requestedResetID = nil
+                resetting = library.instances.first { $0.id == id }
+            }
+            .onChange(of: library.requestedDeleteID) { _, id in
+                guard isKey, let id else { return }
+                library.requestedDeleteID = nil
+                deleting = library.instances.first { $0.id == id }
+            }
+            .sheet(isPresented: $creating) { SimulatorInstanceCreationSheet(library: library) }
+            .sheet(item: $editingIdentity) { SimulatorInstanceIdentitySheet(library: library, instance: $0) }
+            .confirmationDialog("删除设备实例", isPresented: Binding(get: { deleting != nil },
+                set: { if !$0 { deleting = nil } }), titleVisibility: .visible, presenting: deleting) { instance in
+                Button("删除「\(instance.record.name)」", role: .destructive) {
+                    let id = instance.id
+                    deleting = nil
+                    Task { await library.delete(id) }
+                }
+                Button("取消", role: .cancel) { deleting = nil }
+            } message: { instance in
+                Text("将停止并移除「\(instance.record.name)」，同时删除这台设备的独立数据盘、固件设置和配对记录。已导入的固件包会保留，可重新创建实例。")
+            }
+            .confirmationDialog("重置实例", isPresented: Binding(get: { resetting != nil },
+                set: { if !$0 { resetting = nil } }), titleVisibility: .visible, presenting: resetting) { instance in
+                Button("重置「\(instance.record.name)」") {
+                    let id = instance.id
+                    resetting = nil
+                    Task { await library.resetInstance(id) }
+                }
+                Button("取消", role: .cancel) { resetting = nil }
+            } message: { instance in
+                Text("将停止「\(instance.record.name)」并清除运行缓存与错误。已保存的数据、固件设置和已导入固件都会保留。")
+            }
+            .alert("设备实例", isPresented: Binding(get: { isKey && library.errorMessage != nil },
+                set: { if !$0 { library.errorMessage = nil } })) {
+                Button("好") { library.errorMessage = nil }
+            } message: { Text(library.errorMessage ?? "") }
+            .sheet(item: Binding(
+                get: { isKey ? presentedInstance?.runReview : nil },
+                set: { presentedInstance?.runReview = $0 }
+            )) { prepared in
+                SimulatorRunConfirmation(summary: prepared.summary, runLimitSeconds: prepared.runLimitSeconds) {
+                    presentedInstance?.runReview = nil
+                } confirm: {
+                    if let instance = presentedInstance {
+                        SimulatorInstanceActions.confirmRun(instance, review: prepared)
+                    }
+                }
+            }
+            .alert(presentedInstance?.record.name ?? "设备实例", isPresented: Binding(
+                get: { isKey && instanceError != nil },
+                set: { if !$0 { dismissInstanceErrors() } }
+            )) {
+                Button("好") { dismissInstanceErrors() }
+            } message: { Text(instanceError ?? "") }
+    }
+
+    private var instanceError: String? {
+        guard let instance = presentedInstance else { return nil }
+        return instance.sharing.errorMessage ?? instance.runtime.errorMessage ?? instance.runtime.runtimeSession.errorMessage
+    }
+
+    private func dismissInstanceErrors() {
+        guard let instance = presentedInstance else { return }
+        instance.sharing.errorMessage = nil
+        instance.runtime.errorMessage = nil
+        instance.runtime.runtimeSession.errorMessage = nil
+    }
+}
+
+private struct SimulatorInspectorAttachment: ViewModifier {
+    let library: SimulatorInstanceLibrary
+    @Binding var presented: Bool
+
+    func body(content: Content) -> some View {
+        if let instance = library.selected {
+            content.inspector(isPresented: $presented) {
+                SimulatorInstanceInspector(library: library, instance: instance)
+                    .id(instance.id)
+                    .inspectorColumnWidth(min: 320, ideal: 380, max: 520)
+            }
+        } else {
+            content
+        }
+    }
+}
+
+@MainActor struct SimulatorAuxiliaryDeviceWindow: View {
+    let library: SimulatorInstanceLibrary
+    let instanceID: UUID
+    @State private var inspectorPresented = true
+    @State private var logsPresented = false
+    @State private var importFirmware = false
+    @State private var creating = false
+    @State private var editingIdentity: SimulatorInstanceContext?
+    @State private var deleting: SimulatorInstanceContext?
+    @State private var resetting: SimulatorInstanceContext?
+
+    private var instance: SimulatorInstanceContext? { library.instances.first { $0.id == instanceID } }
+
+    var body: some View {
+        Group {
+            if let instance {
+                SimulatorDeviceDetailView(instance: instance, logsPresented: $logsPresented)
+                    .inspector(isPresented: $inspectorPresented) {
+                        SimulatorInstanceInspector(library: library, instance: instance)
+                            .id(instance.id)
+                            .inspectorColumnWidth(min: 320, ideal: 380, max: 520)
+                    }
+                    .navigationTitle(instance.record.name)
+                    .focusedSceneValue(\.simulatorLibrary, library)
+                    .focusedSceneValue(\.simulatorInstance, instance)
+                    .focusedSceneValue(\.simulatorInspectorPresented, $inspectorPresented)
+                    .focusedSceneValue(\.simulatorLogsPresented, $logsPresented)
+                    .focusedSceneValue(\.simulatorImportFirmware, $importFirmware)
+                    .toolbar {
+                        SimulatorInstanceActionToolbar(
+                            library: library, instance: instance,
+                            onCreate: { creating = true }, onImport: { importFirmware = true }
+                        )
+                    }
+            } else {
+                ContentUnavailableView("设备实例已删除", systemImage: "applewatch")
+            }
+        }
+        .modifier(SimulatorScenePresentations(
+            library: library, sceneInstance: instance, importFirmware: $importFirmware,
+            creating: $creating, editingIdentity: $editingIdentity, deleting: $deleting, resetting: $resetting
+        ))
+        .background {
+            ForEach(library.instances) { item in
+                SimulatorInstanceRuntimeHost(library: library, instance: item)
+            }
+        }
+    }
+}
+
+@MainActor struct SimulatorDeviceDetailView: View {
+    let instance: SimulatorInstanceContext
+    @Binding var logsPresented: Bool
+    @Environment(\.openWindow) private var openWindow
+    private var session: SimulatorSessionModel { instance.runtime.runtimeSession }
+
+    var body: some View {
+        Group {
+            if logsPresented {
+                VSplitView {
+                    canvas.frame(minHeight: 240)
+                    SimulatorLogPanel(runtime: instance.runtime, stream: instance.logStream, instanceName: instance.record.name)
+                        .frame(minHeight: 120)
+                }
+            } else {
+                canvas
+            }
+        }
+    }
+
+    @ViewBuilder private var canvas: some View {
+        if let geometry = session.manifest?.displayGeometry {
+            SimulatorNativeCanvas(image: session.image, geometry: geometry, acceptsInput: session.canInput,
+                                  onInput: session.sendInput)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityIdentifier("simulator.canvas.\(instance.id.uuidString)")
+                .contextMenu {
+                    Button("截图") { SimulatorInstanceActions.screenshot(instance) }
+                        .disabled(session.image == nil)
+                    Button("在新窗口打开") { openWindow(id: "device-display", value: instance.id) }
+                }
+        } else {
+            ContentUnavailableView {
+                Label(session.isAttached ? "等待画面" : "设备未运行", systemImage: "applewatch")
+            } description: {
+                Text(session.isAttached ? "设备已连接，正在等待第一帧。" : "在检查器中选择固件并运行，或使用工具栏「运行」。")
+            }
+        }
     }
 }
 
@@ -224,34 +383,39 @@ import SwiftUI
     @State private var failureMessage: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("虚拟设备身份").font(.title2)
-            Text(instance.record.name).foregroundStyle(.secondary)
-            TextField("序列号", text: $serial).textFieldStyle(.roundedBorder)
-                .accessibilityIdentifier("simulator.virtual-serial")
-            Text("供设备信息和应用识别，最多 \(SimulatorVirtualIdentity.serialLimit(model: instance.record.model)) 位英文字符。")
-                .font(.caption).foregroundStyle(.secondary)
-            TextField("蓝牙地址，例如 02:12:34:56:78:9A", text: $address).textFieldStyle(.roundedBorder)
-                .accessibilityIdentifier("simulator.virtual-address")
-            Text("供固件识别此虚拟设备；不改变 Mac 对外广播的物理地址或系统配对身份。")
-                .font(.caption).foregroundStyle(.secondary)
-            Text("下次启动使用新身份和全新设备数据，需要重新配对。原应用、表盘、设置及配对记录保留在旧快照中。身份未改变时不会重建数据。")
-                .font(.callout).fixedSize(horizontal: false, vertical: true)
-            if loading { ProgressView().controlSize(.small) }
-            if let failureMessage { Text(failureMessage).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
-            HStack {
-                Spacer()
-                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("应用新身份并重建数据") {
-                    do {
-                        try library.setVirtualIdentity(instance.id, identity: .init(serial: serial, address: address))
-                        dismiss()
-                    } catch { failureMessage = error.localizedDescription }
-                }.disabled(loading || serial.isEmpty || address.isEmpty || instance.runtime.isBusy)
-                    .keyboardShortcut(.defaultAction)
-                    .accessibilityIdentifier("simulator.save-virtual-identity")
+        NavigationStack {
+            Form {
+                LabeledContent("实例", value: instance.record.name)
+                TextField("序列号", text: $serial)
+                    .accessibilityIdentifier("simulator.virtual-serial")
+                Text("供设备信息和应用识别，最多 \(SimulatorVirtualIdentity.serialLimit(model: instance.record.model)) 位英文字符。")
+                TextField("蓝牙地址", text: $address, prompt: Text("02:12:34:56:78:9A"))
+                    .accessibilityIdentifier("simulator.virtual-address")
+                Text("供固件识别此虚拟设备；不改变 Mac 对外广播的物理地址或系统配对身份。")
+                Text("下次启动使用新身份和全新设备数据，需要重新配对。原应用、表盘、设置及配对记录保留在旧快照中。身份未改变时不会重建数据。")
+                if loading { ProgressView() }
+                if let failureMessage { Text(failureMessage).foregroundStyle(.red) }
             }
-        }.padding(24).frame(width: 480)
+            .formStyle(.grouped)
+            .navigationTitle("虚拟设备身份")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { dismiss() }
+                        .keyboardShortcut(.defaultAction)
+                }
+                ToolbarItem(placement: .destructiveAction) {
+                    Button("应用新身份并重建数据", role: .destructive) {
+                        do {
+                            try library.setVirtualIdentity(instance.id, identity: .init(serial: serial, address: address))
+                            dismiss()
+                        } catch { failureMessage = error.localizedDescription }
+                    }
+                    .disabled(loading || serial.isEmpty || address.isEmpty || instance.runtime.isBusy)
+                    .accessibilityIdentifier("simulator.save-virtual-identity")
+                }
+            }
+        }
+        .frame(minWidth: 480, minHeight: 360)
         .task {
             defer { loading = false }
             do {
@@ -264,8 +428,6 @@ import SwiftUI
     }
 }
 
-/// Own the picker state in the sheet so its first render and Create validation
-/// use the same model, rather than a parent state value captured before opening.
 @MainActor private struct SimulatorInstanceCreationSheet: View {
     let library: SimulatorInstanceLibrary
     @Environment(\.dismiss) private var dismiss
@@ -289,8 +451,8 @@ import SwiftUI
     private var selectedModel: BundledDevicePreset? { library.deviceModels.first { $0.model == newModel } }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-                Text("新建设备实例").font(.title2)
+        NavigationStack {
+            Form {
                 Picker("设备型号", selection: $newModel) {
                     ForEach(library.deviceModels, id: \.model) { item in
                         Text(SimulatorInstanceLibrary.deviceName(item)).tag(item.model)
@@ -298,27 +460,28 @@ import SwiftUI
                 }.accessibilityIdentifier("simulator.new-instance-model")
                 TextField("实例名称", text: Binding(get: { nameDraft.text }, set: { nameDraft.edit($0); failureMessage = nil }),
                           prompt: Text(nameDraft.defaultName))
-                    .textFieldStyle(.roundedBorder)
                     .accessibilityIdentifier("simulator.new-instance-name")
                     .help("用于实例列表、设备标题和录屏文件名；不会修改固件型号或序列号")
-                TextField("虚拟序列号", text: $serial).textFieldStyle(.roundedBorder)
+                TextField("虚拟序列号", text: $serial)
                     .accessibilityIdentifier("simulator.new-instance-serial")
-                TextField("虚拟蓝牙地址", text: $address).textFieldStyle(.roundedBorder)
+                TextField("虚拟蓝牙地址", text: $address)
                     .accessibilityIdentifier("simulator.new-instance-address")
                 Text("序列号供固件和应用识别；虚拟地址属于模拟设备，不改变 Mac 的物理蓝牙身份。")
-                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("跳过首次设置（OOBE）", isOn: $skipOOBE)
                     .accessibilityIdentifier("simulator.new-instance-skip-oobe")
                 Text(skipOOBE ? "首次启动直接进入设备界面。" : "保留语言选择和配对引导，可开启外部蓝牙后自行连接。")
-                    .font(.caption).foregroundStyle(.secondary)
                 if let failureMessage {
-                    Text(failureMessage).font(.callout).foregroundStyle(.red)
-                        .fixedSize(horizontal: false, vertical: true)
+                    Text(failureMessage).foregroundStyle(.red)
                         .accessibilityIdentifier("simulator.instance-name-error")
                 }
-                HStack {
-                    Spacer()
+            }
+            .formStyle(.grouped)
+            .navigationTitle("新建设备实例")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
                     Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
+                }
+                ToolbarItem(placement: .confirmationAction) {
                     Button("创建") {
                         guard let selectedModel else { return }
                         do {
@@ -326,11 +489,12 @@ import SwiftUI
                                                     identity: .init(serial: serial, address: address), skipOOBE: skipOOBE)
                             dismiss()
                         } catch { failureMessage = error.localizedDescription }
-                    }.disabled(selectedModel == nil || nameDraft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                        .accessibilityIdentifier("simulator.confirm-create-instance")
-                        .keyboardShortcut(.defaultAction)
+                    }
+                    .disabled(selectedModel == nil || nameDraft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .accessibilityIdentifier("simulator.confirm-create-instance")
+                    .keyboardShortcut(.defaultAction)
                 }
-            }.padding(24).frame(width: 440)
+            }
             .onChange(of: library.deviceModels.map(\.model), initial: true) { _, models in
                 if !models.contains(newModel) { newModel = models.first ?? "" }
             }
@@ -338,6 +502,8 @@ import SwiftUI
                 nameDraft.updateDefault(library.defaultName(for: model))
                 failureMessage = nil
             }
+        }
+        .frame(minWidth: 440, minHeight: 420)
     }
 }
 
@@ -355,176 +521,33 @@ import SwiftUI
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("重命名实例").font(.title2)
-            TextField("实例名称", text: $name)
-                .textFieldStyle(.roundedBorder)
-                .accessibilityIdentifier("simulator.rename-instance-name")
-            if let failureMessage {
-                Text(failureMessage).font(.callout).foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("simulator.instance-name-error")
-            }
-            HStack {
-                Spacer()
-                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("保存") {
-                    do { try library.rename(instance.id, name: name); dismiss() }
-                    catch { failureMessage = error.localizedDescription }
+        NavigationStack {
+            Form {
+                TextField("实例名称", text: $name)
+                    .accessibilityIdentifier("simulator.rename-instance-name")
+                if let failureMessage {
+                    Text(failureMessage).foregroundStyle(.red)
+                        .accessibilityIdentifier("simulator.instance-name-error")
                 }
-                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .keyboardShortcut(.defaultAction)
-                .accessibilityIdentifier("simulator.confirm-rename-instance")
             }
+            .formStyle(.grouped)
+            .navigationTitle("重命名实例")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") {
+                        do { try library.rename(instance.id, name: name); dismiss() }
+                        catch { failureMessage = error.localizedDescription }
+                    }
+                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("simulator.confirm-rename-instance")
+                }
+            }
+            .onChange(of: name) { _, _ in failureMessage = nil }
         }
-        .padding(24).frame(width: 440)
-        .onChange(of: name) { _, _ in failureMessage = nil }
+        .frame(minWidth: 400, minHeight: 180)
     }
-}
-
-/// Own the complete local mouse sequence. A drag changes display placement
-/// only on release over this window's display area; a short click selects.
-@MainActor private struct SimulatorInstanceDragSource: NSViewRepresentable {
-    let payload: SimulatorInstanceDragPayload
-    let canDrag: Bool
-    let canShow: Bool
-    let select: () -> Void
-    let show: () -> Void
-    let rename: () -> Void
-    let reset: () -> Void
-    let delete: () -> Void
-
-    func makeNSView(context: Context) -> SimulatorInstanceDragSourceView {
-        let view = SimulatorInstanceDragSourceView()
-        view.setAccessibilityElement(false)
-        return view
-    }
-
-    func updateNSView(_ view: SimulatorInstanceDragSourceView, context: Context) {
-        view.payload = payload
-        view.canDrag = canDrag; view.canShow = canShow
-        view.selectInstance = select; view.showInstance = show
-        view.renameInstance = rename; view.deleteInstance = delete; view.resetInstance = reset
-        view.toolTip = canDrag ? "拖到右侧显示画面" : nil
-    }
-}
-
-@MainActor final class SimulatorInstanceDragSourceView: NSView {
-    var payload: SimulatorInstanceDragPayload?
-    var canDrag = false
-    var canShow = false
-    var selectInstance: (() -> Void)?
-    var showInstance: (() -> Void)?
-    var renameInstance: (() -> Void)?
-    var resetInstance: (() -> Void)?
-    var deleteInstance: (() -> Void)?
-    private var gesture: SimulatorInstanceDragGesture?
-    private weak var gestureWindow: NSWindow?
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    override func mouseDown(with event: NSEvent) {
-        cancelInternalDrag()
-        guard let window, let payload, event.windowNumber == window.windowNumber else { return }
-        gesture = SimulatorInstanceDragGesture(payload: payload, sourceWindowNumber: window.windowNumber,
-                                               start: event.locationInWindow)
-        gestureWindow = window
-        NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)),
-            name: NSWindow.didResignKeyNotification, object: window)
-        NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)),
-            name: NSApplication.didResignActiveNotification, object: nil)
-        NSLog("[AzkiDisplayDrag] internal.down instance=%@ enabled=%d eventWindow=%@ window=%ld", payload.instanceID.uuidString,
-              canDrag ? 1 : 0, NSStringFromPoint(event.locationInWindow), window.windowNumber)
-    }
-
-    override func mouseDragged(with event: NSEvent) {
-        let wasDragging = gesture?.isDragging == true
-        guard let gesture = updateGesture(event), let window = gestureWindow, gesture.isDragging, canDrag else { return }
-        if !wasDragging {
-            setSourceHighlighted(true)
-            NSLog("[AzkiDisplayDrag] internal.begin instance=%@ eventWindow=%@", gesture.payload.instanceID.uuidString,
-                  NSStringFromPoint(event.locationInWindow))
-        }
-        SimulatorInstanceInternalDragRegistry.updateHighlight(for: gesture, window: window, point: event.locationInWindow)
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        guard let gesture = updateGesture(event), let window = gestureWindow else { return }
-        defer { cancelInternalDrag() }
-        if gesture.isDragging {
-            let accepted: Bool
-            if canDrag, let target = SimulatorInstanceInternalDragRegistry.target(for: gesture, window: window,
-                                                                                  point: event.locationInWindow) {
-                accepted = target.receive(gesture, pointInWindow: event.locationInWindow)
-            } else { accepted = false }
-            NSLog("[AzkiDisplayDrag] internal.end instance=%@ accepted=%d eventWindow=%@", gesture.payload.instanceID.uuidString,
-                  accepted ? 1 : 0, NSStringFromPoint(event.locationInWindow))
-        } else if bounds.contains(convert(event.locationInWindow, from: nil)) {
-            selectInstance?()
-        }
-    }
-
-    private func updateGesture(_ event: NSEvent) -> SimulatorInstanceDragGesture? {
-        guard var gesture, let origin = gestureWindow, window === origin, payload == gesture.payload,
-              gesture.update(locationInWindow: event.locationInWindow, windowNumber: event.windowNumber) else {
-            cancelInternalDrag()
-            return nil
-        }
-        self.gesture = gesture
-        return gesture
-    }
-
-    override func viewWillMove(toWindow newWindow: NSWindow?) {
-        if newWindow !== window { cancelInternalDrag() }
-        super.viewWillMove(toWindow: newWindow)
-    }
-
-    @objc private func interrupted(_ notification: Notification) { cancelInternalDrag() }
-
-    private func cancelInternalDrag() {
-        if gesture?.isDragging == true {
-            NSLog("[AzkiDisplayDrag] internal.clear instance=%@", gesture?.payload.instanceID.uuidString ?? "none")
-        }
-        gesture?.cancel()
-        gesture = nil; gestureWindow = nil
-        NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: nil)
-        NotificationCenter.default.removeObserver(self, name: NSApplication.didResignActiveNotification, object: nil)
-        setSourceHighlighted(false)
-        SimulatorInstanceInternalDragRegistry.clearHighlights()
-    }
-
-    private func setSourceHighlighted(_ highlighted: Bool) {
-        wantsLayer = true
-        layer?.backgroundColor = highlighted ? NSColor.controlAccentColor.withAlphaComponent(0.12).cgColor : nil
-        layer?.cornerRadius = 5
-    }
-
-    override func menu(for event: NSEvent) -> NSMenu? {
-        cancelInternalDrag()
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        let rename = NSMenuItem(title: "重命名…", action: #selector(renameCurrentInstance), keyEquivalent: "")
-        rename.target = self
-        menu.addItem(rename)
-        if canShow {
-            let show = NSMenuItem(title: "显示画面", action: #selector(showCurrentInstance), keyEquivalent: "")
-            show.target = self
-            menu.addItem(show)
-        }
-        let reset = NSMenuItem(title: "重置实例", action: #selector(resetCurrentInstance), keyEquivalent: "")
-        reset.target = self
-        reset.toolTip = "停止设备并清除运行缓存与错误；已保存的数据保留"
-        menu.addItem(reset)
-        menu.addItem(.separator())
-        // Deleting stops the instance, drops its record and removes its own data;
-        // imported firmware stays in the library.
-        let remove = NSMenuItem(title: "删除实例…", action: #selector(deleteCurrentInstance), keyEquivalent: "")
-        remove.target = self
-        menu.addItem(remove)
-        return menu
-    }
-    @objc private func renameCurrentInstance() { renameInstance?() }
-    @objc private func showCurrentInstance() { if canShow { showInstance?() } }
-    @objc private func resetCurrentInstance() { resetInstance?() }
-    @objc private func deleteCurrentInstance() { deleteInstance?() }
 }

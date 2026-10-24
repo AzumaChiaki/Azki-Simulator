@@ -11,23 +11,24 @@ struct AzkiSimulatorApp: App {
             SimulatorInstanceManagerView(library: library)
                 .onAppear { delegate.library = library }
         }
-        .defaultSize(width: 1_300, height: 860)
+        .defaultSize(width: 1_100, height: 760)
         .windowResizability(.contentMinSize)
+        .windowToolbarStyle(.unified)
+        .commands { SimulatorCommands() }
+
+        WindowGroup(id: "device-display", for: UUID.self) { $instanceID in
+            if let instanceID {
+                SimulatorAuxiliaryDeviceWindow(library: library, instanceID: instanceID)
+            }
+        }
+        .defaultSize(width: 420, height: 780)
+
         Settings {
             SimulatorSettingsView(library: library)
-        }
-        .commands {
-            CommandGroup(replacing: .newItem) {
-                Button("新建设备实例…") { library.creationRequested = true }
-                    .keyboardShortcut("n")
-                    .disabled(!library.storageAvailable || library.deviceModels.isEmpty)
-            }
         }
     }
 }
 
-/// Quitting waits for the app-owned helper/core to stop. An attached external
-/// session only loses this UI's connection; it is not implicitly terminated.
 @MainActor final class SimulatorAppDelegate: NSObject, NSApplicationDelegate {
     var library: SimulatorInstanceLibrary?
     private var terminating = false
@@ -35,12 +36,8 @@ struct AzkiSimulatorApp: App {
     private var termination: DispatchSourceSignal?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // SIGTERM (logout, kill, launchd) takes the same path as Quit, so the
-        // app-owned core and helper are stopped instead of being orphaned.
         signal(SIGTERM, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-        // Hop to a run-loop block: terminating inside this main-queue callout would
-        // block the main queue that the asynchronous stop (terminateLater) needs.
         source.setEventHandler { [weak self] in
             self?.signalled = true
             RunLoop.main.perform { NSApp.terminate(nil) }
@@ -56,9 +53,7 @@ struct AzkiSimulatorApp: App {
         guard !terminating else { return .terminateLater }
         terminating = true
         Task {
-            // Each instance's stop is bounded, so Quit always gets an answer.
             let failed = await library.stopAll()
-            // Logout/kill cannot wait for a dialog; every stop was already tried.
             guard !failed.isEmpty, !signalled else {
                 sender.reply(toApplicationShouldTerminate: true)
                 return
@@ -69,6 +64,8 @@ struct AzkiSimulatorApp: App {
             alert.informativeText = "「\(failed.joined(separator: "」「"))」的设备进程尚未确认退出。仍然退出可能留下后台进程，下次启动时会自动清理临时会话。"
             alert.addButton(withTitle: "仍然退出")
             alert.addButton(withTitle: "取消")
+            alert.buttons[0].keyEquivalent = ""
+            alert.buttons[1].keyEquivalent = "\r"
             let quit = alert.runModal() == .alertFirstButtonReturn
             terminating = false
             sender.reply(toApplicationShouldTerminate: quit)
