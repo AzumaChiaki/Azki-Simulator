@@ -68,13 +68,14 @@ static BesGpuColor gpu_sw_target_load(const BesGpuTarget *t,
         return gpu_sw_color_bgra(pixel);
     }
     /* SDK BGR565 (0x101) has red in bits 15:11; RGB565 (0x121)
-     * reverses red/blue. BGRA5658 (0x10a) prepends an alpha byte. */
-    BesGpuColor color = gpu_sw_color_565(lduw_le_p(pixel + (t->bpp == 3)));
+     * reverses red/blue. BGRA5658 (0x10a) stores alpha after the two
+     * little-endian BGR565 bytes; alpha-first is ABGR8565 (0x11a). */
+    BesGpuColor color = gpu_sw_color_565(lduw_le_p(pixel));
     if (t->format == 0x121) {
         unsigned red = color.r; color.r = color.b; color.b = red;
     }
     if (t->bpp == 3) {
-        color.a = pixel[0];
+        color.a = pixel[2];
     }
     return color;
 }
@@ -97,9 +98,9 @@ static void gpu_sw_target_store(const BesGpuTarget *t, uint8_t *pixel,
         unsigned red = color.r; color.r = color.b; color.b = red;
     }
     if (t->bpp == 3) {
-        pixel[0] = color.a;
+        pixel[2] = color.a;
     }
-    stw_le_p(pixel + (t->bpp == 3),
+    stw_le_p(pixel,
              ((color.r >> 3) << 11) | ((color.g >> 2) << 5) | (color.b >> 3));
 }
 
@@ -636,8 +637,8 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                                     color = (BesGpuColor) {sample_pixel[rgb_order ? 0 : 2],
                                         sample_pixel[1], sample_pixel[rgb_order ? 2 : 0], 255};
                                 } else {
-                                    color = gpu_sw_color_565(lduw_le_p(sample_pixel + packed_source));
-                                    if (packed_source) { color.a = texel; }
+                                    color = gpu_sw_color_565(lduw_le_p(sample_pixel));
+                                    if (packed_source) { color.a = sample_pixel[2]; }
                                 }
                                 double opacity = color.a * weight;
                                 sample += opacity;
