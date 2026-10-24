@@ -2423,7 +2423,8 @@ static bool touch_powered(Best1503State *s)
  * screen settings enable them. */
 static bool touch_gesture_mode(BesTouch *t)
 {
-    return t->mode == 4 && t->sleep_mode == 3 && !t->bootloader;
+    return (t->mode == 4 || t->mode == 9) &&
+           t->sleep_mode == 3 && !t->bootloader;
 }
 
 /* Modes in which the controller raises its data-ready line for reports. */
@@ -2707,7 +2708,10 @@ static bool touch_write_packet(Best1503State *s)
     t->pointer = reg;
     if (!count) {
         switch (reg) {
-        case 0xd109: t->mode = 9; t->sleep_mode = 0; break;
+        /* Normal report mode is independent of the sleep state. The O66
+         * enter_sleep routine sends D109 after verifying D104/D105/D107;
+         * only the explicit software-wakeup command D11D exits sleep. */
+        case 0xd109: t->mode = 9; break;
         case 0xd11e: break; /* Enter command interface; scan mode is unchanged. */
         /* hynitron_ts_resume: leave any sleep and report touches again. */
         case 0xd11d: t->mode = 9; t->sleep_mode = 0; break;
