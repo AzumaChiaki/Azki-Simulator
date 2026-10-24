@@ -23,9 +23,9 @@ import SwiftUI
     private enum Choice: Hashable { case keep, value(String), reset }
 
     var body: some View {
+        NavigationStack {
         VStack(alignment: .leading, spacing: 14) {
-            Text("固件设置").font(.title2)
-            Text("下次开机时写入固件的系统设置数据库（persist.db），并按以下时钟启动；佩戴、心率、步行、电量、充电在工作区“设备数据”中修改。目录覆盖的手环 9 / 9 Pro / 10 / 10 Pro / 11 与导入固件共用同一套 /data 存储，均按实例的硬件预设生效。")
+            Text("下次开机时写入固件的系统设置数据库（persist.db），并按以下时钟启动；佩戴、心率、步行、电量、充电在检查器“设备数据”中修改。目录覆盖的手环 9 / 9 Pro / 10 / 10 Pro / 11 与导入固件共用同一套 /data 存储，均按实例的硬件预设生效。")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if !loaded {
                 ProgressView().controlSize(.small)
@@ -54,20 +54,28 @@ import SwiftUI
                     Button("重新读取") { Task { await load() } }
                 }
             }
-            HStack {
-                if let observedAt {
-                    Text("固件当前值读取于 \(observedAt.formatted(date: .abbreviated, time: .shortened))")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
+            if let observedAt {
+                Text("固件当前值读取于 \(observedAt.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(24)
+        .navigationTitle("固件设置")
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-                if restartAvailable {
+            }
+            if restartAvailable {
+                ToolbarItem(placement: .automatic) {
                     Button("保存并重新开机") { save(thenRestart: true) }.disabled(!loaded || saving)
                 }
+            }
+            ToolbarItem(placement: .confirmationAction) {
                 Button("保存") { save(thenRestart: false) }.keyboardShortcut(.defaultAction).disabled(!loaded || saving)
             }
         }
-        .padding(24).frame(width: 620)
+        }
+        .frame(minWidth: 620, minHeight: 520)
         .task { await load() }
     }
 

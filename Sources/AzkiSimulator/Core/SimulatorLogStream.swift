@@ -46,9 +46,17 @@ nonisolated struct SimulatorLogBuffer: Sendable {
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var connection: SimulatorSessionConnection?
     @ObservationIgnored private var generation = UUID()
+    @ObservationIgnored private var current: (directory: URL, sessionID: UUID, name: String)?
+
+    /// Start only when the session or log file actually changed, so extra windows can share one reader.
+    func startIfNeeded(directory: URL, sessionID: UUID, name: String) {
+        if current?.directory == directory, current?.sessionID == sessionID, current?.name == name, task != nil { return }
+        start(directory: directory, sessionID: sessionID, name: name)
+    }
 
     func start(directory: URL, sessionID: UUID, name: String) {
         stop()
+        current = (directory, sessionID, name)
         text = ""; revision &+= 1; epoch &+= 1; discardedUTF16 = 0; detail = "等待日志"; isFollowing = true
         let token = generation
         task = Task { [weak self] in
@@ -105,6 +113,7 @@ nonisolated struct SimulatorLogBuffer: Sendable {
 
     func stop() {
         generation = UUID(); task?.cancel(); task = nil; isFollowing = false
+        current = nil
         if let connection { Task { await connection.close() } }
         connection = nil
     }

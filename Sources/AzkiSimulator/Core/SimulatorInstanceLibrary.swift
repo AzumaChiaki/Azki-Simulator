@@ -9,6 +9,10 @@ final class SimulatorInstanceContext: Identifiable {
     let sharing = HostStatusSharingModel()
     let recording = SimulatorRecordingModel()
     let bluetooth: BluetoothExternalSession
+    let guestOperations = SimulatorGuestOperationsModel()
+    let logStream = SimulatorLogStreamModel()
+    /// Set by Run in the menu/toolbar when the selected firmware still needs a fingerprint review.
+    var runReview: SimulatorRunReview?
 
     init(record: SimulatorInstanceRecord, maximumRuntimeSeconds: Int = StandaloneRunLimits.unlimited) {
         self.id = record.id
@@ -25,6 +29,12 @@ final class SimulatorInstanceContext: Identifiable {
     }
 }
 
+struct SimulatorRunReview: Identifiable {
+    let id = UUID()
+    let summary: String
+    let runLimitSeconds: Int
+}
+
 /// Instance ownership is independent from selection: changing the sidebar never
 /// stops another runtime or borrows another instance's session/IPC endpoints.
 @MainActor @Observable
@@ -38,6 +48,9 @@ final class SimulatorInstanceLibrary {
     private(set) var storageAvailable = true
     /// Set by the New menu command (⌘N); the manager view presents the sheet.
     var creationRequested = false
+    var requestedIdentityID: UUID?
+    var requestedResetID: UUID?
+    var requestedDeleteID: UUID?
     let catalog: StandaloneRuntimeModel
     @ObservationIgnored private let store: SimulatorInstanceRecordStore
     @ObservationIgnored private let maximumRuntimeSeconds: Int

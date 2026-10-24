@@ -430,9 +430,18 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
     # No user Python, Homebrew, pip or network is needed on the target Mac.
     pbuild=cache/'python-build';pbuild.mkdir(exist_ok=True)
     pyinstall=cache/'python-install'
-    if not (pbuild/'Makefile').exists():
-        run([psource/'configure','--prefix='+str(pyinstall),'--with-ensurepip=no','--disable-test-modules',
-             '--with-openssl='+output([brew,'--prefix','openssl@3'])],cwd=pbuild,env=env)
+    python_flags=[
+        '--prefix='+str(pyinstall),'--with-ensurepip=no','--disable-test-modules',
+        '--with-openssl='+output([brew,'--prefix','openssl@3']),
+        # SDK unistd.h can advertise pipe2 while libsystem_kernel only
+        # exports pipe; the resulting binary SIGSEGV at the first os.pipe().
+        'ac_cv_func_pipe2=no',
+    ]
+    stamp=pbuild/'.azki-configure'
+    needed='\n'.join(python_flags)+'\n'
+    if not stamp.exists() or stamp.read_text()!=needed:
+        run([psource/'configure',*python_flags],cwd=pbuild,env=env)
+        stamp.write_text(needed)
     run(['make','-j',args.jobs],cwd=pbuild,env=env)
     run(['make','install'],cwd=pbuild,env=env)
     wheels=cache/'wheels';wheels.mkdir(exist_ok=True)
