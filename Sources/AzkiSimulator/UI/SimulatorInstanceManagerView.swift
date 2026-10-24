@@ -167,7 +167,13 @@ private struct SimulatorScenePresentations: ViewModifier {
     private var isKey: Bool { controlActiveState == .key }
     private var presentedInstance: SimulatorInstanceContext? { sceneInstance ?? library.selected }
 
+    // Split into separately type-checked stages: as one modifier chain the
+    // older Swift 6.2 toolchain used by CI gives up type-checking it.
     func body(content: Content) -> some View {
+        alerts(dialogs(requests(content)))
+    }
+
+    private func requests(_ content: some View) -> some View {
         content
             .fileImporter(isPresented: $importFirmware, allowedContentTypes: [.item]) { result in
                 guard let instance = presentedInstance else { return }
@@ -204,6 +210,10 @@ private struct SimulatorScenePresentations: ViewModifier {
                 library.requestedDeleteID = nil
                 deleting = library.instances.first { $0.id == id }
             }
+    }
+
+    private func dialogs(_ content: some View) -> some View {
+        content
             .sheet(isPresented: $creating) { SimulatorInstanceCreationSheet(library: library) }
             .sheet(item: $editingIdentity) { SimulatorInstanceIdentitySheet(library: library, instance: $0) }
             .confirmationDialog("删除设备实例", isPresented: Binding(get: { deleting != nil },
@@ -228,6 +238,10 @@ private struct SimulatorScenePresentations: ViewModifier {
             } message: { instance in
                 Text("将停止「\(instance.record.name)」并清除运行缓存与错误。已保存的数据、固件设置和已导入固件都会保留。")
             }
+    }
+
+    private func alerts(_ content: some View) -> some View {
+        content
             .alert("设备实例", isPresented: Binding(get: { isKey && library.errorMessage != nil },
                 set: { if !$0 { library.errorMessage = nil } })) {
                 Button("好") { library.errorMessage = nil }
