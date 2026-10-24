@@ -7,6 +7,7 @@ the firmware displays. These are fixed requests, never a generic QMP bridge.
 """
 from __future__ import annotations
 
+import math
 import time
 
 from .adc_commands import DEADLINE_SECONDS, runner_exchange
@@ -35,7 +36,7 @@ LC_NTC_MV = (
 LC_NTC_PREFIXES = ("miwear.watch.n67", "miwear.watch.p67")
 ADC_SLOPE, ADC_OFFSET = 0.051538, -23.3
 
-SET_KEYS = {"addSteps", "cadence", "heartRate", "worn", "charger", "batteryLevel", "batteryRaw", "temperatureC"}
+SET_KEYS = {"addSteps", "cadence", "heartRate", "worn", "charger", "batteryLevel", "batteryRaw", "temperatureC", "orientation"}
 NOTES = {
     "clock": "运行中修改 RTC 固件不会采用（它只在开机时读取时间），请在固件设置中修改并重启实例。",
     "settings": "系统属性、语言、时区和时间格式只在开机时读取，修改后需重启实例。",
@@ -81,11 +82,20 @@ def _exchange(adapter, request, *, write):
         if error.code == "runner_outcome_unknown":
             raise MError("live_outcome_unknown", "实时输入可能已生效但未确认，不要自动重复提交") from error
         raise
-    result = _decode(payload)
-    if type(result) is not dict or len(result) != 1:
+    try:
+        result = _decode(payload)
+    except (ValueError, TypeError) as error:
+        if write and request["command"] == "motion.orientation.set":
+            raise MError("live_outcome_unknown", "姿态写入回执无效，可能已生效，不要自动重复提交") from error
+        raise
+    if type(result) is not dict or set(result) not in ({"return"}, {"error"}):
+        if write and request["command"] == "motion.orientation.set":
+            raise MError("live_outcome_unknown", "姿态写入回执无效，可能已生效，不要自动重复提交")
         raise MError("live_protocol", "Runner returned an invalid live response")
     if "error" in result:
         message = str(result["error"])[:300]
+        if message.startswith("orientation_outcome_unknown:"):
+            raise MError("live_outcome_unknown", "姿态输入可能已生效但未确认，不要自动重复提交")
         if message.startswith("unsupported_hardware_input"):
             raise MError("unsupported_hardware", "此会话没有接入该硬件输入")
         raise MError("invalid_live", message)
@@ -93,7 +103,8 @@ def _exchange(adapter, request, *, write):
 
 
 def _report(adapter, snapshot):
-    if type(snapshot) is not dict or set(snapshot) != {"health", "charger", "adc", "batteryChannel", "ntcChannels"}:
+    required = {"health", "charger", "adc", "batteryChannel", "ntcChannels"}
+    if type(snapshot) is not dict or not required <= set(snapshot) <= required | {"orientation"}:
         raise MError("live_protocol", "Runner live snapshot has an invalid schema")
     model = _model(adapter)
     sensors = health_sensors(model) or {}
@@ -103,6 +114,17 @@ def _report(adapter, snapshot):
     battery_raw = adc[channel] if type(adc) is list and type(channel) is int else None
     ntc_list = [index for index in range(8) if type(ntc) is int and ntc >> index & 1]
     lc_ntc = type(model) is str and model.startswith(LC_NTC_PREFIXES) and type(adc) is list and bool(ntc_list)
+    orientation = snapshot.get("orientation")
+    if orientation is not None:
+        if (type(orientation) is not dict or set(orientation) != {"mode", "rollDegrees", "pitchDegrees"} or
+                orientation["mode"] not in ("auto", "held")):
+            raise MError("live_protocol", "Runner returned invalid orientation state")
+        angles = {k: orientation[k] for k in ("rollDegrees", "pitchDegrees")}
+        if orientation["mode"] == "auto":
+            if any(v is not None for v in angles.values()):
+                raise MError("live_protocol", "Auto orientation must not claim a held pose")
+        else:
+            validate_orientation(angles)
     supported = {
         "steps": bool(health is not None and sensors.get("steps")),
         "heartRate": bool(health is not None and sensors.get("heartRate")),
@@ -111,6 +133,7 @@ def _report(adapter, snapshot):
         "batteryRaw": battery_raw is not None,
         "temperature": lc_ntc,
         "clock": False,
+        "orientation": bool(orientation is not None and sensors.get("motion")),
     }
     notes = dict(NOTES)
     if not supported["temperature"]:
@@ -128,8 +151,44 @@ def _report(adapter, snapshot):
         "batteryRaw": battery_raw,
         "temperatureC": _ntc_celsius(adc[ntc_list[0]]) if lc_ntc else None,
         "clock": None,
+        "orientation": ({k: orientation[k] for k in ("rollDegrees", "pitchDegrees")}
+                        if supported["orientation"] and orientation["mode"] == "held" else None),
     }
     return {"supported": supported, "notes": notes, "state": state}
+
+
+def validate_orientation(value):
+    """An atomic pose object in degrees; null releases the host-held pose."""
+    if value is not None and (type(value) is not dict or set(value) != {"rollDegrees", "pitchDegrees"} or
+            any(type(v) not in (int, float) or not -180 <= v <= 180 or not math.isfinite(v)
+                for v in value.values())):
+        raise MError("invalid_live", "orientation requires finite rollDegrees and pitchDegrees within -180…180, or null")
+
+
+def _orientation_receipt(result):
+    """Retain board acknowledgement; never turn a refresh into a second write."""
+    invalid = MError("live_outcome_unknown", "姿态写入回执无效，可能已生效，不要自动重复提交")
+    if type(result) is not dict or result.get("accepted") is not True or result.get("guestObserved") is not False:
+        raise invalid
+    if set(result) == {"accepted", "guestObserved", "stateUnavailable"} and result["stateUnavailable"] is True:
+        return result
+    if set(result) != {"accepted", "guestObserved", "state"}:
+        raise invalid
+    state = result["state"]
+    if type(state) is not dict or set(state) != {"mode", "rollDegrees", "pitchDegrees"}:
+        raise invalid
+    angles = {k: state[k] for k in ("rollDegrees", "pitchDegrees")}
+    if state["mode"] == "auto":
+        if any(v is not None for v in angles.values()):
+            raise invalid
+    elif state["mode"] == "held":
+        try:
+            validate_orientation(angles)
+        except MError as error:
+            raise invalid from error
+    else:
+        raise invalid
+    return result
 
 
 def live_get(adapter, arguments):
@@ -142,16 +201,21 @@ def live_set(adapter, arguments):
     if type(arguments) is not dict or len(arguments) != 1 or not set(arguments) <= SET_KEYS:
         raise MError("invalid_live", "live-set takes exactly one of " + ", ".join(sorted(SET_KEYS)))
     (key, value), = arguments.items()
+    if key == "orientation":
+        validate_orientation(value)
     report = live_get(adapter, {})
     supported = report["supported"]
     need = {"addSteps": "steps", "cadence": "steps", "heartRate": "heartRate", "worn": "heartRate",
             "charger": "charger",
-            "batteryLevel": "batteryLevel", "batteryRaw": "batteryRaw", "temperatureC": "temperature"}[key]
+            "batteryLevel": "batteryLevel", "batteryRaw": "batteryRaw", "temperatureC": "temperature",
+            "orientation": "orientation"}[key]
     if not supported[need]:
         raise MError("unsupported_hardware", "此会话不支持实时修改该项")
     if key in ("addSteps", "cadence", "heartRate", "batteryLevel", "batteryRaw") and type(value) is not int:
         raise MError("invalid_live", key + " must be an integer")
-    if key == "addSteps":
+    if key == "orientation":
+        request = {"command": "motion.orientation.set", "value": value}
+    elif key == "addSteps":
         if not 1 <= value <= 100000:
             raise MError("invalid_live", "addSteps must be within 1…100000")
         request = {"command": "health.walk", "steps": value}
@@ -189,6 +253,11 @@ def live_set(adapter, arguments):
             channels = {str(index): raw for index in range(8) if snapshot["ntcChannels"] >> index & 1}
         request = {"command": "pmu.adcChannels.set", "channels": channels}
     result = _exchange(adapter, request, write=True)
+    if key == "orientation":
+        # The board already read back the exact pose (or explicitly reported
+        # an acknowledged write without state). A second live-get could fail
+        # after success and falsely make the caller believe the write failed.
+        return _orientation_receipt(result)
     if request["command"] in ("charger.set", "pmu.adcChannels.set"):
         return _report(adapter, result)
     return live_get(adapter, {})

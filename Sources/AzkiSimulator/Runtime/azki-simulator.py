@@ -111,7 +111,7 @@ def main():
     serve.add_argument("--approved-identity-sha256", help="Explicitly approved complete multi-device plan identity")
     call = commands.add_parser("call", help="One bounded JSON request over this session's Unix socket")
     call.add_argument("session", type=Path)
-    call.add_argument("command", choices=["status", "start", "stop", "input", "screenshot", "logs",
+    call.add_argument("command", choices=["status", "start", "stop", "input", "screenshot", "logs", "live-get", "live-set",
                                           "inspect-package", "stage-package", "install", "uninstall"])
     call.add_argument("--arguments", default="{}", help="JSON object")
     args = parser.parse_args()

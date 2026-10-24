@@ -5143,6 +5143,35 @@ static void best1503_set_charger_map(Object *obj, Visitor *v, const char *name,
  * at cadence C steps/min (raising N later walks the difference); heart-rate
  * is the pulse rate the optical front end sees (0 = not on a wrist).
  * Reading returns the input plus walked=W, the steps actually emitted. */
+static char *best1503_get_motion_orientation(Object *obj, Error **errp)
+{
+    BesSensorHub *h = &((Best1503State *)obj)->sensors;
+    if (h->imu.kind == BES_IMU_NONE) {
+        return g_strdup("unsupported");
+    }
+    if (!h->orientation_enabled) {
+        return g_strdup("auto");
+    }
+    return g_strdup_printf("roll=%.17g;pitch=%.17g", h->roll_degrees, h->pitch_degrees);
+}
+
+static void best1503_set_motion_orientation(Object *obj, const char *value, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    if (s->sensors.imu.kind == BES_IMU_NONE) {
+        error_setg(errp, "motion-orientation requires a modeled IMU");
+        return;
+    }
+    if (!bes_orientation_set(&s->sensors, value)) {
+        error_setg(errp, "motion-orientation must be auto or roll=R;pitch=P "
+                   "(finite degrees, each within -180..180)");
+        return;
+    }
+    if (s->sensor_timer) {
+        timer_mod(s->sensor_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
+}
+
 static char *best1503_get_health_fixture(Object *obj, Error **errp)
 {
     BesSensorHub *h = &((Best1503State *)obj)->sensors;
@@ -5362,6 +5391,10 @@ static void best1503_class_init(ObjectClass *oc, const void *data)
         "Charger register layout: 0 hp4560x driver (id at 0x0a), 1 BESPOWER driver (id at 0x60)");
     object_class_property_add_str(oc, "health-fixture", best1503_get_health_fixture,
                                   best1503_set_health_fixture);
+    object_class_property_add_str(oc, "motion-orientation", best1503_get_motion_orientation,
+                                  best1503_set_motion_orientation);
+    object_class_property_set_description(oc, "motion-orientation",
+        "Held body pose: auto or roll=R;pitch=P (degrees -180..180); raw IMU input only");
     object_class_property_add_str(oc, "sensor-board", best1503_get_sensor_board,
                                   best1503_set_sensor_board);
     object_class_property_set_description(oc, "sensor-board",

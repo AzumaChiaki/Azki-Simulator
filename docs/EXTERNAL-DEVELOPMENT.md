@@ -168,3 +168,59 @@ External launchers should use the returned `start_options`: pass `skipOOBE` as
 | Log follow/viewport zoom/panels | Host UI preferences, not device parameters |
 
 Run `python3 -m unittest discover -s tests -p test_device_parameters.py -v`.
+
+## Live IMU orientation
+
+`live.orientation` adds a bounded, atomic **hardware input** for the modeled
+LSM6DSO and ICM-42607 on N66, O66, N67, P67 and Q66 presets. It is available only
+when the running core reports the `motion-orientation` board property and the
+selected preset has a modeled IMU. Older cores continue to expose their existing
+inputs and report orientation unavailable. This control does not execute Lua,
+replace a sensor callback, write guest memory, or claim a guest observation.
+
+```sh
+"$ENGINE/python/bin/python3.12" -I -S -B "$RUNTIME/azki-simulator.py" \
+  instance-parameters --engine-root "$ENGINE" --library-root "$LIBRARY" \
+  --instance-id "$INSTANCE" --profile-id "$PROFILE" --session "$SESSION" \
+  --set '{"live.orientation":{"rollDegrees":30,"pitchDegrees":-45}}'
+```
+
+The same selected private session supports
+`call "$SESSION" live-set --arguments '{"orientation":{"rollDegrees":30,"pitchDegrees":-45}}'`.
+An orientation write returns `{accepted:true, guestObserved:false, state:...}`.
+If the board accepted the write but readback failed, the receipt instead carries
+`stateUnavailable:true`; it remains a successful write. An uncertain transport
+outcome is `live_outcome_unknown` and must not be automatically retried. The
+runtime does not perform a second live refresh after this board acknowledgement.
+`instance-parameters` separately refreshes its schema, retaining `applied` and
+the receipt if that later refresh fails.
+Use `{"live.orientation":null}` (or `{"orientation":null}` for `live-set`) to
+release the held pose and restore the automatic motion model. A fresh process
+starts in automatic mode; this live input is not persisted as an instance setting.
+
+Both fields are required, finite numbers within **-180 to 180 degrees**; booleans,
+strings, missing/extra fields and non-finite values are rejected before any write.
+The parameter schema uses `type: "object"`, `nullable: true`, `units: "degrees"`
+and two bounded numeric `fields`. A null current value means automatic mode when
+the capability is available; it does not mean a measured zero angle. As with
+other live inputs, `guestObserved` remains false and `observedValue` remains null.
+
+The band body frame has +Z out through the display. For roll `r` and pitch `p`,
+the held pose generates the acceleration vector
+`(-sin(p), sin(r)*cos(p), cos(r)*cos(p))` in **g**, then applies the unchanged
+board installation transform and the chip's configured scale/ODR/register/FIFO
+path. Thus `(0,0)` gives +Z, `(90,0)` +Y and `(0,90)` -X before installation.
+N67/P67 retain their `+y+x-z` chip mount. The firmware still performs its own
+axis conversion and sensor publication; Lua `sensor_accel` units must be checked
+against that firmware rather than inferred from the host input unit.
+
+Holding a pose pauses the synthetic walk/handling progression and retains the
+existing small sensor noise. Reset resumes automatic motion. This is a sequence
+of held poses, not an inertial rotation solver: it does not synthesize the angular
+velocity of transitions. It is suited to acceleration/gravity-driven UI tests.
+The Q65/P65 sensor-CPU machines are not covered by this shared IMU model.
+
+Run `python3 -B -m unittest discover -s tests -p test_orientation.py -v` for
+parameter-to-board round trips, unsupported/old core behavior, invalid atomic
+writes, uncertain-write no-retry behavior, and the production C sample generator
+with both IMUs, six body axes, an oblique vector, board mount and auto reset.

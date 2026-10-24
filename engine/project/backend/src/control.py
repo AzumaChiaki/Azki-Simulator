@@ -2,6 +2,7 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import math
 import os
 from pathlib import Path
 from socketserver import StreamRequestHandler, ThreadingUnixStreamServer
@@ -379,6 +380,8 @@ class WatchControl:
             return self.health(data['value'])
         if set(data) == {'command', 'steps'} and data['command'] == 'health.walk':
             return self.walk(data['steps'])
+        if set(data) == {'command', 'value'} and data['command'] == 'motion.orientation.set':
+            return self.orientation(data['value'], write=True)
         if set(data) == {'command'} and data['command'] == 'live.get':
             return self.live()
         if set(data) == {'command', 'value'} and data['command'] == 'charger.set':
@@ -461,8 +464,63 @@ class WatchControl:
                 health = None
             charger = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'battery-charger'})
             adc = self._adc_raw_state()['values'] if getattr(self, 'adc_raw_available', False) else None
+            try:
+                orientation = self.orientation()
+            except RuntimeError:
+                orientation = None
             return {'health': health, 'charger': charger if charger in ('unplugged', 'charging', 'full') else None,
-                    'adc': adc, 'batteryChannel': self.battery_channel, 'ntcChannels': self.ntc_channels}
+                    'adc': adc, 'batteryChannel': self.battery_channel, 'ntcChannels': self.ntc_channels,
+                    'orientation': orientation}
+
+    def orientation(self, value=None, *, write=False):
+        """Read or atomically set the modeled IMU's held body pose, not Lua data.
+
+        Explicit null resets to auto. Older cores are read-only unavailable;
+        Acknowledged writes retain that fact if a later read fails. A transport
+        failure during the write has an explicitly uncertain outcome.
+        """
+        encoded = 'auto'
+        if write and value is not None:
+            if (type(value) is not dict or set(value) != {'rollDegrees', 'pitchDegrees'} or
+                    any(type(v) not in (int, float) or not -180 <= v <= 180 or
+                        not math.isfinite(v) for v in value.values())):
+                raise ValueError('orientation requires finite rollDegrees and pitchDegrees within -180..180, or null')
+            encoded = 'roll=%.17g;pitch=%.17g' % (value['rollDegrees'], value['pitchDegrees'])
+        with self.lock:
+            try:
+                current = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'motion-orientation'})
+            except RuntimeError as error:
+                raise RuntimeError('unsupported_hardware_input: orientation') from error
+            if current == 'unsupported':
+                raise RuntimeError('unsupported_hardware_input: orientation')
+            if write:
+                try:
+                    self.qmp.execute('qom-set', {'path': '/machine', 'property': 'motion-orientation', 'value': encoded})
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    # QMP RuntimeError is a correlated rejection; a broken or
+                    # malformed reply may follow an already applied write.
+                    raise RuntimeError('orientation_outcome_unknown: do not automatically retry') from error
+            try:
+                if write:
+                    current = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'motion-orientation'})
+                state = self._orientation_state(current)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                if write:
+                    return {'accepted': True, 'guestObserved': False, 'stateUnavailable': True}
+                raise
+            return {'accepted': True, 'guestObserved': False, 'state': state} if write else state
+
+    @staticmethod
+    def _orientation_state(current):
+        if current == 'auto':
+            return {'mode': 'auto', 'rollDegrees': None, 'pitchDegrees': None}
+        if type(current) is not str or len(current) > 128:
+            raise RuntimeError('Invalid orientation readback')
+        fields = dict(item.split('=', 1) for item in current.split(';'))
+        roll, pitch = float(fields['roll']), float(fields['pitch'])
+        if set(fields) != {'roll', 'pitch'} or not all(math.isfinite(v) and -180 <= v <= 180 for v in (roll, pitch)):
+            raise RuntimeError('Invalid orientation readback')
+        return {'mode': 'held', 'rollDegrees': roll, 'pitchDegrees': pitch}
 
     def health(self, value=None):
         """Live health input of the session's modeled sensors.

@@ -123,9 +123,44 @@ struct BesSensorHub {
     double walk_phase;           /* completed steps, fractional */
     double step_rate, step_gain; /* per-step gait variation */
     uint32_t noise;
+    /* Optional host-held body pose; default false preserves the gait model. */
+    bool orientation_enabled;
+    double roll_degrees, pitch_degrees;
 };
 
 /* ---- motion model ------------------------------------------------------ */
+
+/* Fixed, atomic property grammar. It never accepts chip/register addresses.
+ * All angles are degrees in the band's body frame, before the board mount.
+ * A held pose pauses synthetic gait/handling; "auto" resumes them. */
+static inline bool bes_orientation_set(BesSensorHub *h, const char *value)
+{
+    if (!strcmp(value, "auto")) {
+        h->orientation_enabled = false;
+        h->roll_degrees = h->pitch_degrees = 0;
+        return true;
+    }
+    double roll, pitch;
+    char extra;
+    if (sscanf(value, "roll=%lf;pitch=%lf%c", &roll, &pitch, &extra) != 2 ||
+        !isfinite(roll) || !isfinite(pitch) ||
+        fabs(roll) > 180 || fabs(pitch) > 180) {
+        return false;
+    }
+    h->roll_degrees = roll;
+    h->pitch_degrees = pitch;
+    h->orientation_enabled = true;
+    return true;
+}
+
+static inline void bes_orientation_gravity(BesSensorHub *h, double a[3])
+{
+    double roll = h->roll_degrees * M_PI / 180.0;
+    double pitch = h->pitch_degrees * M_PI / 180.0;
+    a[0] = -sin(pitch);
+    a[1] = sin(roll) * cos(pitch);
+    a[2] = cos(roll) * cos(pitch);
+}
 
 static inline double bes_noise(BesSensorHub *h)
 {
@@ -174,7 +209,9 @@ static inline void bes_motion_sample(BesSensorHub *h, double dt, double a[3], do
     /* At rest: forearm level, display up. */
     a[0] = 0.02; a[1] = -0.05; a[2] = 0.99;
     g[0] = g[1] = g[2] = 0;
-    if (bes_walking(h)) {
+    if (h->orientation_enabled) {
+        bes_orientation_gravity(h, a);
+    } else if (bes_walking(h)) {
         /* Natural gait varies stride to stride: a new rate and intensity are
          * drawn at each completed step (+-6 % period, +-15 % amplitude). */
         double before = h->walk_phase;

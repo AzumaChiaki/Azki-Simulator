@@ -17,6 +17,7 @@ from . import instance_settings as settings
 from .bridge import request, private_root, regular_bytes, MAX_MESSAGE
 from .minative import MError, battery_inputs, health_sensors, board_hardware
 from .instance_storage import public_instance_identity, requested_virtual_identity
+from .live_commands import validate_orientation
 
 HOST_FILE = "external-settings.json"
 LANGUAGES = ("zh_CN", "zh_TW", "zh_HK", "en_US", "en_GB", "ja_JP", "ko_KR", "de_DE", "fr_FR", "es_ES", "it_IT", "pt_BR", "ru_RU", "th_TH", "vi_VN")
@@ -29,6 +30,7 @@ LIVE = (
     ("batteryRaw", "电池原始采样", "integer", 0, 65535, "batteryRaw"),
     ("charger", "充电状态", "enum", None, None, "charger"),
     ("temperatureC", "温度输入（°C）", "number", -40, 125, "temperature"),
+    ("orientation", "IMU 姿态（度）", "object", None, None, "orientation"),
 )
 
 
@@ -138,9 +140,13 @@ def describe(library, instance, item, call=None):
             extra.update(minimum=minimum, maximum=maximum, step=1 if kind == "integer" else .1)
         if key == "charger":
             extra["options"] = _options(("unplugged", "charging", "full"))
+        if key == "orientation":
+            extra.update(nullable=True, units="degrees", fields={axis: {"type": "number", "minimum": -180, "maximum": 180}
+                         for axis in ("rollDegrees", "pitchDegrees")})
         add("live." + key, label, kind, value, "实时传感器", "live", available=available,
             reason=None if available else ("请先启动实例并读取硬件状态" if not running else "当前精确核心/固件没有此可调输入或读取失败"),
-            description="只改变模拟硬件输入；固件独立计算显示值。" + ("电量通过电压改变，固件会渐变且通常只在充电时上升。" if key == "batteryLevel" else ""), **extra)
+            description=("原子设置 rollDegrees/pitchDegrees；空值恢复自动动作。只改变原始 IMU 采样，保留板级轴映射；不会注入 Lua 数据。" if key == "orientation" else
+                         "只改变模拟硬件输入；固件独立计算显示值。" + ("电量通过电压改变，固件会渐变且通常只在充电时上升。" if key == "batteryLevel" else "")), **extra)
     for key, label in (("walked", "已模拟行走步数"), ("walkSteps", "剩余模拟步数")):
         add("live." + key, label, "integer", live_state.get(key), "实时传感器", "live", readonly=True,
             available=running and supported.get("steps") is True, reason="模拟器输入计数，不是固件活动页步数", valueSource="modeled-hardware")
@@ -205,6 +211,9 @@ def validate_value(row, value):
         _need(row.get("nullable") is True, "该参数不允许空值")
         return
     kind = row["type"]
+    if row["id"] == "live.orientation":
+        validate_orientation(value)
+        return
     valid = (type(value) is bool if kind == "boolean" else type(value) is int if kind == "integer" else
              type(value) in (int, float) and math.isfinite(value) if kind == "number" else type(value) is str)
     _need(valid, "参数类型错误：" + row["id"])
