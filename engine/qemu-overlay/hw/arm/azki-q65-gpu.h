@@ -58,6 +58,75 @@ static BesGpuColor gpu_sw_color_565(unsigned value)
                          (value & 31) * 255 / 31, 255};
 }
 
+/* SDK BGRA5551: little-endian B[15:11], G[10:6], R[5:1], A[0]. */
+static BesGpuColor gpu_sw_color_5551(unsigned value)
+{
+    return (BesGpuColor) {((value >> 1) & 31) * 255 / 31,
+                         ((value >> 6) & 31) * 255 / 31,
+                         ((value >> 11) & 31) * 255 / 31,
+                         (value & 1) ? 255 : 0};
+}
+
+static unsigned gpu_sw_mul(unsigned a, unsigned b)
+{
+    return (a * b + 127) / 255;
+}
+
+/* VGLite stores alpha-bearing targets premultiplied and blends the sampled
+ * source in that same space.  Keep the complete blend table here instead of
+ * treating every draw as SRC_OVER; NORMAL image blits with A00=0x10001081
+ * use the mode-0 coverage replacement path. */
+static BesGpuColor gpu_sw_blend(unsigned mode, BesGpuColor source,
+                                BesGpuColor dest, unsigned coverage)
+{
+    unsigned out[4];
+    unsigned sc[4] = {source.r, source.g, source.b, source.a};
+    unsigned dc[4] = {dest.r, dest.g, dest.b, dest.a};
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned v;
+        switch (mode) {
+        case 1: /* SRC_OVER */
+            v = sc[i] + gpu_sw_mul(dc[i], 255 - sc[3]);
+            break;
+        case 2: /* DST_OVER */
+            v = gpu_sw_mul(sc[i], 255 - dc[3]) + dc[i];
+            break;
+        case 3: /* SRC_IN */
+            v = gpu_sw_mul(sc[i], dc[3]) + (dc[i] * (256 - coverage) >> 8);
+            break;
+        case 4: /* DST_IN */
+            v = gpu_sw_mul(dc[i], sc[3]) + (dc[i] * (256 - coverage) >> 8);
+            break;
+        case 5: /* MULTIPLY */
+            v = gpu_sw_mul(sc[i], 255 - dc[3]) +
+                gpu_sw_mul(dc[i], 255 - sc[3]) + gpu_sw_mul(sc[i], dc[i]);
+            break;
+        case 6: /* SCREEN */
+            v = sc[i] + dc[i] - gpu_sw_mul(sc[i], dc[i]);
+            break;
+        case 7: /* DARKEN */
+            v = MIN(sc[i] + gpu_sw_mul(dc[i], 255 - sc[3]),
+                    dc[i] + gpu_sw_mul(sc[i], 255 - dc[3]));
+            break;
+        case 8: /* LIGHTEN */
+            v = MAX(sc[i] + gpu_sw_mul(dc[i], 255 - sc[3]),
+                    dc[i] + gpu_sw_mul(sc[i], 255 - dc[3]));
+            break;
+        case 9: /* ADDITIVE */
+            v = sc[i] + dc[i];
+            break;
+        case 10: /* SUBTRACT */
+            v = gpu_sw_mul(dc[i], 255 - sc[3]);
+            break;
+        default: /* NONE: replace by coverage */
+            v = sc[i] + (dc[i] * (256 - coverage) >> 8);
+            break;
+        }
+        out[i] = MIN(255, v);
+    }
+    return (BesGpuColor) {out[0], out[1], out[2], out[3]};
+}
+
 static BesGpuColor gpu_sw_target_load(const BesGpuTarget *t,
                                      const uint8_t *pixel)
 {
@@ -70,14 +139,17 @@ static BesGpuColor gpu_sw_target_load(const BesGpuTarget *t,
     if (t->bpp == 4) {
         return gpu_sw_color_bgra(pixel);
     }
+    if (t->format == 0x105) {
+        return gpu_sw_color_5551(lduw_le_p(pixel));
+    }
     /* SDK BGR565 (0x101) has red in bits 15:11; RGB565 (0x121)
-     * reverses red/blue. BGRA5658 (0x10a) prepends an alpha byte. */
-    BesGpuColor color = gpu_sw_color_565(lduw_le_p(pixel + (t->bpp == 3)));
+     * reverses red/blue. BGRA5658 (0x10a) stores alpha after the color bytes. */
+    BesGpuColor color = gpu_sw_color_565(lduw_le_p(pixel));
     if (t->format == 0x121) {
         unsigned red = color.r; color.r = color.b; color.b = red;
     }
     if (t->bpp == 3) {
-        color.a = pixel[0];
+        color.a = pixel[2];
     }
     return color;
 }
@@ -93,6 +165,11 @@ static void gpu_sw_target_store(const BesGpuTarget *t, uint8_t *pixel,
         pixel[0] = color.b; pixel[1] = color.g; pixel[2] = color.r;
         return;
     }
+    if (t->format == 0x105) {
+        stw_le_p(pixel, ((color.b >> 3) << 11) | ((color.g >> 3) << 6) |
+                       ((color.r >> 3) << 1) | (color.a >> 7));
+        return;
+    }
     if (t->bpp == 4) {
         pixel[0] = color.b; pixel[1] = color.g; pixel[2] = color.r;
         pixel[3] = color.a;
@@ -102,9 +179,9 @@ static void gpu_sw_target_store(const BesGpuTarget *t, uint8_t *pixel,
         unsigned red = color.r; color.r = color.b; color.b = red;
     }
     if (t->bpp == 3) {
-        pixel[0] = color.a;
+        pixel[2] = color.a;
     }
-    stw_le_p(pixel + (t->bpp == 3),
+    stw_le_p(pixel,
              ((color.r >> 3) << 11) | ((color.g >> 2) << 5) | (color.b >> 3));
 }
 
@@ -192,7 +269,10 @@ static BesGpuTarget *gpu_sw_target(BesGpuWork *w, BesGpuRead read)
     }
     uint64_t length = (uint64_t)stride * height;
     uint32_t canonical = gpu_sw_canonical(r[0xa11], length);
-    bool bad_format = format != 0x100 && format != 0x101 && format != 0x121 &&
+    /* Q65's secondary 414x100 BGRA5551 layer reports target format 0x105.
+     * Rejecting it makes the firmware's nested GPU submit fail and
+     * the AP enters its recursive-assert reset path. */
+    bool bad_format = format != 0x100 && format != 0x101 && format != 0x105 && format != 0x121 &&
                       format != 0x109 && format != 0x10a && format != 0x103;
     bool bad_size = !width || !height || width > 1024 || height > 1024;
     bool bad_stride = stride < width * bpp || stride > 4096 || (bpp == 2 && (stride & 1));
@@ -483,17 +563,27 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                         BesGpuRead read)
 {
     uint32_t *r = w->regs;
+    unsigned control_op = r[0xa00] & 7;
     bool multiply_mode = r[0xa00] == 0x10002181 || r[0xa00] == 0x10002102;
-    bool clear_rectangle = r[0xa00] == 0x10000001 && bytes == 8;
+    /* VGLite encodes CLEAR as operation 4 in the low control bits.  The
+     * Q65 firmware also uses the older 0x10000001 clear word, so accept both
+     * forms and replace the target pixels instead of blending over the
+     * previous watch-face frame. */
+    bool clear_rectangle = (control_op == 4 || r[0xa00] == 0x10000001) &&
+                           bytes == 8;
     /* A single DATA unit is x/y/width/height even for solid clears.
      * Longer solid DATA carries a path and keeps its tessellation state. */
     /* vg_lite_clear emits 0x10000001 for a regular solid rectangle;
      * path fills use 0x10000102. Both carry the same x/y/w/h DATA. */
     bool solid_rectangle = (r[0xa00] == 0x10000001 ||
                             r[0xa00] == 0x10000102) && bytes == 8;
-    bool path = !solid_rectangle && r[0xa00] != 0x2181 && r[0xa00] != 0x10001181 &&
-                r[0xa00] != 0x10002181 && r[0xa00] != 0x10001081;
-    bool image = !solid_rectangle && r[0xa00] != 0x10000102;
+    /* DATA is a tessellated path when PATH_CONTROL bit 24 is enabled.  A00
+     * describes blend/image mode only; using it to infer path-vs-rectangle
+     * misclassified Q65's full-screen background paths and left the previous
+     * watch-face framebuffer visible underneath the new page. */
+    bool path = !solid_rectangle && !clear_rectangle &&
+                (r[0xa34] & 0x01000000);
+    bool image = !solid_rectangle && !clear_rectangle && r[0xa00] != 0x10000102;
     /* 4.100.080 crown-press animation blits use 0x10001081: the public
      * vg_lite_blit word 0x10000001 | imageMode(0x1000 NORMAL) with the
      * ahb-read-split bit (1<<7) and no SRC_OVER blend bit. */
@@ -501,8 +591,17 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                       r[0xa00] == 0x10001081;
     bool indexed = r[0xa25] == 0x01000900 || r[0xa25] == 0x01020900;
     bool packed_source = r[0xa25] == 0x41020100 || r[0xa25] == 0x41000100;
+    /* The firmware uses both packed BGR888 transition surfaces and the
+     * BGRA5551 asset format for settings/control-center artwork.  The
+     * sampler word carries the filter variant in its middle byte. */
+    bool bgr888_source = r[0xa25] == 0x21000100 ||
+                         r[0xa25] == 0x21010100 ||
+                         r[0xa25] == 0x21020100;
     bool rgb565_source = r[0xa25] == 0x01000105 ||
                          r[0xa25] == 0x01010105 || r[0xa25] == 0x01020105;
+    bool bgra5551_source = r[0xa25] == 0x01000104 ||
+                           r[0xa25] == 0x01010104 ||
+                           r[0xa25] == 0x01020104;
     /* Original Q65 launcher glyphs use POINT A8 (01000102), while
      * startup glyphs use LINEAR A8 (01010102). Both share the A8 layout. */
     bool a8_source = r[0xa25] == 0x01000102 || r[0xa25] == 0x01010102 ||
@@ -520,15 +619,34 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                             ((r[0xa25] >> 8) & 0xff) == 0x11 ||
                             ((r[0xa25] >> 8) & 0xff) == 0x21 ||
                             ((r[0xa25] >> 8) & 0xff) == 0x20);
+    /* Format 6 is the same four-byte BGR layout with an unused alpha
+     * component.  It appears in a few transition buffers and must not fall
+     * through to the one-byte A8 path. */
+    bool bgr8888_source = (r[0xa25] & 0xff) == 0x06 &&
+                          (r[0xa25] >> 24) == 0x01 &&
+                          ((r[0xa25] >> 16) & 0xff) <= 0x03 &&
+                          (((r[0xa25] >> 8) & 0xff) == 0x01 ||
+                           ((r[0xa25] >> 8) & 0xff) == 0x11 ||
+                           ((r[0xa25] >> 8) & 0xff) == 0x21 ||
+                           ((r[0xa25] >> 8) & 0xff) == 0x20);
     /* The Rive paints in Q65's control center use LINEAR with PAD. Their
      * one-row BGRA ramps extend across the path in the other dimension. */
     bool linear_pad = r[0xa25] == 0x01011107;
-    bool colored_source = indexed || packed_source || rgb565_source || bgra8888_source;
-    if ((r[0xa00] != 0x2181 && r[0xa00] != 0x2102 &&
+    bool colored_source = indexed || packed_source || bgr888_source ||
+                          rgb565_source || bgra5551_source ||
+                          bgra8888_source || bgr8888_source;
+    /* VGLite marks premultiplied texels in IMAGE_CONFIG bit 24 (A25), not
+     * in the blend/control word A00.  The resource images used by Q65
+     * settings and control-center pages set this bit.  A00 bit 28 applies
+     * only to the already-premultiplied paint colour. */
+    bool premultiplied_source = packed_source || (r[0xa25] & 0x01000000);
+    bool premultiplied_paint = !image && (r[0xa00] & 0x10000000);
+    if ((!clear_rectangle &&
+        (r[0xa00] != 0x2181 && r[0xa00] != 0x2102 &&
          r[0xa00] != 0x10000001 && r[0xa00] != 0x10000102 &&
-         !color_mode && !multiply_mode) ||
+         !color_mode && !multiply_mode)) ||
         (r[0xa00] == 0x10000001 && !clear_rectangle) ||
-        (!path && !solid_rectangle && r[0xa34]) || r[0xad1]) {
+        (!path && !solid_rectangle && !clear_rectangle && r[0xa34]) || r[0xad1]) {
         return gpu_sw_fail(w, "unsupported draw/blend/global-alpha mode");
     }
     for (unsigned i = 0xa90; i <= 0xa97; i++) {
@@ -546,8 +664,10 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
         return false;
     }
     unsigned sw = r[0xa2f] & 0xffff, sh = r[0xa2f] >> 16, stride = r[0xa2b];
-    unsigned source_bpp = bgra8888_source ? 4 : packed_source ? 3 : rgb565_source ? 2 : 1;
-    if (image && packed_source) {
+    unsigned source_bpp = (bgra8888_source || bgr8888_source) ? 4 :
+                          (packed_source || bgr888_source) ? 3 :
+                          (rgb565_source || bgra5551_source) ? 2 : 1;
+    if (image && (packed_source || bgr888_source)) {
         if (stride & 3) { return gpu_sw_fail(w, "unaligned packed source stride"); }
         stride = stride / 4 * 3;
     }
@@ -678,12 +798,18 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                                 color = gpu_sw_color_argb(r[0xb00 + texel]);
                             } else if (bgra8888_source) {
                                 color = gpu_sw_color_bgra(sample_pixel);
+                            } else if (bgr8888_source) {
+                                color = (BesGpuColor) {sample_pixel[2], sample_pixel[1], sample_pixel[0], 255};
+                            } else if (bgr888_source) {
+                                color = (BesGpuColor) {sample_pixel[2], sample_pixel[1], sample_pixel[0], 255};
+                            } else if (bgra5551_source) {
+                                color = gpu_sw_color_5551(lduw_le_p(sample_pixel));
                             } else {
-                                color = gpu_sw_color_565(lduw_le_p(sample_pixel + packed_source));
-                                if (packed_source) { color.a = texel; }
+                                color = gpu_sw_color_565(lduw_le_p(sample_pixel));
+                                if (packed_source) { color.a = sample_pixel[2]; }
                             }
                             sample = color.a;
-                            unsigned color_weight = packed_source ? 255 : color.a;
+                            unsigned color_weight = premultiplied_source ? 255 : color.a;
                             colors[0] = color.r * color_weight;
                             colors[1] = color.g * color_weight;
                             colors[2] = color.b * color_weight;
@@ -709,13 +835,19 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                                     color = gpu_sw_color_argb(r[0xb00 + texel]);
                                 } else if (bgra8888_source) {
                                     color = gpu_sw_color_bgra(sample_pixel);
+                                } else if (bgr8888_source) {
+                                    color = (BesGpuColor) {sample_pixel[2], sample_pixel[1], sample_pixel[0], 255};
+                                } else if (bgr888_source) {
+                                    color = (BesGpuColor) {sample_pixel[2], sample_pixel[1], sample_pixel[0], 255};
+                                } else if (bgra5551_source) {
+                                    color = gpu_sw_color_5551(lduw_le_p(sample_pixel));
                                 } else {
-                                    color = gpu_sw_color_565(lduw_le_p(sample_pixel + packed_source));
-                                    if (packed_source) { color.a = texel; }
+                                    color = gpu_sw_color_565(lduw_le_p(sample_pixel));
+                                    if (packed_source) { color.a = sample_pixel[2]; }
                                 }
                                 double opacity = color.a * weight;
                                 sample += opacity;
-                                double color_weight = packed_source ? 255 * weight : opacity;
+                                double color_weight = premultiplied_source ? 255 * weight : opacity;
                                 colors[0] += color.r * color_weight;
                                 colors[1] += color.g * color_weight;
                                 colors[2] += color.b * color_weight;
@@ -758,13 +890,22 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                 continue;
             }
             uint8_t *pixel = t->pixels + y * t->stride + x * t->bpp;
+            /* VGLite composes every layer in premultiplied space.  This is
+             * essential for the BGRA8888 intermediate targets used by the
+             * settings/control-center shadows; treating them as straight
+             * alpha makes transparent ramps darken twice and leaves broad
+             * horizontal bands after the layer is copied to RGB565. */
             BesGpuColor old = gpu_sw_target_load(t, pixel);
-            BesGpuColor blended = {
-                (sr * a + old.r * (255-a) + 127) / 255,
-                (sg * a + old.g * (255-a) + 127) / 255,
-                (sb * a + old.b * (255-a) + 127) / 255,
-                a + (old.a * (255-a) + 127) / 255,
-            };
+            unsigned red = premultiplied_paint ? ((sr * cov + 8) / 16) * 255 : sr * a;
+            unsigned green = premultiplied_paint ? ((sg * cov + 8) / 16) * 255 : sg * a;
+            unsigned blue = premultiplied_paint ? ((sb * cov + 8) / 16) * 255 : sb * a;
+            BesGpuColor source = {(red + 127) / 255 > 255 ? 255 : (red + 127) / 255,
+                                  (green + 127) / 255 > 255 ? 255 : (green + 127) / 255,
+                                  (blue + 127) / 255 > 255 ? 255 : (blue + 127) / 255,
+                                  a};
+            unsigned blend_mode = (r[0xa00] >> 8) & 0xF;
+            BesGpuColor blended = gpu_sw_blend(blend_mode, source, old,
+                                               cov * 16);
             gpu_sw_target_store(t, pixel, blended);
             w->pixels++;
         }
