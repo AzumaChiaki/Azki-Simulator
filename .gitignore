@@ -25,3 +25,6 @@ instances/
 .build-debug
 
 tests
+# .NET build output lives one directory deeper per project (src/*, tests/*).
+linux/**/bin/
+linux/**/obj/

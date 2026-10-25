@@ -135,6 +135,8 @@ def qemu_display_backend(qemu, window, platform=None):
     platform = sys.platform if platform is None else platform
     if platform == 'darwin':
         return 'cocoa,show-cursor=on'
+    if platform.startswith('linux'):
+        raise RuntimeError('Linux sessions render through the host control surface; QEMU window backends are not built')
     available = subprocess.run([str(qemu), '-display', 'help'],
                                capture_output=True, text=True, timeout=5)
     backends = set((available.stdout + '\n' + available.stderr).split())

@@ -21,7 +21,9 @@ def write(path, value):
 
 class DeveloperStorageTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="azki-owner-", dir="/private/tmp")
+        # The scratch root must live outside the repository on every host;
+        # the platform temp directory is the disposable location.
+        self.temp = tempfile.TemporaryDirectory(prefix="azki-owner-")
         self.session = Path(self.temp.name)
         self.run = self.session / "m-123456789abc"
         self.run.mkdir(mode=0o700)

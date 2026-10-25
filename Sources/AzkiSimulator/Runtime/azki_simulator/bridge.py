@@ -23,6 +23,8 @@ import time
 import uuid
 import zlib
 
+from .bwrap_policy import LAUNCHER as BWRAP_LAUNCHER, PREAMBLE as BWRAP_PREAMBLE
+
 MAX_MESSAGE = 65536
 DISPLAY_GEOMETRIES = frozenset(((192, 490), (212, 520), (336, 480), (432, 514)))
 MAX_FRAME = 32 + 432 * 514 * 2
@@ -57,6 +59,11 @@ class BridgeError(ValueError):
     def __init__(self, code, message):
         self.code = code
         super().__init__(message)
+
+
+# launch.py execs exactly one supported sandbox launcher per host; the Linux
+# path name lives in bwrap_policy so every supervised process shares it.
+EXPECTED_LAUNCHER = "/usr/bin/sandbox-exec" if sys.platform == "darwin" else BWRAP_LAUNCHER
 
 
 def quarantine(path: Path, value=None):
@@ -416,6 +423,12 @@ class QMP:
                 peer = struct.unpack("i", self.socket.getsockopt(0, 2, 4))[0]
                 if peer != expected_pid:
                     raise BridgeError("qmp_error", "QMP peer is not the isolated process")
+            elif expected_pid is not None and sys.platform.startswith("linux"):
+                # struct ucred {pid, uid, gid}; bwrap shares the pid namespace so
+                # the kernel-visible peer pid equals the tracked child pid.
+                peer = struct.unpack("=i", self.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)[:4])[0]
+                if peer != expected_pid:
+                    raise BridgeError("qmp_error", "QMP peer is not the isolated process")
             if "QMP" not in self.receive():
                 raise BridgeError("qmp_error", "Invalid QMP greeting")
             self.execute("qmp_capabilities")
@@ -481,6 +494,27 @@ def sandbox_profile(root, files, frame_path=None, writable_files=None, allow_pri
             + quoted(root) + ')))' + frame_rule + memfd_rule)
 
 
+def bwrap_arguments(root, files, frame_path=None, writable_files=None, allow_private_memfd=False):
+    """Bubblewrap translation of sandbox_profile (deny-default visibility).
+
+    Same posture as the Seatbelt profile: exact core inputs read-only, the run
+    directory writable, one shared framebuffer, no network. Deviation: bind
+    granularity is per file/directory rather than per syscall rule, so the run
+    directory's contents are fully writable (Seatbelt limited writes to the
+    pinned output files); everything writable is still inside this session's
+    private run. On Linux memfd_create needs no file rule, so
+    allow_private_memfd is accepted and ignored."""
+    args = list(BWRAP_PREAMBLE)
+    for item in files:
+        args += ["--ro-bind", str(item), str(item)]
+    if frame_path is not None:
+        args += ["--bind", str(frame_path), str(frame_path)]
+    # Outputs live in the run directory; bind the directory so QEMU may create
+    # them, matching the Seatbelt subpath/literal write grants for run.
+    args += ["--bind", str(root), str(root)]
+    return [*args, "--"]
+
+
 class SessionBridge:
     def __init__(self, root: Path, approved_hashes: dict | None = None, max_runtime: int = 0,
                  allow_private_memfd: bool = False):
@@ -541,8 +575,9 @@ class SessionBridge:
             return self.status()
         if self.approved_hashes is None:
             raise BridgeError("execution_not_approved", "Core execution awaits explicit approval of source and hashes")
-        if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
-            raise BridgeError("isolation_unavailable", "Required macOS process isolation is unavailable")
+        if sys.platform not in ("darwin", "linux") or \
+                not Path(EXPECTED_LAUNCHER).is_file():
+            raise BridgeError("isolation_unavailable", "Required process isolation launcher is unavailable")
         if self.process is not None:
             self.stop()
         if len(list(self.root.glob("run-*"))) >= 8:
@@ -592,10 +627,14 @@ class SessionBridge:
             self.stop()
             raise BridgeError("unsafe_session", "Run socket path is too long; use a shorter session path")
         outputs = [self.run_root / name for name in ("stderr.log", "qemu.log", "virtual-peer.log", "uart0.log", "uart1.log", "uart2.log", "qmp.sock")]
+        sandbox = (["/usr/bin/sandbox-exec", "-p",
+                    sandbox_profile(self.run_root, paths.values(), self.root / "frame.raw", outputs,
+                                    self.allow_private_memfd)] if sys.platform == "darwin"
+                   else bwrap_arguments(self.run_root, paths.values(), self.root / "frame.raw", outputs,
+                                        self.allow_private_memfd))
         args = [sys.executable, "-I", "-S", str(Path(__file__).with_name("launch.py")), str(self.max_runtime),
                 str(self.root / "core-process.json"), str(os.getpid()),
-                "/usr/bin/sandbox-exec", "-p", sandbox_profile(self.run_root, paths.values(), self.root / "frame.raw", outputs,
-                                                            self.allow_private_memfd), str(paths["qemu"]),
+                *sandbox, str(paths["qemu"]),
                 "-M", machine, "-display", "none", "-monitor", "none", "-no-reboot", "-nic", "none",
                 "-kernel", str(paths["firmware"]), "-qmp", f"unix:{self.run_root}/qmp.sock,server=on,wait=off",
                 "-d", "guest_errors", "-D", str(self.run_root / "qemu.log")]

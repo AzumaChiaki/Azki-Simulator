@@ -1,7 +1,7 @@
 """Private exec trampoline for child resource limits, never a general service.
 
 Run in a fresh isolated Python interpreter instead of a threaded preexec_fn.
-The bridge supplies a fixed sandbox-exec invocation and fixed audited core.
+The bridge supplies a fixed sandbox launcher invocation and fixed audited core.
 """
 import os
 import resource
@@ -11,12 +11,16 @@ import sys
 import time
 import json
 
+# The trampoline runs outside the sandbox and execs exactly one supported
+# launcher per host; a mismatched launcher is a hard failure, never a fallback.
+EXPECTED_LAUNCHER = "/usr/bin/sandbox-exec" if sys.platform == "darwin" else "/usr/bin/bwrap"
+
 
 def main():
     duration = int(sys.argv[1])
     metadata_path = sys.argv[2]
     parent_pid = int(sys.argv[3])
-    if not 0 <= duration <= 28800 or sys.argv[4] != "/usr/bin/sandbox-exec" or os.getppid() != parent_pid:
+    if not 0 <= duration <= 28800 or sys.argv[4] != EXPECTED_LAUNCHER or os.getppid() != parent_pid:
         raise SystemExit("Invalid isolated launch invocation")
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_FSIZE, (16 * 1024 * 1024, 16 * 1024 * 1024))

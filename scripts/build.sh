@@ -2,8 +2,15 @@
 set -euo pipefail
 root="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 source "$root/scripts/build-common.sh"
-test "$(uname -s)" = Darwin || { echo 'Build requires macOS.' >&2; exit 2; }
-test "$(uname -m)" = arm64 || { echo 'Build requires Apple Silicon.' >&2; exit 2; }
+case "$(uname -s)" in
+  Darwin)
+    test "$(uname -m)" = arm64 || { echo 'Build requires Apple Silicon.' >&2; exit 2; }
+    ;;
+  Linux)
+    exec "$root/scripts/build-linux.sh" "$@"
+    ;;
+  *) echo 'Build requires macOS or Linux.' >&2; exit 2 ;;
+esac
 test "$#" -le 1 || { echo "Usage: $0 [debug|release]" >&2; exit 2; }
 configuration="${1:-debug}"
 case "$configuration" in debug|release) ;; *) echo 'Choose debug or release.' >&2; exit 2 ;; esac

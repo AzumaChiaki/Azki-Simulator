@@ -1,14 +1,17 @@
-"""Protocol crypto with macOS AES/Security and stdlib SHA256/HMAC.
+"""Protocol crypto with system AES/ECDH and stdlib SHA256/HMAC.
 
-P-256 keys are ephemeral SecKey objects, explicitly non-permanent. No Keychain,
-external key stores, cloud services or caller-provided device identity material.
+macOS uses CommonCrypto plus ephemeral SecKey objects; Linux uses libcrypto's
+EVP AES and EC key agreement against the system OpenSSL. P-256 keys are
+ephemeral, explicitly non-permanent. No Keychain, external key stores, cloud
+services or caller-provided device identity material.
 AES-CCM/CTR follow the standard mode constructions over system AES; known-answer
 tests cover the exact nonce/tag layouts before use with a guest.
 """
 import ctypes as C
 import hashlib
 import hmac
-from .crypto import CommonCryptoAES
+import sys
+from .crypto import aes_provider
 
 
 def mac(key, message):
@@ -30,7 +33,7 @@ def xor(a, b):
 
 
 class AESModes:
-    def __init__(self): self.aes = CommonCryptoAES()
+    def __init__(self): self.aes = aes_provider()
 
     def ctr(self, key, counter, data):
         if len(counter)!=16 or len(data)>65536: raise ValueError('CTR bounds')
@@ -78,7 +81,7 @@ class AESModes:
         return plaintext
 
 
-class P256:
+class _DarwinP256:
     """Ephemeral standard P-256 ECDH through Apple's public SecKey API."""
     def __init__(self, private_data=None):
         self.cf=C.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
@@ -168,3 +171,129 @@ class P256:
 
     def close(self):
         if self.private:self.cf.CFRelease(self.private);self.private=None
+
+
+class _LinuxP256:
+    """Ephemeral standard P-256 ECDH through libcrypto's EC key agreement.
+
+    Byte contracts mirror the SecKey provider exactly: .public is X||Y (64),
+    export_private is 0x04||X||Y||K (97), exchange returns the 32-byte raw
+    ECDH X coordinate (no KDF). Known-answer tests pin the equivalence."""
+    NID_PRIME256V1 = 415
+
+    def __init__(self, private_data=None):
+        import ctypes.util
+        name = ctypes.util.find_library("crypto") or "libcrypto.so.3"
+        self.lib = C.CDLL(name)
+        vp = C.c_void_p
+        for function, restype, argtypes in (
+                ("EC_KEY_new_by_curve_name", vp, [C.c_int]),
+                ("EC_KEY_free", None, [vp]),
+                ("EC_KEY_generate_key", C.c_int, [vp]),
+                ("EC_KEY_check_key", C.c_int, [vp]),
+                ("EC_KEY_get0_group", vp, [vp]),
+                ("EC_KEY_get0_public_key", vp, [vp]),
+                ("EC_KEY_get0_private_key", vp, [vp]),
+                ("EC_KEY_set_private_key", C.c_int, [vp, vp]),
+                ("EC_KEY_set_public_key", C.c_int, [vp, vp]),
+                ("EC_POINT_new", vp, [vp]),
+                ("EC_POINT_free", None, [vp]),
+                ("EC_POINT_mul", C.c_int, [vp, vp, vp, vp, vp, vp]),
+                ("EC_POINT_oct2point", C.c_int, [vp, vp, C.c_char_p, C.c_size_t, vp]),
+                ("EC_POINT_get_affine_coordinates_GFp", C.c_int, [vp, vp, vp, vp, vp]),
+                ("BN_new", vp, []),
+                ("BN_free", None, [vp]),
+                ("BN_bin2bn", vp, [C.c_char_p, C.c_int, vp]),
+                ("BN_bn2binpad", C.c_int, [vp, C.c_char_p, C.c_int]),
+                ("ECDH_compute_key", C.c_size_t, [C.c_void_p, C.c_size_t, vp, vp, C.c_void_p])):
+            call = getattr(self.lib, function)
+            call.restype = restype
+            call.argtypes = argtypes
+        self.key = self.lib.EC_KEY_new_by_curve_name(self.NID_PRIME256V1)
+        if not self.key:
+            raise ValueError('System P256 operation failed: EC_KEY_new_by_curve_name')
+        try:
+            if private_data is None:
+                if self.lib.EC_KEY_generate_key(self.key) != 1:
+                    raise ValueError('System P256 key generation failed')
+            else:
+                if not isinstance(private_data, bytes) or len(private_data) != 97 or private_data[0] != 4:
+                    raise ValueError('Self-generated P256 private representation required')
+                scalar = C.create_string_buffer(private_data[65:97])
+                private = self.lib.BN_bin2bn(scalar, 32, None)
+                if not private:
+                    raise ValueError('System P256 import failed')
+                group = self.lib.EC_KEY_get0_group(self.key)
+                point = self.lib.EC_POINT_new(group)
+                try:
+                    if (self.lib.EC_KEY_set_private_key(self.key, private) != 1 or
+                            self.lib.EC_POINT_mul(group, point, private, None, None, None) != 1 or
+                            self.lib.EC_KEY_set_public_key(self.key, point) != 1 or
+                            self.lib.EC_KEY_check_key(self.key) != 1):
+                        raise ValueError('System P256 import failed')
+                finally:
+                    self.lib.EC_POINT_free(point)
+                    self.lib.BN_free(private)
+            self.public = self._affine()
+        except BaseException:
+            self.close()
+            raise
+
+    def _affine(self):
+        group = self.lib.EC_KEY_get0_group(self.key)
+        point = self.lib.EC_KEY_get0_public_key(self.key)
+        x, y = self.lib.BN_new(), self.lib.BN_new()
+        if not x or not y:
+            raise ValueError('System P256 operation failed: BN_new')
+        try:
+            buffer_x, buffer_y = C.create_string_buffer(32), C.create_string_buffer(32)
+            if (self.lib.EC_POINT_get_affine_coordinates_GFp(group, point, x, y, None) != 1 or
+                    self.lib.BN_bn2binpad(x, buffer_x, 32) != 32 or
+                    self.lib.BN_bn2binpad(y, buffer_y, 32) != 32):
+                raise ValueError('System P256 public-key export failed')
+            return buffer_x.raw + buffer_y.raw
+        finally:
+            self.lib.BN_free(x); self.lib.BN_free(y)
+
+    def exchange(self, public):
+        if not isinstance(public, bytes) or len(public) != 64:
+            raise ValueError('P256 public key must be 64 bytes')
+        group = self.lib.EC_KEY_get0_group(self.key)
+        point = self.lib.EC_POINT_new(group)
+        if not point:
+            raise ValueError('System P256 operation failed: EC_POINT_new')
+        try:
+            peer = C.create_string_buffer(b'\x04' + public)
+            if self.lib.EC_POINT_oct2point(group, point, peer, 65, None) != 1:
+                raise ValueError('System P256 peer point rejected')
+            output = C.create_string_buffer(32)
+            size = self.lib.ECDH_compute_key(output, 32, point, self.key, None)
+            if size != 32:
+                raise ValueError('System P256 shared-secret length')
+            return output.raw[:32]
+        finally:
+            self.lib.EC_POINT_free(point)
+
+    def export_private(self):
+        """Export only this object's newly generated key for its private sandbox."""
+        private = self.lib.EC_KEY_get0_private_key(self.key)
+        if not private:
+            raise ValueError('System P256 private export failed')
+        buffer = C.create_string_buffer(32)
+        if self.lib.BN_bn2binpad(private, buffer, 32) != 32:
+            raise ValueError('System P256 private export failed')
+        return b'\x04' + self.public + buffer.raw
+
+    def close(self):
+        if self.key:
+            self.lib.EC_KEY_free(self.key)
+            self.key = None
+
+
+def P256(private_data=None):
+    """Platform P-256 provider; unknown hosts fail closed."""
+    if sys.platform == "darwin":
+        return _DarwinP256(private_data)
+    if sys.platform.startswith("linux"):
+        return _LinuxP256(private_data)
+    raise ValueError('P-256 requires macOS or Linux')

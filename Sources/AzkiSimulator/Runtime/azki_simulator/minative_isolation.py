@@ -2,6 +2,14 @@
 
 Generated-mode profiles may create storage caches only under the session's private
 prepared project assets directory, via the pinned yaffs-image/legacy-ui-db builders.
+
+Darwin uses /usr/bin/sandbox-exec with an SBPL policy file. Linux uses
+/usr/bin/bwrap with the same least-write posture expressed as bind arguments:
+deny-default visibility (empty tmpfs root), the bundled interpreter and the
+prepared project tree read-only, the session run directory writable, and no
+network. Granularity differs from Seatbelt: bound read-only trees expose all
+their file contents, not only the manifest-pinned files, because bwrap binds
+directories; those trees contain only manifest-pinned application material.
 """
 import json
 import os
@@ -9,6 +17,7 @@ from pathlib import Path
 import sys
 import stat
 
+from .bwrap_policy import PREAMBLE as BWRAP_PREAMBLE
 from .minative import MError
 
 
@@ -16,8 +25,14 @@ def execution_prefix(adapter):
     plan, run = adapter.plan, adapter.run_root
     identity = plan["identity"]
     generated = identity.get("mode") == "generated"
-    if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
-        raise MError("isolation_unavailable", "Required macOS sandbox launcher is unavailable")
+    if sys.platform == "darwin":
+        if not Path("/usr/bin/sandbox-exec").is_file():
+            raise MError("isolation_unavailable", "Required macOS sandbox launcher is unavailable")
+    elif sys.platform.startswith("linux"):
+        if not Path("/usr/bin/bwrap").is_file():
+            raise MError("isolation_unavailable", "Required bubblewrap launcher is unavailable")
+    else:
+        raise MError("isolation_unavailable", "No supported process isolation launcher for this host")
     if not generated and not identity["profile"].get("resource_path"):
         raise MError("isolation_unavailable", "Resource cache generation is outside this read-only launch policy")
     read_paths = set()
@@ -76,6 +91,8 @@ def execution_prefix(adapter):
             if image != str(instance_data / name):
                 raise MError("unsafe_instance_storage", "Instance storage images must remain in this session")
         writable.append(instance_data)
+    if sys.platform.startswith("linux"):
+        return bwrap_prefix(adapter, run, writable, python_library.parent, project_root, read_paths)
     # Exact content files are pinned above. Directory listing/metadata does not
     # grant file contents; all writes remain in this instance's private run.
     reads = " ".join("(literal " + quote(path) + ")" for path in sorted(read_paths))
@@ -104,3 +121,32 @@ def execution_prefix(adapter):
     return (sys.executable, "-I", "-S", str(Path(__file__).with_name("minative_launch.py")),
             str(adapter.seconds + 15 if adapter.seconds else 0), str(adapter.runner_metadata), str(os.getpid()),
             "/usr/bin/sandbox-exec", "-f", str(policy))
+
+
+def bwrap_prefix(adapter, run, writable, python_home, project_root, read_paths):
+    """Bubblewrap translation of the least-write plan (see module docstring).
+
+    The argv below is the policy the trampoline actually execs; the JSON copy is
+    written next to it only so a failed launch leaves an auditable record (the
+    Darwin branch's file is different: sandbox-exec reads it with -f). A missing
+    or failed bwrap spawn is a hard launch error with no unsandboxed fallback."""
+    bases = [python_home, project_root, Path("/usr")]
+    args = list(BWRAP_PREAMBLE)
+    for directory in (python_home, project_root):
+        args += ["--ro-bind", str(directory), str(directory)]
+    for path in sorted(read_paths):
+        candidate = Path(path)
+        if not any(candidate == base or candidate.is_relative_to(base) for base in bases):
+            args += ["--ro-bind", path, path]
+    bootstrap = adapter.plan.get("spec", {}).get("bootstrap")
+    if bootstrap:
+        args += ["--ro-bind", str(bootstrap), str(bootstrap)]
+    for path in writable:
+        args += ["--bind", str(path), str(path)]
+    policy = adapter.root / ("policy-" + run.name + ".bwrap.json")
+    descriptor = os.open(policy, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w") as stream:
+        json.dump(args, stream)
+    return (sys.executable, "-I", "-S", str(Path(__file__).with_name("minative_launch.py")),
+            str(adapter.seconds + 15 if adapter.seconds else 0), str(adapter.runner_metadata), str(os.getpid()),
+            *args, "--")

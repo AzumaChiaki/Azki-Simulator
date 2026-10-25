@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import threading
 import uuid
 
@@ -50,7 +51,9 @@ _OWNED = {}
 
 
 def _registry_path():
-    return Path("/private/tmp") / ("azki-simulator-" + str(os.getuid()))
+    # Session roots live in the platform temp directory (Darwin exposes /tmp as
+    # a link to /private/tmp; Linux uses /tmp directly).
+    return Path("/private/tmp" if sys.platform == "darwin" else "/tmp") / ("azki-simulator-" + str(os.getuid()))
 
 
 def _path(value):

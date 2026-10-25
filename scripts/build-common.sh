@@ -1,5 +1,13 @@
 #!/bin/bash
 # Shared policy: only final artifacts in dist; all work is disposable and external.
+# Work roots must live outside the repository so a failure never touches dist.
+azki_work_template() {
+  case "$(uname -s)" in
+    Darwin) echo /private/tmp/azki-build ;;
+    *) echo "${TMPDIR:-/tmp}/azki-build" ;;
+  esac
+}
+
 azki_dist_output() {
   python3 -B - "$root" "${1:-$root/dist}" <<'PY'
 import pathlib, sys
@@ -18,7 +26,7 @@ azki_temporary_work() {
     echo 'AZKI_BUILD_DIR/AZKI_WORK_DIR are no longer supported; build work is temporary and cleaned automatically.' >&2
     return 2
   fi
-  azki_work="$(mktemp -d /private/tmp/azki-build.XXXXXXXX)"
+  azki_work="$(mktemp -d "$(azki_work_template).XXXXXXXX")"
   trap azki_cleanup_work EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
@@ -27,6 +35,6 @@ azki_temporary_work() {
 
 azki_cleanup_work() {
   case "${azki_work:-}" in
-    /private/tmp/azki-build.*) rm -rf -- "$azki_work" ;;
+    /private/tmp/azki-build.*|/tmp/azki-build.*|"${TMPDIR%/}"/azki-build.*) rm -rf -- "$azki_work" ;;
   esac
 }

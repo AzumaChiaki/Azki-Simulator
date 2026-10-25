@@ -61,8 +61,10 @@ def main():
         if action in ("instance-identity", "instance-delete", "instance-reset"):
             library.add_argument("--instance-id", required=True)
         if action == "sessions-cleanup":
-            # Tests point this at a scratch folder; the app always uses /private/tmp.
-            library.add_argument("--tmp-root", type=Path, default=Path("/private/tmp"), help=argparse.SUPPRESS)
+            # Tests point this at a scratch folder; the app always uses the platform temp root.
+            library.add_argument("--tmp-root", type=Path,
+                                 default=Path("/private/tmp" if sys.platform == "darwin" else "/tmp"),
+                                 help=argparse.SUPPRESS)
         if action == "instance-settings":
             library.add_argument("--instance-id", required=True)
             library.add_argument("--set", help="Replace the instance settings with this JSON document")

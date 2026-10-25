@@ -1,0 +1,90 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:AzkiSimulator.Linux.ViewModels"
+        xmlns:ui="using:FluentAvalonia.UI.Controls"
+        x:Class="AzkiSimulator.Linux.Views.DeviceWindow"
+        x:DataType="vm:DeviceViewModel"
+        Title="{Binding Record.Name}"
+        Width="1000" Height="760"
+        WindowStartupLocation="CenterOwner">
+  <Grid RowDefinitions="Auto,*,Auto">
+    <StackPanel Grid.Row="0" Margin="24,20,24,12" Spacing="2">
+      <TextBlock Classes="pageHeader" Text="{Binding Record.Name}" />
+      <TextBlock Classes="captionSecondary" Text="{Binding Record.Model}" />
+    </StackPanel>
+
+    <Grid Grid.Row="1" ColumnDefinitions="*,16,380" Margin="24,0,24,16">
+      <Border Grid.Column="0" Classes="card" Padding="12">
+        <DockPanel>
+          <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="8" Margin="0,0,0,12">
+            <Button Content="启动" Command="{Binding StartCommand}" Classes="accent" />
+            <Button Content="停止" Command="{Binding StopCommand}" />
+            <Button Content="冷重启" Command="{Binding RestartCommand}" />
+            <Button Content="截图" Command="{Binding ScreenshotCommand}" />
+            <Button Content="表冠单击" Command="{Binding CrownClickCommand}" IsVisible="{Binding SupportsButtons}" />
+            <Button Content="下键单击" Command="{Binding LowerClickCommand}" IsVisible="{Binding SupportsButtons}" />
+            <Button Content="下键双击" Command="{Binding LowerDoubleClickCommand}" IsVisible="{Binding SupportsButtons}" />
+          </StackPanel>
+          <Border Background="Black" CornerRadius="8" ClipToBounds="True">
+            <Image x:Name="Canvas" Stretch="Uniform" Source="{Binding Frame}" />
+          </Border>
+        </DockPanel>
+      </Border>
+
+      <Border Grid.Column="2" Classes="card" Padding="12,4,12,12">
+        <TabControl>
+          <TabItem Header="日志">
+            <ListBox x:Name="LogList" ItemsSource="{Binding LogLines}"
+                     FontFamily="Consolas,monospace" FontSize="12" />
+          </TabItem>
+          <TabItem Header="PMU ADC">
+            <ScrollViewer>
+              <StackPanel Margin="4,12" Spacing="8">
+                <TextBlock Classes="captionSecondary" Text="PMU ADC 原始输入（0…65535，未标定为物理量）"
+                           TextWrapping="Wrap" />
+                <ItemsControl ItemsSource="{Binding AdcChannels}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="vm:PmuAdcChannelViewModel">
+                      <Border Classes="card" Padding="12,8" Margin="0,2">
+                        <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto">
+                          <StackPanel Grid.Row="0" Grid.Column="0" Spacing="1">
+                            <TextBlock Text="{Binding Title}" FontWeight="SemiBold" FontSize="12" />
+                            <TextBlock Classes="captionSecondary" Text="{Binding Purpose}" TextWrapping="Wrap" />
+                          </StackPanel>
+                          <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding Text}" Width="90"
+                                   VerticalAlignment="Center" Watermark="raw" />
+                          <StackPanel Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Spacing="1" Margin="0,6,0,0">
+                            <TextBlock Classes="captionSecondary" Text="{Binding StatusText}" TextWrapping="Wrap" />
+                            <TextBlock Classes="captionSecondary" Text="{Binding CountText}" />
+                          </StackPanel>
+                        </Grid>
+                      </Border>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                  <Button Content="刷新" Command="{Binding RefreshAdcCommand}" />
+                  <Button Content="应用" Command="{Binding ApplyAdcCommand}" Classes="accent" />
+                </StackPanel>
+              </StackPanel>
+            </ScrollViewer>
+          </TabItem>
+          <TabItem Header="固件">
+            <StackPanel Margin="4,12" Spacing="8">
+              <TextBlock Classes="sectionHeader" Text="Guest 安装包" />
+              <TextBlock Classes="captionSecondary" Text="向设备 guest 安装快应用或表盘包" TextWrapping="Wrap" />
+              <Button Content="安装包…" Click="Install_Click" Classes="accent" HorizontalAlignment="Left" />
+              <Border Classes="card" Padding="12">
+                <TextBlock Classes="captionSecondary"
+                           Text="真实手机蓝牙射频配对在 Linux 尚未实现。" TextWrapping="Wrap" />
+              </Border>
+            </StackPanel>
+          </TabItem>
+        </TabControl>
+      </Border>
+    </Grid>
+
+    <ui:InfoBar Grid.Row="2" Margin="24,0,24,20" IsOpen="True" IsClosable="False"
+                Severity="Informational" Message="{Binding StatusText}" />
+  </Grid>
+</Window>

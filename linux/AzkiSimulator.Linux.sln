@@ -1,0 +1,24 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AzkiSimulator.Linux", "src\AzkiSimulator.Linux\AzkiSimulator.Linux.csproj", "{5F4A9E30-0D2B-4C6E-9F2D-7A9D2E6F1B3C}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AzkiSimulator.Linux.Tests", "tests\AzkiSimulator.Linux.Tests\AzkiSimulator.Linux.Tests.csproj", "{9C2E1B7F-4A83-4D1F-8E6C-3B5D0F7A2E91}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{5F4A9E30-0D2B-4C6E-9F2D-7A9D2E6F1B3C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5F4A9E30-0D2B-4C6E-9F2D-7A9D2E6F1B3C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5F4A9E30-0D2B-4C6E-9F2D-7A9D2E6F1B3C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5F4A9E30-0D2B-4C6E-9F2D-7A9D2E6F1B3C}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9C2E1B7F-4A83-4D1F-8E6C-3B5D0F7A2E91}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9C2E1B7F-4A83-4D1F-8E6C-3B5D0F7A2E91}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9C2E1B7F-4A83-4D1F-8E6C-3B5D0F7A2E91}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9C2E1B7F-4A83-4D1F-8E6C-3B5D0F7A2E91}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

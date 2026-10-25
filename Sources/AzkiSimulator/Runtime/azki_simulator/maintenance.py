@@ -24,7 +24,7 @@ import time
 
 from .minative import _decode, _path
 
-TMP_ROOT = Path("/private/tmp")
+TMP_ROOT = Path("/private/tmp" if sys.platform == "darwin" else "/tmp")
 SESSION_PREFIXES = ("azki-b-", "azki-sim-", "azki-cmd-")
 # A root with no process/socket evidence is treated as live while this young:
 # it may be a session being prepared right now.
@@ -104,8 +104,33 @@ class _BSDInfo(ctypes.Structure):
                 ("start_usec", ctypes.c_uint64)]
 
 
+_boot_time_seconds = None
+
+
+def _boot_time():
+    # /proc/stat's btime is fixed for the running kernel, so a cleanup pass that
+    # asks about many pids reads it once instead of rescanning the file per pid.
+    global _boot_time_seconds
+    if _boot_time_seconds is None:
+        with open("/proc/stat", "rb") as stream:
+            _boot_time_seconds = next(int(line.split()[1]) for line in stream
+                                      if line.startswith(b"btime "))
+    return _boot_time_seconds
+
+
 def _process_started(pid):
     """(uid, start seconds) of a live process, None if gone, ... if unknown."""
+    if sys.platform.startswith("linux"):
+        try:
+            owner = os.stat("/proc/" + str(pid)).st_uid
+            with open("/proc/" + str(pid) + "/stat", "rb") as stream:
+                fields = stream.read().split(b")", 1)[1].split()
+            start_ticks = int(fields[19])
+            return owner, _boot_time() + start_ticks // os.sysconf("SC_CLK_TCK")
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, IndexError, StopIteration):
+            return ...
     if sys.platform != "darwin":
         return ...
     try:

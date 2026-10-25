@@ -1,4 +1,4 @@
-"""Fixed macOS runner supervisor, invoked only by the local adapter launcher.
+"""Fixed runner supervisor, invoked only by the local adapter launcher.
 
 The sandbox encloses the supplied runner and its QEMU child. This process owns
 one process group, monitors its parent, and never leaves a surviving descendant
@@ -27,6 +27,9 @@ CPU_FACTOR = 8
 # Independent of session duration. Normal stop must collect bounded health
 # evidence, reap QEMU and publish the storage receipt before forced cleanup.
 STOP_GRACE_SECONDS = 8
+# The sandboxed payload starts with exactly one supported launcher per host.
+EXPECTED_LAUNCHER = "/usr/bin/sandbox-exec" if sys.platform == "darwin" else "/usr/bin/bwrap"
+SUPPORTED_HOSTS = ("darwin", "linux")
 
 
 def publish_metadata(path, child_pid):
@@ -45,6 +48,23 @@ def publish_metadata(path, child_pid):
 
 
 def group_members():
+    if sys.platform.startswith("linux"):
+        # /proc scan for this owned process group; the sandbox never asks for
+        # --unshare-pid (bwrap has no --share-pid), so pgid membership stays
+        # meaningful to the host supervisor.
+        group = os.getpgid(0)
+        members = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit() or int(entry) == os.getpid():
+                continue
+            try:
+                with open("/proc/" + entry + "/stat", "rb") as stream:
+                    fields = stream.read().split(b")", 1)[1].split()
+                if int(fields[2]) == group:
+                    members.append(int(entry))
+            except (OSError, ValueError, IndexError):
+                continue
+        return members
     library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
     function = library.proc_listpids
     function.argtypes = (ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int)
@@ -189,7 +209,7 @@ def main():
     native = len(sys.argv) > 1 and sys.argv[1] == "--native"
     if native:
         duration, metadata, parent, command = native_invocation(sys.argv[1:])
-        if sys.platform != "darwin" or os.getppid() != parent:
+        if sys.platform not in SUPPORTED_HOSTS or os.getppid() != parent:
             raise SystemExit("Invalid native parent")
         if os.getpgrp() != os.getpid():
             os.setsid()
@@ -197,9 +217,9 @@ def main():
             raise SystemExit("Native guest failed to establish its owned process group")
     else:
         duration, metadata, parent = int(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
-        if (sys.platform != "darwin" or not 0 <= duration <= MAX_RUN_SECONDS + 15 or
+        if (sys.platform not in SUPPORTED_HOSTS or not 0 <= duration <= MAX_RUN_SECONDS + 15 or
                 os.getppid() != parent or os.getpgrp() != os.getpid() or
-                sys.argv[4] != "/usr/bin/sandbox-exec" or metadata.name != "runner-process.json"):
+                sys.argv[4] != EXPECTED_LAUNCHER or metadata.name != "runner-process.json"):
             raise SystemExit("Invalid isolated runner invocation")
         command = sys.argv[4:]
     # The helper rejects any run output readable by others; the runner and QEMU

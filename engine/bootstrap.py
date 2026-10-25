@@ -20,7 +20,7 @@ if script.resolve() != script or not script.is_file():
 stdlib = engine / "python/lib/python3.12"
 sys.path[:] = [str(stdlib), str(stdlib / "lib-dynload"), str(stdlib / "site-packages"), str(project), str(project / "backend")]
 for key in list(os.environ):
-    if key.startswith(("PYTHON", "DYLD_")):
+    if key.startswith(("PYTHON", "DYLD_", "LD_")):
         del os.environ[key]
 os.environ["PYTHONNOUSERSITE"] = "1"
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"

@@ -1,6 +1,6 @@
 # Azki Simulator
 
-[English](README.en.md) · [构建说明](docs/BUILDING.md) · [GPL-2.0](LICENSE)
+[English](README.en.md) · [构建说明](docs/BUILDING.md) · [Linux 构建](docs/BUILDING-LINUX.md) · [GPL-2.0](LICENSE)
 
 面向 Apple Silicon Mac 的独立手环模拟器。原生 SwiftUI/AppKit 界面通过独立 QEMU 进程运行设备固件，不嵌入 Azki Studio。
 
@@ -27,6 +27,8 @@
 开源仓库和自动构建产物**不包含厂商固件、真实设备身份、测试实例或个人日志**。固件由用户本地导入，不会提交回仓库。请保留实例数据；应用在版本切换时保留上一份存储快照。
 
 安装包没有 Developer ID 签名，也不提交 Apple 公证；Apple Silicon 可执行文件仅使用运行所需的 ad-hoc 签名。macOS 可能提示无法验证开发者。不要关闭系统安全机制；仅在确认来源后使用系统提供的单个应用打开方式。
+
+Linux（x86_64 / aarch64）目前为**开发/CI 级**支持：引擎与桌面应用可从源码构建并以本地控制面板运行，不提供正式安装包，与真实手机的蓝牙配对（BlueZ）尚未实现。依赖、构建与差异见 [Linux 构建说明](docs/BUILDING-LINUX.md)。
 
 ## 构建
 

@@ -6,21 +6,21 @@ Unsupported methods fail. No key or raw SMP payload is emitted into evidence.
 """
 import hmac
 import secrets
-from .crypto import CommonCryptoAES
+from .crypto import aes_provider
 from .auth_crypto import AESModes, xor
 
 
 def c1(key,random,request,response,initiator,responder,iat=0,rat=0):
     if tuple(map(len,(key,random,request,response,initiator,responder)))!=(16,16,7,7,6,6):
         raise ValueError('SMP c1 lengths')
-    aes=CommonCryptoAES()
+    aes=aes_provider()
     if iat not in (0,1) or rat not in (0,1):raise ValueError('SMP address type')
     p1=bytes((iat,rat))+request+response
     return aes.le_encrypt(key,xor(aes.le_encrypt(key,xor(random,p1)),responder+initiator+bytes(4)))
 
 
 def s1(key,responder_random,initiator_random):
-    return CommonCryptoAES().le_encrypt(key,initiator_random[:8]+responder_random[:8])
+    return aes_provider().le_encrypt(key,initiator_random[:8]+responder_random[:8])
 
 
 class VirtualAir:
@@ -32,7 +32,7 @@ class VirtualAir:
     """
     def __init__(self,peer_ltk,guest_ltk):
         if len(peer_ltk)!=16 or len(guest_ltk)!=16:raise ValueError('Virtual link key size')
-        skd=secrets.token_bytes(16);aes=CommonCryptoAES()
+        skd=secrets.token_bytes(16);aes=aes_provider()
         self.peer_key=aes.le_encrypt(peer_ltk,skd)[::-1]
         self.guest_key=aes.le_encrypt(guest_ltk,skd)[::-1]
         self.iv=secrets.token_bytes(8);self.count=[0,0];self.aes=AESModes();self.records=[]

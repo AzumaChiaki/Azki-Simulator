@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build the macOS arm64 engine from source, without firmware or Developer ID.
+"""Build the simulator engine from source, without firmware or Developer ID.
 
-Requires Xcode command line tools and Homebrew build dependencies documented in
-README. Final outputs live in dist; temporary work is cleaned. No guest is executed.
+Hosts: macOS arm64 (Xcode + Homebrew) and Linux (gcc + pkg-config system libs).
+Final outputs live in dist; temporary work is cleaned. No guest is executed.
 """
 from __future__ import annotations
 
@@ -30,6 +30,13 @@ QEMU_VERSION = '10.1.0'
 PYTHON_VERSION = '3.12.12'
 PACKAGES = {'pillow': '12.3.0', 'littlefs-python': '0.19.0'}
 MAGIC = {bytes.fromhex(v) for v in ('feedface','cefaedfe','feedfacf','cffaedfe','cafebabe','bebafeca','cafebabf','bfbafeca')}
+ELF_MAGIC = bytes.fromhex('7f454c46')
+HOST_OS = platform.system()
+HOST_ARCH = platform.machine()
+# Libraries that a Linux engine build is allowed to resolve outside the tree.
+# Everything else must be vendored or the build fails; glibc-family loader
+# pseudo-entries (vdso, ld.so) are skipped by name prefix in linux_verify().
+LINUX_SYSTEM_LIB_ROOTS = ('/usr/lib/', '/lib/')
 
 
 def run(args, **kwargs):
@@ -178,6 +185,7 @@ def _download_one(url, target, *, allow_ranges=None):
             for attempt in range(1, 6):
                 result=subprocess.run(['curl','--fail','--location','--silent','--show-error',
                                        '--connect-timeout','15','--max-time','1800',
+                                       '--speed-limit','20480','--speed-time','60',
                                        '--dump-header',str(temporary)+'.headers',
                                        '--output',temporary,url],capture_output=True,text=True)
                 status,metadata=response_headers(Path(str(temporary)+'.headers').read_text()
@@ -199,7 +207,29 @@ def _download_one(url, target, *, allow_ranges=None):
         temporary.unlink(missing_ok=True)
 
 
-def download(url, target, alternates=()):
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+# PyPI replicates its artifact tree byte for byte, and the download is checked
+# against the digest from the canonical metadata, so a throttled or unreachable
+# files.pythonhosted.org does not stall the build.
+PYPI_ARTIFACT_HOSTS = ('https://files.pythonhosted.org', 'https://mirrors.cloud.tencent.com/pypi',
+                       'https://mirrors.aliyun.com/pypi', 'https://mirror.nju.edu.cn/pypi/web')
+
+
+def pypi_artifact_urls(url):
+    if not url.startswith(PYPI_ARTIFACT_HOSTS[0] + '/'):
+        return [url]
+    path = url[len(PYPI_ARTIFACT_HOSTS[0]):]
+    return [host + path for host in PYPI_ARTIFACT_HOSTS]
+
+
+def download(url, target, alternates=(), sha256=None):
     """Download from URL candidates, preserving the first working artifact."""
     urls = [url] if isinstance(url, str) else list(url)
     urls += list(alternates)
@@ -210,7 +240,11 @@ def download(url, target, alternates=()):
             continue
         seen.add(candidate)
         try:
-            return _download_one(candidate, target)
+            downloaded = _download_one(candidate, target)
+            if sha256 and _sha256_file(downloaded) != sha256:
+                downloaded.unlink()
+                raise RuntimeError(f'Source digest mismatch from {candidate}')
+            return downloaded
         except Exception as error:
             last_error = error
             print(f'Download failed from {candidate}: {error}; trying next mirror', flush=True)
@@ -245,6 +279,87 @@ def macho(path):
         return False
     with path.open('rb') as f:
         return f.read(4) in MAGIC
+
+
+def elf(path):
+    """True for a loadable ELF. Relocatable objects (CPython's config-3.12/python.o)
+    share the magic but have no dependency closure, and ldd refuses them."""
+    if not path.is_file():
+        return False
+    with path.open('rb') as f:
+        header = f.read(18)
+    return header[:4] == ELF_MAGIC and int.from_bytes(header[16:18], 'little') in {2, 3}
+
+
+def ldd_entries(path):
+    """Parse `ldd` output into (soname, resolved path) pairs, failing on gaps."""
+    result=subprocess.run(['ldd',str(path)],capture_output=True,text=True)
+    if result.returncode and 'not a dynamic executable' in result.stdout+result.stderr:
+        return []
+    if result.returncode:
+        raise RuntimeError(f'ldd failed for {path}: {(result.stdout+result.stderr).strip()}')
+    entries = []
+    for line in result.stdout.splitlines():
+        words = line.split()
+        if not words:
+            continue
+        if 'not found' in line:
+            raise RuntimeError(f'Unresolved dynamic dependency in {path}: {line.strip()}')
+        if len(words) >= 3 and words[1] == '=>' and words[2].startswith('/'):
+            entries.append((words[0], words[2]))
+        elif len(words) >= 2 and words[0].startswith('/'):
+            # Loader pseudo-entry: /lib64/ld-linux-x86-64.so.2 (0x7f...).
+            entries.append((Path(words[0]).name, words[0]))
+        # Remaining forms are kernel-provided pseudo-libraries (linux-vdso and
+        # friends) and carry no filesystem path to check.
+    return entries
+
+
+def dynamic_strings(path):
+    text = output(['readelf', '-dW', path])
+    values = []
+    for line in text.splitlines():
+        match = re.search(r'\((RUNPATH|RPATH)\)\s+Library (?:rpath|runpath):', line)
+        if match:
+            quoted = re.search(r"\[(.*)\]", line)
+            if quoted:
+                values.append(quoted.group(1))
+    return values
+
+
+def linux_verify(engine):
+    """Fail closed unless every ELF dependency resolves to the engine tree or
+    the host's system library roots, and no ELF carries a build-time rpath.
+
+    Linux engines deliberately link against the host glibc/OpenSSL/etc. instead
+    of vendoring a closure: the build host is the run host (Arch target), and
+    packaging would duplicate what pkg-config already resolves. The returned
+    SONAME table documents the runtime ABI floor."""
+    system, seen = set(), set()
+    for path in engine.rglob('*'):
+        if not elf(path):
+            continue
+        for value in dynamic_strings(path):
+            for entry in value.split(':'):
+                if not entry:
+                    continue
+                resolved = str((path.parent / entry).resolve()) if entry.startswith('$ORIGIN') else str(Path(entry).resolve())
+                if not (Path(resolved).is_relative_to(engine) or any(resolved.startswith(r) for r in LINUX_SYSTEM_LIB_ROOTS)):
+                    raise RuntimeError(f'Build-time dynamic path in {path}: {entry}')
+        for soname, resolved in ldd_entries(path):
+            # ldd reports the loader itself with an absolute first column, and some
+            # distributions resolve system libraries through a /usr/lib64 symlink.
+            if Path(soname).name.startswith(('linux-vdso', 'linux-gate', 'ld-linux')):
+                continue
+            location = Path(resolved).resolve()
+            if location.is_relative_to(engine):
+                continue
+            if not any(str(location).startswith(root) for root in LINUX_SYSTEM_LIB_ROOTS):
+                raise RuntimeError(f'External dependency outside system roots: {soname} -> {resolved} in {path}')
+            seen.add((str(location.parent), soname))
+            system.add(soname)
+    return sorted(system), sorted(({'soname': s, 'directory': d} for d, s in seen),
+                                  key=lambda entry:(entry['directory'], entry['soname']))
 
 
 def load_commands(path):
@@ -350,7 +465,9 @@ def main():
     parser.add_argument('--build-python',type=Path,help='Existing CPython 3.12 with pip; default: Homebrew python@3.12')
     parser.add_argument('--tools-dir',type=Path,help='Optional existing directory containing ninja/pkg-config')
     args=parser.parse_args()
-    if platform.system()!='Darwin' or platform.machine()!='arm64': parser.error('macOS arm64 build host required')
+    if HOST_OS not in ('Darwin','Linux') or (HOST_OS=='Darwin' and HOST_ARCH!='arm64') \
+            or (HOST_OS=='Linux' and HOST_ARCH not in ('x86_64','aarch64')):
+        parser.error('build host must be macOS arm64 or Linux x86_64/aarch64')
     dist=ROOT/'dist'
     engine=args.output.resolve(); source_output=args.source_output.resolve()
     if dist.is_symlink() or engine.parent != dist or source_output.parent != dist:
@@ -364,7 +481,8 @@ def main():
     try:
         for signum in (signal.SIGTERM,signal.SIGHUP):
             previous_handlers[signum]=signal.signal(signum,terminate)
-        with tempfile.TemporaryDirectory(prefix='azki-engine-',dir='/private/tmp') as temporary:
+        with tempfile.TemporaryDirectory(prefix='azki-engine-',
+                                        dir='/private/tmp' if HOST_OS=='Darwin' else None) as temporary:
             work=Path(temporary)
             build_engine(work,work/'Engine',work/'Engine-sources.tar.gz',args.jobs,args.build_python,args.tools_dir)
             (work/'Engine').rename(engine)
@@ -376,8 +494,9 @@ def main():
 
 def build_engine(work, engine, source_output, jobs=None, build_python=None, tools_dir=None):
     """Internal staging API; callers own and clean the temporary work tree."""
-    if platform.system()!='Darwin' or platform.machine()!='arm64':
-        raise RuntimeError('macOS arm64 build host required')
+    if HOST_OS not in ('Darwin','Linux') or (HOST_OS=='Darwin' and HOST_ARCH!='arm64') \
+            or (HOST_OS=='Linux' and HOST_ARCH not in ('x86_64','aarch64')):
+        raise RuntimeError('build host must be macOS arm64 or Linux x86_64/aarch64')
     args=argparse.Namespace(jobs=jobs or min(os.cpu_count() or 2,8),build_python=build_python,tools_dir=tools_dir)
     # Persistent dependency cache under the repository build/ directory so that
     # downloaded tarballs, extracted upstream sources, configured build trees and
@@ -389,28 +508,58 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
                  'python-install', 'wheels', 'python-packages',
                  'corresponding-source', 'pip-cache', 'tmp'):
         (cache / name).mkdir(parents=True, exist_ok=True)
-    brew=shutil.which('brew')
-    if not brew: raise RuntimeError('Homebrew build dependencies are required; see README')
-    builder=args.build_python or Path(output([brew,'--prefix','python@3.12']))/'bin/python3.12'
-    if not builder.is_file(): raise RuntimeError('Install python@3.12 for building wheels')
-    env=os.environ.copy(); env['MACOSX_DEPLOYMENT_TARGET']='15.0'
+    brew=shutil.which('brew') if HOST_OS=='Darwin' else None
+    if HOST_OS=='Darwin':
+        if not brew: raise RuntimeError('Homebrew build dependencies are required; see README')
+        builder=args.build_python or Path(output([brew,'--prefix','python@3.12']))/'bin/python3.12'
+        if not builder.is_file(): raise RuntimeError('Install python@3.12 for building wheels')
+        env=os.environ.copy(); env['MACOSX_DEPLOYMENT_TARGET']='15.0'
+    else:
+        builder=args.build_python or Path(shutil.which('python3') or '')
+        if not builder.is_file(): raise RuntimeError('A python3 build host with ensurepip is required; see docs/BUILDING-LINUX.md')
+        env=os.environ.copy()
     temporary=cache/'tmp'
     env['TMPDIR']=str(temporary);env['PIP_CACHE_DIR']=str(cache/'pip-cache')
-    # Some portable builder Pythons record their original, now absent compiler
-    # paths in sysconfig. Use the selected Xcode tools for native extensions.
-    for key,tool in (('CC','clang'),('CXX','clang++'),('AR','ar'),('RANLIB','ranlib')):
-        env[key]=output(['xcrun','--find',tool])
-    sdk=output(['xcrun','--show-sdk-path']);env['SDKROOT']=sdk
-    for key in ('CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS'):
-        env[key]=env.get(key,'')+' -isysroot '+sdk+' -mmacosx-version-min=15.0'
+    # A host's global pip.conf can name an index that refuses this build, where a 403
+    # surfaces as "from versions: none". PEP 517 build backends install their own
+    # dependencies from that index, so the index is pinned rather than inherited.
+    env['PIP_INDEX_URL']=os.environ.get('AZKI_PIP_INDEX_URL','https://pypi.org/simple')
+    env['PIP_EXTRA_INDEX_URL']=''
+    # Build backends fetch Cython/meson-python over the same throttled link, where a
+    # single incomplete read aborts the whole wheel build.
+    env.setdefault('PIP_RETRIES','10')
+    if HOST_OS=='Darwin':
+        # Some portable builder Pythons record their original, now absent compiler
+        # paths in sysconfig. Use the selected Xcode tools for native extensions.
+        for key,tool in (('CC','clang'),('CXX','clang++'),('AR','ar'),('RANLIB','ranlib')):
+            env[key]=output(['xcrun','--find',tool])
+        sdk=output(['xcrun','--show-sdk-path']);env['SDKROOT']=sdk
+        for key in ('CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS'):
+            env[key]=env.get(key,'')+' -isysroot '+sdk+' -mmacosx-version-min=15.0'
     env['PATH']=str(builder.parent)+os.pathsep+env['PATH']
     if args.tools_dir:env['PATH']=str(args.tools_dir)+os.pathsep+env['PATH']
-    prefix=Path(output([brew,'--prefix']))
-    env['PKG_CONFIG_PATH']=os.pathsep.join(str(prefix/'opt'/f/'lib/pkgconfig') for f in ('glib','libffi','pcre2','zstd','dtc'))
-    env['PKG_CONFIG_PATH']+=os.pathsep+sdk+'/usr/lib/pkgconfig'
-    env['CPATH']=str(prefix/'include'); env['LIBRARY_PATH']=str(prefix/'lib')
+    if HOST_OS=='Darwin':
+        prefix=Path(output([brew,'--prefix']))
+        env['PKG_CONFIG_PATH']=os.pathsep.join(str(prefix/'opt'/f/'lib/pkgconfig') for f in ('glib','libffi','pcre2','zstd','dtc'))
+        env['PKG_CONFIG_PATH']+=os.pathsep+sdk+'/usr/lib/pkgconfig'
+        env['CPATH']=str(prefix/'include'); env['LIBRARY_PATH']=str(prefix/'lib')
     downloads=cache/'downloads'; sources=cache/'source'; sources.mkdir(exist_ok=True)
     delivery=cache/'corresponding-source';delivery.mkdir(exist_ok=True)
+    if HOST_OS=='Linux':
+        # QEMU's configure imports PyYAML. Keep it out of the host interpreter by
+        # building a throwaway venv; wheel bootstrapping uses the engine python.
+        try:
+            run([builder,'-c','import yaml'],stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            qemu_venv=cache/'qemu-venv'
+            if not (qemu_venv/'bin/python').exists():
+                run([builder,'-m','venv',str(qemu_venv)])
+                run([qemu_venv/'bin/python','-m','pip','install','--quiet','PyYAML'],env=env)
+            builder_py=qemu_venv/'bin/python'
+        else:
+            builder_py=builder
+    else:
+        builder_py=builder
     q_archive=download(f'https://download.qemu.org/qemu-{QEMU_VERSION}.tar.xz',downloads/f'qemu-{QEMU_VERSION}.tar.xz')
     p_archive=download(f'https://www.python.org/ftp/python/{PYTHON_VERSION}/Python-{PYTHON_VERSION}.tar.xz',downloads/f'Python-{PYTHON_VERSION}.tar.xz')
     qsource=sources/f'qemu-{QEMU_VERSION}'; psource=sources/f'Python-{PYTHON_VERSION}'
@@ -424,19 +573,28 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
         run([qsource/'configure','--target-list=arm-softmmu','--with-devices-arm=mi-emu','--without-default-devices',
              '--disable-docs','--disable-tools','--disable-guest-agent','--disable-gtk','--disable-sdl','--disable-vnc',
              '--disable-opengl','--disable-werror','--disable-download','--audio-drv-list=','--disable-slirp',
-             '--python='+str(builder)],cwd=qbuild,env=env)
+             '--python='+str(builder_py)],cwd=qbuild,env=env)
     run(['ninja','-C',qbuild,'-j',args.jobs,'qemu-system-arm'],env=env)
     # Build a non-framework Python with its normal prefix-relative layout.
     # No user Python, Homebrew, pip or network is needed on the target Mac.
     pbuild=cache/'python-build';pbuild.mkdir(exist_ok=True)
     pyinstall=cache/'python-install'
-    python_flags=[
-        '--prefix='+str(pyinstall),'--with-ensurepip=no','--disable-test-modules',
-        '--with-openssl='+output([brew,'--prefix','openssl@3']),
-        # SDK unistd.h can advertise pipe2 while libsystem_kernel only
-        # exports pipe; the resulting binary SIGSEGV at the first os.pipe().
-        'ac_cv_func_pipe2=no',
-    ]
+    if HOST_OS=='Darwin':
+        python_flags=[
+            '--prefix='+str(pyinstall),'--with-ensurepip=no','--disable-test-modules',
+            '--with-openssl='+output([brew,'--prefix','openssl@3']),
+            # SDK unistd.h can advertise pipe2 while libsystem_kernel only
+            # exports pipe; the resulting binary SIGSEGV at the first os.pipe().
+            'ac_cv_func_pipe2=no',
+        ]
+    else:
+        # glibc has a real pipe2. ensurepip lets the freshly installed 3.12
+        # build its own wheels (cp312 ABI match); pip is pruned from the
+        # delivered engine copy below.
+        python_flags=[
+            '--prefix='+str(pyinstall),'--with-ensurepip=install','--disable-test-modules',
+            '--with-openssl=/usr',
+        ]
     stamp=pbuild/'.azki-configure'
     needed='\n'.join(python_flags)+'\n'
     if not stamp.exists() or stamp.read_text()!=needed:
@@ -446,6 +604,9 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
     run(['make','install'],cwd=pbuild,env=env)
     wheels=cache/'wheels';wheels.mkdir(exist_ok=True)
     package_sources=delivery/'python-packages';package_sources.mkdir(exist_ok=True)
+    # On Linux wheels must be compiled by the same 3.12 that ships in the
+    # engine, not by the (possibly newer) host python3 used to bootstrap.
+    wheel_builder=pyinstall/'bin/python3.12' if HOST_OS=='Linux' else builder
     for package,version in PACKAGES.items():
         # Reuse a previously built wheel for this exact package/version so the
         # PyPI metadata fetch, sdist download and native build are all skipped.
@@ -458,8 +619,9 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
         # is not a substitute for its corresponding source distribution.
         metadata=json.loads(urllib.request.urlopen(f'https://pypi.org/pypi/{package}/{version}/json').read())
         item=next(x for x in metadata['urls'] if x['packagetype']=='sdist')
-        source=download(item['url'],package_sources/item['filename'])
-        command=[builder,'-m','pip','wheel','--no-deps','--wheel-dir',wheels,source]
+        source=download(pypi_artifact_urls(item['url']),package_sources/item['filename'],
+                        sha256=(item.get('digests') or {}).get('sha256'))
+        command=[wheel_builder,'-m','pip','wheel','--no-deps','--wheel-dir',wheels,source]
         if package=='pillow':
             for feature in ('jpeg','tiff','freetype','lcms','webp','jpeg2000','raqm','imagequant','xcb','avif'):
                 command+=['--config-settings',feature+'=disable']
@@ -469,6 +631,11 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
     copytree(pyinstall/'lib/python3.12',engine/'python/lib/python3.12')
     (engine/'python/bin').mkdir(parents=True)
     shutil.copy2(pyinstall/'bin/python3.12',engine/'python/bin/python3.12')
+    if HOST_OS=='Linux':
+        # ensurepip was enabled only so this interpreter could build its own
+        # wheels; the delivered engine must not contain pip tooling.
+        doomed=[p for p in (engine/'python').rglob('*') if p.name in ('pip','setuptools','wheel') and p.is_dir()]
+        for p in doomed: shutil.rmtree(p, ignore_errors=True)
     site=engine/'python/lib/python3.12/site-packages';site.mkdir(exist_ok=True)
     # Wheels were compiled for CPython 3.12 arm64 above; expand their runtime
     # files, excluding installation scripts and packaging tools.
@@ -487,12 +654,20 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
     shutil.copy2(qbuild/'qemu-system-arm',build/'qemu-system-arm')
     y=INPUT/'third-party/yaffs2';u=INPUT/'third-party/unqlite'
     definitions=('CONFIG_YAFFS_DIRECT','CONFIG_YAFFS_YAFFS2','CONFIG_YAFFS_DEFINES_TYPES','CONFIG_YAFFS_PROVIDE_DEFS','CONFIG_YAFFSFS_PROVIDE_VALUES','CONFIG_YAFFS_USE_32_BIT_TIME_T')
-    run(['cc','-O2',*['-D'+x for x in definitions],'-Dloff_t=int64_t','-I'+str(y/'core'),'-I'+str(y/'direct'),
+    if HOST_OS=='Linux':
+        # glibc already typedefs loff_t (64-bit off_t) and time_t is 64-bit;
+        # the Darwin-only overrides would collide or truncate on the timestamp
+        # the guest's boot clock reads from persist.db.
+        definitions=tuple(d for d in definitions if d!='CONFIG_YAFFS_USE_32_BIT_TIME_T')
+        yaffs_extra=()
+    else:
+        yaffs_extra=('-Dloff_t=int64_t',)
+    run(['cc','-O2',*['-D'+x for x in definitions],*yaffs_extra,'-I'+str(y/'core'),'-I'+str(y/'direct'),
          INPUT/'project/backend/src/yaffs_image.c',*sorted((y/'core').glob('*.c')),
          *[y/'direct'/n for n in ('yaffsfs.c','yaffs_attribs.c','yaffs_error.c','yaffs_hweight.c')],'-o',build/'yaffs-image'],env=env)
     run(['cc','-O2','-I'+str(u),INPUT/'project/backend/src/legacy_ui_db.c',u/'unqlite.c','-o',build/'legacy-ui-db'],env=env)
     # Reads/updates persist.db inside an instance YAFFS image (settings and boot clock).
-    run(['cc','-O2',*['-D'+x for x in definitions],'-Dloff_t=int64_t','-I'+str(y/'core'),'-I'+str(y/'direct'),'-I'+str(u),
+    run(['cc','-O2',*['-D'+x for x in definitions],*yaffs_extra,'-I'+str(y/'core'),'-I'+str(y/'direct'),'-I'+str(u),
          INPUT/'project/backend/src/instance_props.c',*sorted((y/'core').glob('*.c')),
          *[y/'direct'/n for n in ('yaffsfs.c','yaffs_attribs.c','yaffs_error.c','yaffs_hweight.c')],u/'unqlite.c',
          '-o',build/'instance-props'],env=env)
@@ -501,7 +676,32 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
     shutil.copy2(INPUT/'THIRD_PARTY.md',engine/'licenses/THIRD_PARTY.md')
     for name,path in [('python',psource/'LICENSE'),('yaffs',y/'LICENSE'),('unqlite',u/'LICENSE')]:
         d=engine/'licenses'/name;d.mkdir(exist_ok=True);shutil.copy2(path,d/'LICENSE')
-    formulas=relocate(engine,brew,delivery)
+    system_libraries=[]
+    if HOST_OS=='Darwin':
+        formulas=relocate(engine,brew,delivery)
+    else:
+        formulas=[]
+        system_libraries,_library_table=linux_verify(engine)
+        # System libraries are host-provided on Linux; record the exact
+        # versions this artifact was linked against for the source offer and
+        # the ABI floor, and keep upstream license text inside Engine/licenses.
+        upstream={'glib':('https://gitlab.gnome.org/GNOME/glib','LGPL-2.1-or-later'),
+                  'pixman':('https://gitlab.freedesktop.org/pixman/pixman','MIT'),
+                  'zlib':('https://zlib.net','Zlib'),
+                  'libffi':('https://github.com/libffi/libffi','MIT'),
+                  'pcre2':('https://github.com/PCRE2Project/pcre2','BSD-3-Clause'),
+                  'zstd':('https://github.com/facebook/zstd','BSD-2-Clause'),
+                  'openssl':('https://www.openssl.org','Apache-2.0'),
+                  'dtc':('https://gitlab.com/libfdt/dtc','GPL-2.0-or-later')}
+        records=[]
+        for name,pc in tuple(upstream.items()):
+            try: version=output(['pkg-config','--modversion',pc])
+            except Exception: version=None
+            records.append({'name':name,'version':version,'upstream':upstream[name][0],'license':upstream[name][1]})
+        (delivery/'DEPENDENCIES.json').write_text(json.dumps(
+            {'host':{'os':'linux','arch':HOST_ARCH},
+             'note':'Dynamic links resolve against the build host system libraries; obtain exact source from the distribution of the build host (dev/CI distribution, not a cross-distro package).',
+             'libraries':records,'runtimeSonames':system_libraries},indent=2)+'\n')
     # Import smoke checks exercise newly built host libraries, never firmware.
     smoke="import sys; from pathlib import Path; assert Path(sys.prefix).resolve()==Path(sys.executable).resolve().parent.parent; sys.path.insert(0,sys.argv[1]); import PIL.Image, littlefs, ctypes, socket, zlib; print('Engine Python imports ready')"
     run([engine/'python/bin/python3.12','-I','-S','-B','-c',smoke,site],env={**env,'PYTHONDONTWRITEBYTECODE':'1'})
@@ -519,9 +719,14 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
       'python':{'version':'3.12','home':'python','stdlib':'python/lib/python3.12','sitePackages':'python/lib/python3.12/site-packages','startupFlags':['-I','-S','-B']},
       'files':files,'payloadSha256':hashlib.sha256(json.dumps(files,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()).hexdigest(),
       'distribution':{'mode':'runtime-only','firmwareIncluded':False,'publicReady':True},
-      'signing':{'developerIDSigned':False,'notarized':False,'adHoc':True},'executionVerified':False,
+      'signing':({'developerIDSigned':False,'notarized':False,'adHoc':True} if HOST_OS=='Darwin'
+                 else {'developerIDSigned':False,'notarized':False,'adHoc':False,'scheme':'manifest-sha256'}),
+      'executionVerified':False,
       'build':{'qemu':QEMU_VERSION,'python':PYTHON_VERSION,'packages':PACKAGES,'nativeLibraries':formulas},
       **capabilities}
+    if HOST_OS=='Linux':
+        manifest['host']={'os':'linux','arch':HOST_ARCH}
+        manifest['distribution']['runtimeLibraries']=system_libraries
     (engine/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
     copytree(INPUT,delivery/'engine')
     (delivery/'scripts').mkdir(exist_ok=True)

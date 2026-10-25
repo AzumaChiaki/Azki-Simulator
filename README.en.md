@@ -1,8 +1,8 @@
 # Azki Simulator
 
-[简体中文](README.md) · [Build instructions](docs/BUILDING.en.md) · [GPL-2.0](LICENSE)
+[简体中文](README.md) · [Build instructions](docs/BUILDING.en.md) · [Linux build](docs/BUILDING-LINUX.en.md) · [GPL-2.0](LICENSE)
 
-A standalone wearable-device simulator for Apple Silicon Macs. Its native SwiftUI/AppKit interface runs device firmware through a separate QEMU process. The emulator is not embedded in Azki Studio.
+A standalone wearable-device simulator for Apple Silicon Macs (with development-grade Linux support). Its native SwiftUI/AppKit interface runs device firmware through a separate QEMU process. The emulator is not embedded in Azki Studio.
 
 ## Features
 
@@ -27,6 +27,8 @@ Requires **Apple Silicon and macOS 15 or later**. The app bundles its interprete
 The repository and automated builds **exclude vendor firmware, real-device identities, test instances and personal logs**. Firmware is imported locally and is not uploaded to this repository. Preserve your instance data; the application retains the previous storage snapshot when switching versions.
 
 Release packages are not Developer ID signed or Apple notarized. Apple Silicon executables use only the ad-hoc signatures required to run. macOS may report an unidentified developer. Do not disable system security; use the system's per-application opening controls only after verifying the source.
+
+Linux (x86_64 / aarch64) support is currently **development/CI grade**: the engine and desktop app build from source and run through the local control surface, without formal packages, and phone-side Bluetooth pairing (BlueZ) is not implemented. See the [Linux build notes](docs/BUILDING-LINUX.en.md) for dependencies, steps and differences.
 
 ## Build
 

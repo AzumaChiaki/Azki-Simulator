@@ -1,0 +1,145 @@
+name: Build and release Linux package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Publishing a Release needs write access to repository contents only.
+permissions:
+  contents: write
+
+# Never cancel a run that may be uploading Release assets; queue instead.
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux/archlinux:latest
+    timeout-minutes: 90
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Initialize mirror and install dependencies
+        run: |
+          echo "Server = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch" > /etc/pacman.d/mirrorlist
+          pacman -Syu --noconfirm --needed base-devel meson ninja pkgconf python git curl bzip2 \
+            glib2 pixman zlib libffi pcre2 zstd dtc libcap openssl bubblewrap dotnet-sdk
+      - name: Assign build number
+        id: number
+        # The same starting point and increment rule as the DMG workflow, so a
+        # Linux package and a DMG from the same run number share one Release.
+        run: |
+          base="$(tr -d '\n\r' < BUILD_NUMBER)"
+          case "$base" in ''|*[!0-9]*) echo 'BUILD_NUMBER must be a positive integer' >&2; exit 1;; esac
+          number=$((base - 1 + GITHUB_RUN_NUMBER))
+          version="$(tr -d '\n\r' < VERSION)"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version-build$number" >> "$GITHUB_OUTPUT"
+      - name: Build engine and Linux package
+        run: ./scripts/build-linux.sh release
+      - name: Test the desktop supervisor
+        run: dotnet test linux/AzkiSimulator.Linux.sln
+      - name: Run Python runtime and device-code tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    # A pull request builds to prove the branch; it never publishes a Release.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Assign build number
+        id: number
+        run: |
+          base="$(tr -d '\n\r' < BUILD_NUMBER)"
+          number=$((base - 1 + GITHUB_RUN_NUMBER))
+          version="$(tr -d '\n\r' < VERSION)"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version-build$number" >> "$GITHUB_OUTPUT"
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: dist
+      - name: Publish Release
+        env:
+          TAG: ${{ steps.number.outputs.tag }}
+          VERSION: ${{ steps.number.outputs.version }}
+          NUMBER: ${{ steps.number.outputs.number }}
+        run: |
+          shopt -s nullglob
+          # Every Linux artifact name contains "-linux-", the GPL source archives too,
+          # so the package list has to exclude them by name rather than by glob.
+          mapfile -t packages < <(find dist -maxdepth 1 -type f -name '*-linux-*.tar.gz' \
+            ! -name '*-source.tar.gz' ! -name '*-engine-sources.tar.gz' | sort)
+          sources=(dist/*-source.tar.gz dist/*-engine-sources.tar.gz)
+          test "${#packages[@]}" -ge 1 || { echo 'Expected a Linux package' >&2; exit 1; }
+          test "${#sources[@]}" -ge 2 || { echo 'Missing corresponding source archives' >&2; exit 1; }
+          {
+            for package in "${packages[@]}" "${sources[@]}"; do sha256sum "$package"; done > SHA256SUMS-linux
+          }
+          primary="$(basename "${packages[0]}")"
+          checksum="$(sha256sum "${packages[0]}" | cut -d' ' -f1)"
+          cat > notes-linux.md <<EOF
+          ## Linux（开发/CI 级） / Linux (development/CI grade)
+
+          **安装包：\`${primary}\`** — 解包后包含 Engine、Runtime 与桌面应用（存在 dotnet SDK 时）。
+          SHA-256: \`$checksum\`
+
+          需要 Linux x86_64/aarch64、bubblewrap（非特权 user namespace）与固件本地导入。真实手机蓝牙射频配对（BlueZ）尚未实现；不做跨发行版兼容承诺。
+          Requires Linux with bubblewrap; firmware is imported locally. Phone-side Bluetooth (BlueZ) is not implemented; no cross-distribution promises.
+
+          \`*-source.tar.gz\` / \`*-engine-sources.tar.gz\` 是 GPL 对应源码。完整说明见 docs/BUILDING-LINUX.md。
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${packages[@]}" "${sources[@]}" SHA256SUMS-linux --clobber
+          else
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" \
+              --title "Azki Simulator $VERSION (build $NUMBER)" --notes-file notes-linux.md
+            gh release upload "$TAG" "${packages[@]}" "${sources[@]}" SHA256SUMS-linux
+            gh release edit "$TAG" --draft=false --latest
+          fi
+          {
+            echo "### Azki Simulator $VERSION (build $NUMBER) — Linux"
+            echo
+            echo "Package: https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$primary"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  tests-macos:
+    # Same Python contract tests on the macOS toolchain, which never ran in CI before.
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Run Python runtime tests
+        run: |
+          brew install python@3.12
+          echo "$(brew --prefix python@3.12)/libexec/bin" >> "$GITHUB_PATH"
+      - name: Test
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v

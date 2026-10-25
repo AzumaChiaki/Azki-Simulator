@@ -58,18 +58,29 @@ class GuestClock:
 
 
 def peer_identity(connection):
-    if sys.platform != 'darwin' or os.getuid() != os.geteuid():
+    if os.getuid() != os.geteuid():
         raise ValueError('Kernel peer identity unavailable')
-    library = ctypes.CDLL(None, use_errno=True)
-    uid, gid = ctypes.c_uint(), ctypes.c_uint()
-    library.getpeereid.argtypes = [ctypes.c_int,ctypes.POINTER(ctypes.c_uint),ctypes.POINTER(ctypes.c_uint)]
-    library.getpeereid.restype = ctypes.c_int
-    if library.getpeereid(connection.fileno(),ctypes.byref(uid),ctypes.byref(gid)):
-        raise ValueError('Kernel peer identity unavailable')
-    raw = connection.getsockopt(0,2,4)
-    pid = struct.unpack('=i',raw)[0]
-    if uid.value != os.getuid() or pid <= 0: raise ValueError('Kernel peer identity mismatch')
-    return uid.value, pid
+    if sys.platform == 'darwin':
+        library = ctypes.CDLL(None, use_errno=True)
+        uid, gid = ctypes.c_uint(), ctypes.c_uint()
+        library.getpeereid.argtypes = [ctypes.c_int,ctypes.POINTER(ctypes.c_uint),ctypes.POINTER(ctypes.c_uint)]
+        library.getpeereid.restype = ctypes.c_int
+        if library.getpeereid(connection.fileno(),ctypes.byref(uid),ctypes.byref(gid)):
+            raise ValueError('Kernel peer identity unavailable')
+        raw = connection.getsockopt(0,2,4)
+        pid = struct.unpack('=i',raw)[0]
+        if uid.value != os.getuid() or pid <= 0: raise ValueError('Kernel peer identity mismatch')
+        return uid.value, pid
+    if sys.platform.startswith('linux'):
+        # struct ucred {pid_t pid; uid_t uid; gid_t gid} (SOL_SOCKET/SO_PEERCRED).
+        # The pid namespace stays shared with the supervisor -- bwrap is invoked
+        # with the namespaces enumerated and no --unshare-pid (it has no
+        # --share-pid), so this pid is the host-visible identity of the
+        # connected process.
+        pid, uid, gid = struct.unpack('=iii', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        if uid != os.getuid() or pid <= 0: raise ValueError('Kernel peer identity mismatch')
+        return uid, pid
+    raise ValueError('Kernel peer identity unavailable')
 
 
 def request(raw):

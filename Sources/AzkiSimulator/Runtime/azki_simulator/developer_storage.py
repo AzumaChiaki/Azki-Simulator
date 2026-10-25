@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import sys
 
 from .minative import _canonical, _directory_fd, _group_members, _json, _read
 
@@ -21,12 +22,20 @@ FIELDS = {"version", "mode", "approvalDigest", "sessionID", "transactionID", "ru
 
 
 def _publish_no_replace(directory, temporary):
-    # Azki Simulator runs on macOS. RENAME_EXCL is the Darwin atomic no-replace
-    # rename; unlike hard-link publication, it never leaves two links on a crash.
-    rename = ctypes.CDLL(None, use_errno=True).renameatx_np
+    # Atomic no-replace rename: Darwin renameatx_np(RENAME_EXCL); Linux
+    # renameat2(RENAME_NOREPLACE). Unlike hard-link publication, it never
+    # leaves two links on a crash.
+    darwin = sys.platform == "darwin"
+    function = "renameatx_np" if darwin else "renameat2"
+    if not darwin and not sys.platform.startswith("linux"):
+        raise OSError(None, "Atomic no-replace rename is unavailable", FILENAME)
+    library = ctypes.CDLL(None, use_errno=True)
+    rename = getattr(library, function, None)
+    if rename is None:
+        raise OSError(None, "Atomic no-replace rename is unavailable", FILENAME)
     rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
     rename.restype = ctypes.c_int
-    if rename(directory, os.fsencode(temporary), directory, os.fsencode(FILENAME), 0x4):
+    if rename(directory, os.fsencode(temporary), directory, os.fsencode(FILENAME), 0x4 if darwin else 1):
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error), FILENAME)
 

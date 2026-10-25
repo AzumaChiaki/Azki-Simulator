@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import secrets
 import struct
 
-from .crypto import CommonCryptoAES, CryptoError
+from .crypto import aes_provider, CryptoError
 
 SUCCESS = 0x00
 UNKNOWN_COMMAND = 0x01
@@ -71,7 +71,7 @@ class VirtualController:
             self.address = bytes(int(part, 16) for part in parts)
         except ValueError as error:
             raise ValueError("Invalid synthetic controller address") from error
-        self.crypto = crypto if crypto is not None else CommonCryptoAES()
+        self.crypto = crypto if crypto is not None else aes_provider()
         self.random_bytes = random_bytes if random_bytes is not None else secrets.token_bytes
         self.reset()
 
