@@ -34,6 +34,7 @@ final class SimulatorGuestOperationsModel {
     private(set) var operationID: String?
     private(set) var operationKind: String?
     private(set) var operationPackageKind: PackageKind?
+    private(set) var operationPackageID: String?
     private(set) var operationState: String?
     private(set) var operationPhase: String?
     private(set) var acknowledgedSegments = 0
@@ -71,6 +72,7 @@ final class SimulatorGuestOperationsModel {
     var canSelect: Bool {
         canInstall && selectedWatchfaceID.map { id in inventory.contains { $0.id == id && !$0.isCurrent } } == true
     }
+    func canUninstall(_ app: QuickApp) -> Bool { canInstall && applications.contains(app) }
     var connectionLabel: String {
         if !isAvailable { return "当前设备不支持" }
         if isAuthenticated { return isTransportReady ? "本地通信已认证" : "本地通信未就绪" }
@@ -85,6 +87,8 @@ final class SimulatorGuestOperationsModel {
         switch operationKind {
         case "inventory": return operationPackageKind == .quickapp ? "正在读取应用" : "正在读取表盘"
         case "watchface-select": return "正在使用表盘"
+        case "quickapp-uninstall":
+            return operationPhase == "after-uninstall-inventory" ? "正在核对设备应用" : "正在卸载应用"
         case "install":
             if acknowledgedSegments > 0 { return "正在安装 · 已确认 \(acknowledgedSegments) 段" }
             switch operationPhase {
@@ -221,7 +225,17 @@ final class SimulatorGuestOperationsModel {
         }
     }
 
-    private func begin(kind: String, packageKind: PackageKind? = nil, request: () async throws -> SimulatorJSON) async {
+    func uninstall(_ app: QuickApp) async {
+        guard canUninstall(app), let identity, let command else { return }
+        await begin(kind: "quickapp-uninstall", packageKind: .quickapp, packageID: app.id) {
+            var arguments = Self.arguments(identity)
+            arguments["identifier"] = .string(app.id)
+            arguments["fingerprint"] = .string(app.fingerprint)
+            return try await command("guest-uninstall", arguments)
+        }
+    }
+
+    private func begin(kind: String, packageKind: PackageKind? = nil, packageID: String? = nil, request: () async throws -> SimulatorJSON) async {
         let token = revision, boundIdentity = identity
         pollRevision = UUID()
         isRequestInFlight = true; errorMessage = nil; resultMessage = nil
@@ -233,7 +247,7 @@ final class SimulatorGuestOperationsModel {
                 throw Self.invalid("设备未返回有效操作编号")
             }
             operationID = id; operationKind = kind; operationState = "running"
-            operationPackageKind = packageKind
+            operationPackageKind = packageKind; operationPackageID = packageID
             operationPhase = nil; acknowledgedSegments = 0; completedOperationID = nil
         } catch {
             guard token == revision else { return }
@@ -266,12 +280,13 @@ final class SimulatorGuestOperationsModel {
         if let failure = status["idleError"]?.string, !failure.isEmpty { errorMessage = String(failure.prefix(512)) }
         if let operation = status["operation"], operation != .null {
             guard let id = operation["operationID"]?.string, UUID(uuidString: id) != nil,
-                  let kind = operation["kind"]?.string, ["install", "inventory", "watchface-select"].contains(kind),
+                  let kind = operation["kind"]?.string, ["install", "inventory", "watchface-select", "quickapp-uninstall"].contains(kind),
                   let state = operation["state"]?.string, ["running", "completed", "failed"].contains(state) else {
                 throw Self.invalid("设备操作状态无效")
             }
             operationID = id; operationKind = kind; operationState = state
             operationPackageKind = try Self.packageKind(operation, field: kind == "inventory" ? "inventoryKind" : "packageKind")
+            operationPackageID = operation["packageID"]?.string
             operationPhase = operation["phase"]?.string
             acknowledgedSegments = Self.integer(operation["acknowledgedSegments"]) ?? 0
             if state == "failed" { errorMessage = operation["error"]?.string ?? "设备操作失败" }
@@ -315,6 +330,17 @@ final class SimulatorGuestOperationsModel {
             }
             if kind == .quickapp, receipt["currentID"] != .null { throw Self.invalid("设备应用库存状态无效") }
             try applyInventory(receipt["inventory"], kind: kind)
+        case "quickapp-uninstall":
+            guard try confirmedPackageKind(response, receipt: receipt, field: "packageKind") == .quickapp,
+                  receipt["guestUninstallVerified"]?.bool == true,
+                  let packageID = operationPackageID,
+                  response["packageID"]?.string == packageID, receipt["packageID"]?.string == packageID,
+                  case .array(let entries) = receipt["afterInventory"],
+                  !entries.contains(where: { $0["id"]?.string == packageID }) else {
+                throw Self.invalid("设备尚未确认卸载此应用")
+            }
+            try applyInventory(receipt["afterInventory"], kind: .quickapp)
+            resultMessage = "应用已卸载"
         default: throw Self.invalid("设备操作类型无效")
         }
     }
@@ -350,7 +376,7 @@ final class SimulatorGuestOperationsModel {
 
     private func clearOperation() {
         operationID = nil; operationKind = nil; operationState = nil; operationPhase = nil
-        operationPackageKind = nil
+        operationPackageKind = nil; operationPackageID = nil
         acknowledgedSegments = 0; completedOperationID = nil
     }
     private static func arguments(_ identity: Identity) -> [String: SimulatorJSON] {

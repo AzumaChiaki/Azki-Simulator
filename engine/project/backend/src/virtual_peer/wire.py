@@ -155,6 +155,15 @@ def inventory_response(kind, payload):
     return items, (0 if kind == 'quickapp' else contents.number(2))
 
 
+def uninstall_request(identifier, fingerprint):
+    request = blob(1, identifier) + blob(2, fingerprint)
+    return envelope(20, 3, 22, blob(5, request))
+
+
+def uninstall_response(payload):
+    body(payload, 20, 3, 22).message(5)
+
+
 def prepare_request(package):
     if package.kind == 'quickapp':
         request = blob(1, package.identifier) + integer(2, package.version) + integer(3, len(package.payload))

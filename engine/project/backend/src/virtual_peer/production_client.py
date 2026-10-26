@@ -48,7 +48,7 @@ class GuestOperations:
                 'backendKind': status.backend_kind, 'operation': operation,
                 'idleMessagesObserved': self.idle_events,
                 'idleError': self.idle_error,
-                'supportedOperations': ['status', 'inventory', 'install', 'watchface-select', 'operation-status'],
+                'supportedOperations': ['status', 'inventory', 'install', 'watchface-select', 'quickapp-uninstall', 'operation-status'],
                 'supportedInstallKinds': ['watchface', 'quickapp'],
                 'supportedInventoryKinds': ['watchface', 'quickapp'],
                 'verifiedInstallKinds': ['watchface'] if self.profile_id == DEFAULT_PROFILE else [],
@@ -140,6 +140,26 @@ class GuestOperations:
             self._fail(error)
         return self.operation['operationID']
 
+    def start_uninstall(self, identifier, fingerprint, *, expected_session_id, expected_generation, timeout=45):
+        if (not isinstance(identifier, str) or not 1 <= len(identifier.encode()) <= 128 or
+                any(ord(c) < 32 or ord(c) == 127 for c in identifier) or
+                not isinstance(fingerprint, str) or len(fingerprint) > 128 or len(fingerprint) % 2 or
+                re.fullmatch(r'[0-9a-f]*', fingerprint) is None):
+            raise ValueError('invalid quickapp uninstall identity')
+        if type(timeout) not in (int, float) or not 5 <= timeout <= 120:
+            raise ValueError('invalid uninstall timeout')
+        self._begin(expected_session_id, expected_generation)
+        self.operation = {'operationID': str(uuid.uuid4()), 'kind': 'quickapp-uninstall', 'state': 'running',
+                          'phase': 'wait-uninstall-response', 'packageID': identifier,
+                          'packageKind': 'quickapp', 'inventoryKind': 'quickapp', 'started': self.clock()}
+        self.deadline = self.clock() + timeout
+        self.pages = set(); self.faces = {}; self.after_selection = False
+        try:
+            self._send(wire.uninstall_request(identifier, bytes.fromhex(fingerprint)))
+        except (OSError, ValueError) as error:
+            self._fail(error)
+        return self.operation['operationID']
+
     def start_inventory(self, kind='watchface', *, expected_session_id, expected_generation, timeout=30):
         if kind not in ('watchface', 'quickapp'):
             raise ValueError('unsupported inventory kind')
@@ -187,7 +207,7 @@ class GuestOperations:
             phase = self.operation['phase']
             kind = self.operation['inventoryKind']
             expected_route = (20 if kind == 'quickapp' else 4, 0)
-            if phase in ('before-select-inventory', 'after-select-inventory', 'wait-inventory') and route == expected_route:
+            if phase in ('before-select-inventory', 'after-select-inventory', 'after-uninstall-inventory', 'wait-inventory') and route == expected_route:
                 faces, cursor = wire.inventory_response(kind, event.payload)
                 for face in faces:
                     if face['id'] in self.faces or len(self.faces) >= 256:
@@ -205,6 +225,16 @@ class GuestOperations:
                                     'inventoryKind': kind,
                                     'currentID': current[0] if current else None, 'readOnly': True,
                                     'guestInventoryVerified': self.identity[2] == 'guest', 'guestInstalled': False}
+                    return
+                if self.operation['kind'] == 'quickapp-uninstall':
+                    if self.operation['packageID'] in self.faces:
+                        raise ValueError('quickapp remains in guest inventory after uninstall')
+                    self.operation.update(state='completed', phase='uninstall-inventory-confirmed', finished=self.clock())
+                    self.receipt = {'state': 'completed', 'operationID': self.operation['operationID'],
+                                    'backendKind': self.identity[2], 'packageID': self.operation['packageID'],
+                                    'packageKind': 'quickapp', 'inventoryKind': 'quickapp',
+                                    'afterInventory': list(self.faces.values()),
+                                    'guestUninstallVerified': self.identity[2] == 'guest'}
                     return
                 target = self.faces.get(self.operation['packageID'])
                 if target is None:
@@ -228,6 +258,10 @@ class GuestOperations:
                     raise ValueError('guest rejected requested watchface selection')
                 self.after_selection = True; self.pages = set(); self.faces = {}
                 self.operation['phase'] = 'after-select-inventory'; self._inventory()
+            elif phase == 'wait-uninstall-response' and route == (20, 3):
+                wire.uninstall_response(event.payload)
+                self.pages = set(); self.faces = {}
+                self.operation['phase'] = 'after-uninstall-inventory'; self._inventory()
 
     def tick(self):
         if not self.operation or self.operation['state'] != 'running':
@@ -256,7 +290,7 @@ class GuestOperations:
             else:
                 self._require_identity()
                 if self.clock() >= self.deadline:
-                    raise TimeoutError('inventory or selection operation deadline exceeded')
+                    raise TimeoutError('guest operation deadline exceeded')
                 events = self.api.poll(); self._check_events(events, self.identity)
                 self._select_events(events)
         except (ValueError, OSError, TimeoutError) as error:

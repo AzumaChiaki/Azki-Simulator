@@ -179,7 +179,7 @@ final class SimulatorSessionModel {
     /// not hold the touch/UI command flag during the subsequent firmware work.
     func guestCommand(_ command: String, arguments: [String: SimulatorJSON] = [:]) async throws -> SimulatorJSON {
         guard let connection, isRunning else { throw SimulatorError.disconnected }
-        guard ["guest-status", "guest-connect", "guest-operation", "guest-inventory", "guest-select"].contains(command) else {
+        guard ["guest-status", "guest-connect", "guest-operation", "guest-inventory", "guest-select", "guest-uninstall"].contains(command) else {
             throw SimulatorError.remote("不受支持的设备操作")
         }
         let token = generation

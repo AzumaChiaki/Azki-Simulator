@@ -21,9 +21,10 @@ PROFILE_ID = re.compile(r"[A-Za-z0-9._@-]{1,128}\Z")
 MAX_REQUEST = 2048
 MAX_RESPONSE = 65536
 DEADLINE_SECONDS = 30.0
-PEER_COMMANDS = ["status", "connect", "inventory", "install", "watchface-select", "operation-status"]
+PEER_COMMANDS = ["status", "connect", "inventory", "install", "watchface-select", "quickapp-uninstall", "operation-status"]
 COMMANDS = {"guest-status": "status", "guest-connect": "connect", "guest-inventory": "inventory",
-            "guest-install": "install", "guest-select": "watchface-select", "guest-operation": "operation-status"}
+            "guest-install": "install", "guest-select": "watchface-select", "guest-uninstall": "quickapp-uninstall",
+            "guest-operation": "operation-status"}
 EXTERNAL_FIELDS = {"external-open": set(), "external-status": {"bridgeID"},
                    "external-reconnect": {"bridgeID"},
                    "external-close": {"bridgeID"}, "external-result": {"bridgeID", "operationID"},
@@ -134,7 +135,8 @@ def validate_arguments(command, arguments):
         return {"schema": 1, "requestID": str(uuid.uuid4()), "command": command, **arguments}
     fields = {"expected_session_id", "expected_generation"} if command != "guest-status" else set()
     fields |= {"guest-install": {"fileName", "sha256"}, "guest-operation": {"operationID"},
-               "guest-select": {"identifier"}, "guest-inventory": {"kind"}}.get(command, set())
+               "guest-select": {"identifier"}, "guest-inventory": {"kind"},
+               "guest-uninstall": {"identifier", "fingerprint"}}.get(command, set())
     if "connectionTimeoutSeconds" in arguments:
         fields.add("connectionTimeoutSeconds")
     if set(arguments) != fields:
@@ -168,6 +170,14 @@ def validate_arguments(command, arguments):
         if arguments["kind"] not in ("watchface", "quickapp"):
             raise MError("invalid_guest_operation", "请选择应用或表盘库存")
         request["kind"] = arguments["kind"]
+    elif command == "guest-uninstall":
+        identifier, fingerprint = arguments["identifier"], arguments["fingerprint"]
+        if (type(identifier) is not str or not 1 <= len(identifier.encode()) <= 128
+                or any(ord(c) < 32 or ord(c) == 127 for c in identifier)
+                or type(fingerprint) is not str or len(fingerprint) > 128
+                or re.fullmatch(r"(?:[0-9a-f]{2})*", fingerprint) is None):
+            raise MError("invalid_guest_operation", "应用卸载信息无效")
+        request.update(identifier=identifier, fingerprint=fingerprint)
     return request
 
 
@@ -228,7 +238,7 @@ def execute(adapter, command, arguments):
     # Staging and peer IO must not hold the adapter's status/frame/lifecycle
     # lock. Bind the response to the captured process and private run instead.
     sent = False
-    mutation = command in ("guest-connect", "guest-install", "guest-select", "guest-inventory")
+    mutation = command in ("guest-connect", "guest-install", "guest-select", "guest-inventory", "guest-uninstall")
     try:
         validate_control(control.get("virtual_peer"))
         path = _inside_private(control["virtual_peer"]["socket"], run / "tmp")

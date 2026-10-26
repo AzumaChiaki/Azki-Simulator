@@ -20,7 +20,7 @@ from .production_client import GuestOperations
 from .state import canonical_uuid, strict_json, validate_state, write_pending
 from .virtual_packages import load_staged
 
-COMMANDS = ('status','connect','inventory','install','watchface-select','operation-status')
+COMMANDS = ('status','connect','inventory','install','watchface-select','quickapp-uninstall','operation-status')
 MAX_REQUEST = 2048
 MAX_RESPONSE = 65536
 
@@ -96,7 +96,7 @@ def request(raw):
         return value
     extra = {'status':set(),'connect':set(),'inventory':{'kind'},
         'install':{'filename','sha256'},'watchface-select':{'identifier'},
-        'operation-status':{'operationID'}}
+        'quickapp-uninstall':{'identifier','fingerprint'},'operation-status':{'operationID'}}
     if type(cmd) is not str or cmd not in extra: raise ValueError('Unknown peer command')
     if 'connectionTimeoutSeconds' in value:
         base.add('connectionTimeoutSeconds')
@@ -113,6 +113,11 @@ def request(raw):
     if cmd == 'operation-status' and not canonical_uuid(value['operationID']): raise ValueError('Invalid operation identity')
     if cmd == 'watchface-select' and (type(value['identifier']) is not str or not 1 <= len(value['identifier']) <= 64 or not value['identifier'].isascii() or not value['identifier'].isalnum()):
         raise ValueError('Invalid watchface identity')
+    if cmd == 'quickapp-uninstall':
+        identifier, fingerprint = value['identifier'], value['fingerprint']
+        if (type(identifier) is not str or not 1 <= len(identifier.encode()) <= 128 or any(ord(c) < 32 or ord(c) == 127 for c in identifier) or
+            type(fingerprint) is not str or len(fingerprint) > 128 or len(fingerprint) % 2 or any(c not in '0123456789abcdef' for c in fingerprint)):
+            raise ValueError('Invalid quickapp uninstall identity')
     if cmd == 'install':
         name, digest = value['filename'], value['sha256']
         if type(name) is not str or not name.endswith('.bin') or not canonical_uuid(name[:-4]) or type(digest) is not str or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
@@ -350,6 +355,8 @@ class PeerService:
             operation = self.operations.start_install_staged(self.run/'packages',value['filename'],inspection,**expected)
         elif command == 'watchface-select':
             operation = self.operations.start_select(value['identifier'],**expected)
+        elif command == 'quickapp-uninstall':
+            operation = self.operations.start_uninstall(value['identifier'],value['fingerprint'],**expected)
         elif command == 'operation-status':
             return self.operations.operation_status(value['operationID'])
         else: raise ValueError('Unknown peer command')

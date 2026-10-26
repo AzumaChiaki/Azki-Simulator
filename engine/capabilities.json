@@ -201,6 +201,7 @@
       "inventory",
       "install",
       "watchface-select",
+      "quickapp-uninstall",
       "operation-status"
     ]
   }

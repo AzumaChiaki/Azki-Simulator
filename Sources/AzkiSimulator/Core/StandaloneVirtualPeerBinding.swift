@@ -45,7 +45,7 @@ struct StandaloneVirtualPeerBinding {
     /// granting the state input. Neither path permits family/version fallback.
     static func validatedLayouts(capabilities: [String: Any], qemuSHA256: String? = nil) throws -> [String: StandaloneNorBinding.Layout] {
         let layouts = try StandaloneNorBinding.validatedLayouts(capabilities: capabilities, qemuSHA256: qemuSHA256)
-        let commands = ["status", "connect", "inventory", "install", "watchface-select", "operation-status"]
+        let commands = ["status", "connect", "inventory", "install", "watchface-select", "quickapp-uninstall", "operation-status"]
         guard let cap = capabilities["virtualPeer"] as? [String: Any],
               Set(cap.keys) == ["schema", "runnerProtocol", "controlProtocol", "transport", "qemuSHA256",
                 "profiles", "stateSchema", "automaticConnect", "physicalRadio",

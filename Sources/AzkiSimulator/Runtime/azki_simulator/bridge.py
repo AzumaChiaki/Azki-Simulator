@@ -715,7 +715,7 @@ class SessionBridge:
                 return self.start()
             if command == "stop":
                 return self.stop()
-            if command in ("guest-status", "guest-connect", "guest-install", "guest-operation", "guest-inventory", "guest-select",
+            if command in ("guest-status", "guest-connect", "guest-install", "guest-operation", "guest-inventory", "guest-select", "guest-uninstall",
                            "external-open", "external-status", "external-request", "external-result", "external-close", "external-reconnect"):
                 from .virtual_peer import execute
                 return execute(getattr(self, "adapter", None), command, args)

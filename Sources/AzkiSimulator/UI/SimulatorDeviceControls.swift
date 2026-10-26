@@ -12,6 +12,9 @@ import SwiftUI
     @State private var fileChoice: PackageChoice = .install
     @State private var installSelectionHost: UUID?
     @State private var installSelectionPeer: SimulatorGuestOperationsModel.Identity?
+    @State private var uninstallCandidate: SimulatorGuestOperationsModel.QuickApp?
+    @State private var uninstallSelectionHost: UUID?
+    @State private var uninstallSelectionPeer: SimulatorGuestOperationsModel.Identity?
     @State private var uiError: String?
 
     private enum PackageChoice { case inspect, stage, install }
@@ -88,6 +91,12 @@ import SwiftUI
         .alert(instanceName ?? "Azki Simulator", isPresented: Binding(get: { uiError != nil }, set: { if !$0 { uiError = nil } })) {
             Button("好") { uiError = nil }
         } message: { Text(uiError ?? "") }
+        .alert("卸载应用？", isPresented: Binding(get: { uninstallCandidate != nil }, set: { if !$0 { uninstallCandidate = nil } })) {
+            Button("取消", role: .cancel) { uninstallCandidate = nil }
+            Button("卸载", role: .destructive) { confirmUninstall() }
+        } message: {
+            if let app = uninstallCandidate { Text("将从虚拟手环卸载“\(app.name.isEmpty ? app.id : app.name)”。") }
+        }
     }
 
     private var applicationInventory: some View {
@@ -104,11 +113,32 @@ import SwiftUI
                 Text(guestOperations.applicationsLoaded ? "暂无应用" : "正在读取…")
             } else {
                 ForEach(guestOperations.applications) { app in
-                    LabeledContent(app.name.isEmpty ? app.id : app.name, value: "\(app.id) · 版本 \(app.version)")
+                    HStack {
+                        LabeledContent(app.name.isEmpty ? app.id : app.name, value: "\(app.id) · 版本 \(app.version)")
+                        Button("删除", systemImage: "trash", role: .destructive) {
+                            uninstallCandidate = app
+                            uninstallSelectionHost = session.manifest?.id
+                            uninstallSelectionPeer = guestOperations.identity
+                        }
+                        .disabled(!guestOperations.canUninstall(app))
+                        .help("卸载应用")
+                        .accessibilityIdentifier("simulator.guest.app-uninstall.\(app.id)")
+                    }
                 }
                 Text("从设备应用列表打开。")
             }
         }.accessibilityIdentifier("simulator.guest.apps-inventory")
+    }
+
+    private func confirmUninstall() {
+        guard let app = uninstallCandidate else { return }
+        uninstallCandidate = nil
+        guard guestOperations.canUninstall(app), uninstallSelectionHost == session.manifest?.id,
+              uninstallSelectionPeer == guestOperations.identity else {
+            uiError = "设备连接已变化或操作正忙，请重新选择应用。"
+            return
+        }
+        Task { await guestOperations.uninstall(app) }
     }
 
     private func choose(_ choice: PackageChoice) { fileChoice = choice; choosingFile = true }
