@@ -23,7 +23,8 @@ import UniformTypeIdentifiers
             detail
         }
         .navigationSplitViewStyle(.balanced)
-        .modifier(SimulatorInspectorAttachment(library: library, presented: $inspectorPresented))
+        .modifier(SimulatorInspectorAttachment(library: library, presented: $inspectorPresented,
+                                               logsPresented: $logsPresented))
         .background {
             ForEach(library.instances) { instance in
                 SimulatorInstanceRuntimeHost(library: library, instance: instance)
@@ -49,7 +50,8 @@ import UniformTypeIdentifiers
         .toolbar {
             SimulatorInstanceActionToolbar(
                 library: library, instance: library.selected,
-                onCreate: { creating = true }, onImport: { importFirmware = true }
+                onCreate: { creating = true }, onImport: { importFirmware = true },
+                logsPresented: $logsPresented
             )
         }
     }
@@ -282,11 +284,12 @@ private struct SimulatorScenePresentations: ViewModifier {
 private struct SimulatorInspectorAttachment: ViewModifier {
     let library: SimulatorInstanceLibrary
     @Binding var presented: Bool
+    @Binding var logsPresented: Bool
 
     func body(content: Content) -> some View {
         if let instance = library.selected {
             content.inspector(isPresented: $presented) {
-                SimulatorInstanceInspector(library: library, instance: instance)
+                SimulatorInstanceInspector(library: library, instance: instance, logsPresented: $logsPresented)
                     .id(instance.id)
                     .inspectorColumnWidth(min: 320, ideal: 380, max: 520)
             }
@@ -314,7 +317,7 @@ private struct SimulatorInspectorAttachment: ViewModifier {
             if let instance {
                 SimulatorDeviceDetailView(instance: instance, logsPresented: $logsPresented)
                     .inspector(isPresented: $inspectorPresented) {
-                        SimulatorInstanceInspector(library: library, instance: instance)
+                        SimulatorInstanceInspector(library: library, instance: instance, logsPresented: $logsPresented)
                             .id(instance.id)
                             .inspectorColumnWidth(min: 320, ideal: 380, max: 520)
                     }
@@ -327,7 +330,8 @@ private struct SimulatorInspectorAttachment: ViewModifier {
                     .toolbar {
                         SimulatorInstanceActionToolbar(
                             library: library, instance: instance,
-                            onCreate: { creating = true }, onImport: { importFirmware = true }
+                            onCreate: { creating = true }, onImport: { importFirmware = true },
+                            logsPresented: $logsPresented
                         )
                     }
             } else {
@@ -356,12 +360,15 @@ private struct SimulatorInspectorAttachment: ViewModifier {
         Group {
             if logsPresented {
                 VSplitView {
-                    canvas.frame(minHeight: 240)
+                    canvas
+                        .frame(maxWidth: .infinity, minHeight: 240, maxHeight: .infinity)
                     SimulatorLogPanel(runtime: instance.runtime, stream: instance.logStream, instanceName: instance.record.name)
-                        .frame(minHeight: 120)
+                        .frame(maxWidth: .infinity, minHeight: 120, maxHeight: .infinity)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 canvas
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
@@ -383,6 +390,7 @@ private struct SimulatorInspectorAttachment: ViewModifier {
             } description: {
                 Text(session.isAttached ? "设备已连接，正在等待第一帧。" : "在检查器中选择固件并运行，或使用工具栏「运行」。")
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 }

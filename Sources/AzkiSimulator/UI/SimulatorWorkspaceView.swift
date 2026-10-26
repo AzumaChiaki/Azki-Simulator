@@ -20,6 +20,7 @@ import UniformTypeIdentifiers
 @MainActor struct SimulatorInstanceInspector: View {
     let library: SimulatorInstanceLibrary
     @Bindable var instance: SimulatorInstanceContext
+    @Binding var logsPresented: Bool
     @State private var choosingFile = false
     @State private var fileChoice: SimulatorFileChoice = .session
     @State private var showingPreparedFiles = false
@@ -127,12 +128,12 @@ import UniformTypeIdentifiers
                 Label(issue, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
                     .accessibilityIdentifier("simulator.transient-issue")
             }
-            if session.isAttached && !runtime.isServing {
-                Button("断开", systemImage: "eject") { SimulatorInstanceActions.detach(instance) }
-                    .help("断开此外接会话，不停止独立启动的设备进程")
-                    .disabled(!SimulatorInstanceActions.canDetach(instance))
-                    .accessibilityIdentifier("simulator.detach-session")
+            Button(logsPresented ? "隐藏日志" : "显示日志",
+                   systemImage: logsPresented ? "rectangle.bottomthird.inset.filled" : "text.alignleft") {
+                logsPresented.toggle()
             }
+            .help(logsPresented ? "隐藏实时日志" : "显示实时日志")
+            .accessibilityIdentifier("simulator.logs-session")
             if session.isAttached && session.image == nil { Text("等待画面") }
             if recording.isRecording {
                 Label("录制中 \(Int(recording.elapsedTime) / 60):\(String(format: "%02d", Int(recording.elapsedTime) % 60))",

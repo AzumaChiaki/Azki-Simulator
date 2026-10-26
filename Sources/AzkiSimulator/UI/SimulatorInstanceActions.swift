@@ -104,6 +104,7 @@ import SwiftUI
     var showsCreate: Bool = true
     var onCreate: () -> Void
     var onImport: () -> Void
+    var logsPresented: Binding<Bool>
     @Environment(\.openWindow) private var openWindow
 
     var body: some ToolbarContent {
@@ -126,10 +127,12 @@ import SwiftUI
                     .help(instance.runtime.isStopping ? "正在停止…" : "停止本应用启动的设备（⌘.）")
                     .disabled(!SimulatorInstanceActions.canStop(instance))
                     .accessibilityIdentifier("simulator.stop")
-                Button("断开", systemImage: "eject") { SimulatorInstanceActions.detach(instance) }
-                    .help("断开此外接会话，不停止独立启动的设备进程")
-                    .disabled(!SimulatorInstanceActions.canDetach(instance))
-                    .accessibilityIdentifier("simulator.detach")
+                Button(logsPresented.wrappedValue ? "隐藏日志" : "日志",
+                       systemImage: logsPresented.wrappedValue ? "rectangle.bottomthird.inset.filled" : "text.alignleft") {
+                    logsPresented.wrappedValue.toggle()
+                }
+                .help(logsPresented.wrappedValue ? "隐藏实时日志" : "显示实时日志")
+                .accessibilityIdentifier("simulator.logs")
                 Button("导入固件", systemImage: "square.and.arrow.down") { onImport() }
                     .help("选择完整 OTA 包导入到固件库")
                     .disabled(!SimulatorInstanceActions.importFirmware(instance))

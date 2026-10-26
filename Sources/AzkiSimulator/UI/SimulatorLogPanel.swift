@@ -10,6 +10,9 @@ import SwiftUI
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            Label(instanceName.map { "\($0) · 日志" } ?? "日志", systemImage: "text.alignleft")
+                .font(.headline)
+                .accessibilityAddTraits(.isHeader)
             HStack {
                 Picker("日志来源", selection: $stream.selectedName) {
                     Text("UART 0").tag("uart0.log")
@@ -35,7 +38,8 @@ import SwiftUI
             }
             SimulatorLogTextView(text: stream.text, followBottom: stream.followBottom,
                                  discardedUTF16: stream.discardedUTF16, epoch: stream.epoch)
-                .frame(minHeight: 70, maxHeight: .infinity)
+                .frame(maxWidth: .infinity, minHeight: 70, maxHeight: .infinity,
+                       alignment: .leading)
                 .accessibilityIdentifier("simulator.live-log")
         }
         .padding(12)
