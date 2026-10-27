@@ -355,6 +355,7 @@ private struct SimulatorInspectorAttachment: ViewModifier {
     @Binding var logsPresented: Bool
     @Environment(\.openWindow) private var openWindow
     private var session: SimulatorSessionModel { instance.runtime.runtimeSession }
+    private let logPanelHeight: CGFloat = 320
 
     var body: some View {
         Group {
@@ -363,7 +364,11 @@ private struct SimulatorInspectorAttachment: ViewModifier {
                     canvas
                         .frame(maxWidth: .infinity, minHeight: 240, maxHeight: .infinity)
                     SimulatorLogPanel(runtime: instance.runtime, stream: instance.logStream, instanceName: instance.record.name)
-                        .frame(maxWidth: .infinity, minHeight: 120, maxHeight: .infinity)
+                        // Keep the divider anchored to the bottom. The native
+                        // text view's content height must not move it when the
+                        // VM publishes its first frame or appends more logs.
+                        .frame(maxWidth: .infinity, minHeight: 120,
+                               idealHeight: logPanelHeight, maxHeight: logPanelHeight)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {

@@ -35,7 +35,7 @@ nonisolated struct SimulatorLogBuffer: Sendable {
 /// Polling is single-flight and at most four requests/UI batches per second.
 @MainActor @Observable final class SimulatorLogStreamModel {
     // One selection and one bounded stream per instance, shared by all windows.
-    var selectedName = "uart2.log"
+    var selectedName = "qemu.log"
     var followBottom = true
     private(set) var text = ""
     private(set) var isFollowing = false
