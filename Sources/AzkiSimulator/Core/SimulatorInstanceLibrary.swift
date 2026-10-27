@@ -101,10 +101,16 @@ final class SimulatorInstanceLibrary {
         guard launchMaintenance == nil || force else { return }
         if StandaloneRuntimeModel.launchCleanup == nil {
             let catalog = catalog
-            StandaloneRuntimeModel.launchCleanup = Task { @MainActor in await catalog.cleanupStaleSessions() }
+            StandaloneRuntimeModel.launchCleanup = Task { @MainActor in
+                await catalog.cleanupStaleSessions()
+                await catalog.autoStorageMaintenance()
+            }
         }
         let targets = instances
         launchMaintenance = Task { @MainActor in
+            // The library-wide pass settles each instance once; per-instance
+            // resets must not race it for the same storage lock.
+            await StandaloneRuntimeModel.waitForLaunchCleanup()
             await withTaskGroup(of: Void.self) { group in
                 for instance in targets { group.addTask { @MainActor in await instance.runtime.resetAtLaunch() } }
             }

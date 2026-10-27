@@ -118,6 +118,9 @@ import SwiftUI
             }
         }
         ToolbarItemGroup(placement: .primaryAction) {
+            Button("存储管理", systemImage: "externaldrive") { openWindow(id: "storage") }
+                .help("查看和管理实例快照、固件库与临时会话")
+                .accessibilityIdentifier("simulator.storage")
             if let instance {
                 Button("运行", systemImage: "play.fill") { SimulatorInstanceActions.run(instance) }
                     .help(instance.runtime.runUnavailableReason ?? "按本实例的硬件预设开机（⌘R）")
@@ -250,6 +253,10 @@ extension FocusedValues {
                 .disabled(instance == nil)
             Button("删除实例…") { library?.requestedDeleteID = instance?.id }
                 .disabled(instance == nil || library?.storageAvailable != true)
+        }
+        CommandMenu("存储") {
+            Button("存储管理…") { openWindow(id: "storage") }
+                .keyboardShortcut("s", modifiers: [.command, .shift])
         }
         CommandMenu("显示") {
             Button(inspectorPresented == true ? "隐藏检查器" : "显示检查器") {

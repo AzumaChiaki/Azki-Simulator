@@ -16,6 +16,11 @@ struct AzkiSimulatorApp: App {
         .windowToolbarStyle(.unified)
         .commands { SimulatorCommands() }
 
+        Window("存储管理", id: "storage") {
+            SimulatorStorageWindow(library: library)
+        }
+        .defaultSize(width: 760, height: 620)
+
         WindowGroup(id: "device-display", for: UUID.self) { $instanceID in
             if let instanceID {
                 SimulatorAuxiliaryDeviceWindow(library: library, instanceID: instanceID)

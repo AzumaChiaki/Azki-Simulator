@@ -5,15 +5,18 @@ import SwiftUI
     let library: SimulatorInstanceLibrary
     @State private var deleting: BundledFirmwareItem?
     @State private var confirmingDeleteAll = false
+    @State private var storageModel = SimulatorStorageModel()
 
     private var items: [BundledFirmwareItem] { library.catalog.firmwareItems }
 
     var body: some View {
         TabView {
             Tab("镜像", systemImage: "externaldrive") { imageManagement }
-            Tab("存储", systemImage: "folder") { storage }
+            Tab("存储", systemImage: "folder") {
+                SimulatorStorageManagementView(library: library, model: storageModel)
+            }
         }
-        .frame(minWidth: 560, minHeight: 400)
+        .frame(minWidth: 720, minHeight: 480)
     }
 
     private var imageManagement: some View {
@@ -98,20 +101,4 @@ import SwiftUI
         }
     }
 
-    private var storage: some View {
-        Form {
-            Section {
-                Text(SimulatorDataLocations.appSupportRoot.path)
-                    .font(.body.monospaced())
-                    .textSelection(.enabled)
-                Button("在访达中打开") {
-                    NSWorkspace.shared.open(SimulatorDataLocations.appSupportRoot)
-                }
-                .accessibilityIdentifier("settings.open-storage")
-            } footer: {
-                Text("应用的所有数据都保存在此目录：实例记录、已导入的固件库、运行快照与临时会话。")
-            }
-        }
-        .formStyle(.grouped)
-    }
 }

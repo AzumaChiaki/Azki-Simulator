@@ -517,6 +517,28 @@ final class StandaloneRuntimeModel {
         }
     }
 
+    /// Launch-time storage pass: share byte-identical images and the erased
+    /// template, then remove stopped sessions. It never prunes a committed
+    /// snapshot; that remains an explicit user action in Storage settings.
+    func autoStorageMaintenance() async {
+        struct Receipt: Decodable {
+            struct Issue: Decodable { let error: String? }
+            let freedBytes: Int64?
+            let clonedFiles: Int?
+            let errors: [Issue]?
+        }
+        do {
+            let receipt = try JSONDecoder().decode(Receipt.self, from: await firmwareService.run(
+                ["storage-maintain", "--auto"]))
+            NSLog("[AzkiStorage] auto freed=%lld cloned=%ld issues=%ld",
+                  receipt.freedBytes ?? 0, receipt.clonedFiles ?? 0, receipt.errors?.count ?? 0)
+        } catch {
+            // An older engine without the action, or a busy library, must not
+            // delay or block launch.
+            NSLog("[AzkiStorage] auto-maintenance skipped: %@", error.localizedDescription)
+        }
+    }
+
     /// Drop every in-memory runtime cache of this instance. Never touches a
     /// live core; callers stop it first.
     private func clearRuntimeCaches() {

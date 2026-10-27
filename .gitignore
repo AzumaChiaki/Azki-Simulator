@@ -23,5 +23,3 @@ Firmware/
 instances/
 .workbuddy
 .build-debug
-
-tests

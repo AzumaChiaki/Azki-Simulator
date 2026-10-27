@@ -364,6 +364,17 @@ nonisolated enum StandaloneProcessSandbox {
             let instance = library.appendingPathComponent("instances/" + arguments[2], isDirectory: true)
             try StandaloneSandboxFiles.ensureLibrary(instance)
             writes.append(instance)
+        case "instance-delete":
+            // Delete the instance folder and every already-stopped session that
+            // still holds its 384 MiB working images. Without this grant the
+            // helper could remove neither, even though the record was gone.
+            guard arguments.count == 3, arguments[1] == "--instance-id",
+                  let id = UUID(uuidString: arguments[2]), id.uuidString.lowercased() == arguments[2] else {
+                throw SimulatorError.transport("实例删除参数无效")
+            }
+            let instance = library.appendingPathComponent("instances/" + arguments[2], isDirectory: true)
+            writes.append(instance)
+            extraRules = sessionCleanupRules
         case "instance-reset":
             // Recovers this instance's interrupted commits/staging and clears its
             // session caches; it may write only inside the instance's own folder.
@@ -381,6 +392,53 @@ nonisolated enum StandaloneProcessSandbox {
             // `subpath` cannot express a name prefix, so the grant is a fixed regex
             // over our own prefixes; listing the parent reveals names only.
             guard arguments.count == 1 else { throw SimulatorError.transport("会话清理参数无效") }
+            extraRules = sessionCleanupRules
+        case "storage-report":
+            guard arguments.count == 1 else { throw SimulatorError.transport("存储报告参数无效") }
+            extraRules = storageReadRules
+        case "storage-maintain":
+            // Only our own explicitly-shaped options; never pass an arbitrary
+            // path or an unbounded keep count into the helper.
+            var keep: Int?, scopedInstance: String?
+            var automatic = false, dryRun = false
+            var index = 1
+            while index < arguments.count {
+                switch arguments[index] {
+                case "--keep":
+                    index += 1
+                    guard index < arguments.count, let value = Int(arguments[index]),
+                          (1...32).contains(value), keep == nil else {
+                        throw SimulatorError.transport("存储整理保留数无效")
+                    }
+                    keep = value
+                case "--instance-id":
+                    index += 1
+                    guard index < arguments.count,
+                          let id = UUID(uuidString: arguments[index]),
+                          id.uuidString.lowercased() == arguments[index], scopedInstance == nil else {
+                        throw SimulatorError.transport("存储整理实例参数无效")
+                    }
+                    scopedInstance = arguments[index]
+                case "--auto":
+                    guard !automatic else { throw SimulatorError.transport("存储整理参数重复") }
+                    automatic = true
+                case "--dry-run":
+                    guard !dryRun else { throw SimulatorError.transport("存储整理参数重复") }
+                    dryRun = true
+                default:
+                    throw SimulatorError.transport("存储整理参数无效")
+                }
+                index += 1
+            }
+            guard keep != nil || automatic else { throw SimulatorError.transport("存储整理缺少保留策略") }
+            if let scopedInstance {
+                writes.append(library.appendingPathComponent("instances/" + scopedInstance, isDirectory: true))
+            } else {
+                writes.append(library.appendingPathComponent("instances", isDirectory: true))
+            }
+            // Shared erased templates are the only other library object this
+            // command may create or remove.
+            writes.append(library.appendingPathComponent(".storage", isDirectory: true))
             extraRules = sessionCleanupRules
         case "instance-storage-finish":
             guard arguments.count == 5, arguments[1] == "--session", arguments[3] == "--instance-id",
@@ -426,6 +484,14 @@ nonisolated enum StandaloneProcessSandbox {
     static let preparedSessionRules = [
         "(allow file-read-metadata (literal \"/private/tmp\") (literal \"/tmp\") (literal \"/private\"))",
         "(allow file-read* file-write* (regex #\"^/private/tmp/azki-b-\"))",
+    ]
+
+    /// Storage reports only read the app's own session roots; they never write
+    /// a temporary directory or another user's file.
+    static let storageReadRules = [
+        "(allow file-read* (literal \"/private/tmp\"))",
+        "(allow file-read-metadata (literal \"/tmp\") (literal \"/private\"))",
+        "(allow file-read* (regex #\"^/private/tmp/azki-(b|sim)-\"))",
     ]
 
     /// Session roots created by this app: prepared (`azki-b-`), advanced
