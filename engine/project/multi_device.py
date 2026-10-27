@@ -82,7 +82,10 @@ def board_profile(profile, resource_bytes, storage_kind='romfs'):
         geometry = {'ap-offset': 0xc0000, 'reset-sp': ap['reset_sp'],
                     'flash-bytes': 0x1000000, 'factory-offset': 0xfe0000,
                     'nv-offset': 0xcc0000, 'nand-data-offset': 220 * 1024**2,
-                    'nand-data-bytes': 292 * 1024**2, 'ram-bytes': 0x1a0000}
+                    'nand-data-bytes': 292 * 1024**2, 'ram-bytes': 0x1a0000,
+                    # Channel 3 remains the P65 firmware's room-temperature
+                    # input when battery channel 6 is changed at boot/runtime.
+                    'pmu-adc-ntc': 1 << 3, 'pmu-adc-ntc-room': 12090}
         board = {'profile_id': profile['id'], 'chip': 'best1502p', 'machine': 'azki-p65',
                  'ap_sha256': ap['sha256'], 'local_setup_bypass': True,
                  'geometry': geometry, 'factory_bytes': 128 * 1024,

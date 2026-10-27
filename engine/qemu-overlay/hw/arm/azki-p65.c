@@ -33,6 +33,8 @@
 #include "ui/input.h"
 #include "chardev/char-fe.h"
 #include "azki-p65-gpu.h"
+#include "best1503-adc.h"
+#include "qemu/thread.h"
 #include "bes-nor-store.h"
 
 typedef struct Best1503State Best1503State;
@@ -205,10 +207,13 @@ typedef struct {
     Best1503State *machine;
     uint8_t page[4];
     uint32_t rx[8];
+    int adc_channel[8];
+    uint64_t adc_version[8];
+    uint64_t adc_sampled_version[BES_ADC_CHANNELS];
     unsigned head, count;
     unsigned logged_reads;
     unsigned logged_adc;
-    uint16_t adc_pending;
+    uint16_t adc_pending, adc_converted;
     uint16_t key_pending;
     qemu_irq pmu_irq;
     int64_t adc_deadline;
@@ -327,6 +332,12 @@ struct Best1503State {
     bool gh3x2x_fixture;
     bool spi0_unconnected;
     bool power_adc_fixture;
+    QemuMutex adc_lock;
+    BesAdcInput adc_input;
+    uint32_t adc_ntc_channels, adc_ntc_room;
+    uint8_t charger_state;
+    uint16_t pmu_charger_edges;
+    bool pmu_charger_ac_on, pmu_charger_armed;
     bool gh_reg0724_set;
     uint32_t gh_reg0724;
     bool bt_peer;
@@ -2288,13 +2299,25 @@ static const MemoryRegionOps gpu_probe_ops = {
  * on PMU CS3/page0: CH_EN=0x1d, INT_EN=0x20, START=0x4f, raw status=0x50,
  * masked/W1C status=0x51, and samples=0x56+channel.
  */
-/* The original GPIO83 IRQ setup at 0x00228414 registers PMU service 5.
- * PMU register 0x41 bit14 enables its shared IRQ42; status/ACK is
- * register 0x5e, bit14 for press and bit15 for release. */
-static void pmu_key_update_irq(BesIspi *spi)
+/* GPIO83 keys and charger AC_ON edges share PMU IRQ42. Key enable/status use
+ * 0x41 bit14 and 0x5e bits14/15; charger enables are 0x05 bits11/12 and its
+ * AC_ON/rising/falling states are 0x5e bits2/3/4. Each source is acknowledged
+ * independently. AC_ON is exposed only after the guest arms its charger IRQ,
+ * so a host-selected charger does not trigger the power-off charging flow. */
+static void pmu_update_irq(BesIspi *spi)
 {
-    bool enabled = spi->analog[3][0][0x41] & 0x4000;
-    qemu_set_irq(spi->pmu_irq, enabled && (spi->key_pending & 0xc000));
+    Best1503State *s = spi->machine;
+    uint16_t charger_enable = spi->analog[3][0][0x05] >> 8 & 0x18;
+    s->pmu_charger_armed |= charger_enable != 0;
+    bool ac_on = s->charger_state && s->pmu_charger_armed;
+    if (ac_on != s->pmu_charger_ac_on) {
+        s->pmu_charger_ac_on = ac_on;
+        s->pmu_charger_edges |= ac_on ? 0x08 : 0x10;
+    }
+    bool key_irq = (spi->analog[3][0][0x41] & 0x4000) &&
+                   (spi->key_pending & 0xc000);
+    bool charger_irq = s->pmu_charger_edges & charger_enable;
+    qemu_set_irq(spi->pmu_irq, key_irq || charger_irq);
 }
 
 static void ispi_adc_update(BesIspi *spi)
@@ -2308,26 +2331,26 @@ static void ispi_adc_update(BesIspi *spi)
         return;
     }
     if (r[0x4f] & 0x20) {
-        /* Q65 /dev/batt_voltage opens channel 6 at 0x0cccba0e and
-         * /dev/temp_skin opens channel 3 at 0x0cccbac4. Channels 2 and 5
-         * retain the earlier fixture inputs. These are constant raw test
-         * inputs. The Q65 NTC table at 0x3c17b118 maps 600 mV to 25 C.
-         * The AP's default calibration maps 15968 to 800 mV and 20816
-         * to 1050 mV. Channel 6 uses 15968 for about 4.0 V after the
-         * board's 5.01 battery divider; channel 3 uses 12090 for 600 mV. */
-        for (unsigned channel = 0; channel < 7; channel++) {
+        /* P65 battery and skin-temperature inputs use channels 6 and 3.
+         * Channels 2 and 5 retain their fixture inputs. The AP's default
+         * calibration maps 15968 to 800 mV and 20816 to 1050 mV; its battery
+         * divider is 5.01. These are raw inputs, not host-computed percentages
+         * or temperatures. */
+        for (unsigned channel = 0; channel < BES_ADC_CHANNELS; channel++) {
             if ((r[0x1d] & (1u << channel)) &&
                 ((1u << channel) & 0x6c)) {
-                r[0x56 + channel] = channel == 3 ? 12090 :
-                                   channel == 6 ? 15968 : 21000;
+                qemu_mutex_lock(&spi->machine->adc_lock);
+                r[0x56 + channel] = bes_adc_sample(&spi->machine->adc_input,
+                    channel, &spi->adc_sampled_version[channel]);
+                qemu_mutex_unlock(&spi->machine->adc_lock);
                 sampled |= 1u << channel;
             }
         }
     }
+    spi->adc_converted |= sampled;
     spi->adc_pending |= sampled | (sampled ? 0x100 : 0);
     if ((r[0x4f] & 0x20) && (r[0x18] & 0x1000)) {
-        /* The current AP enables interval mode at 0x0cc31228 and writes
-         * 0x7a to 0x1c. Match the reference's 1024 ns period units. */
+        /* Interval mode uses the reference's 1024 ns period units. */
         int64_t period = MAX((int64_t)r[0x1c] * 1024, 1024);
         spi->adc_deadline += ((now - spi->adc_deadline) / period + 1) * period;
     } else {
@@ -2369,6 +2392,13 @@ static uint64_t ispi_read(void *opaque, hwaddr offset, unsigned size)
             return 0;
         }
         uint32_t value = spi->rx[spi->head];
+        int channel = spi->adc_channel[spi->head];
+        if (channel >= 0 && channel < BES_ADC_CHANNELS) {
+            qemu_mutex_lock(&spi->machine->adc_lock);
+            bes_adc_observe(&spi->machine->adc_input, channel,
+                            spi->adc_version[spi->head]);
+            qemu_mutex_unlock(&spi->machine->adc_lock);
+        }
         spi->head = (spi->head + 1) % 8;
         spi->count--;
         return value;
@@ -2391,12 +2421,16 @@ static void ispi_write(void *opaque, hwaddr offset, uint64_t value,
     unsigned reg = (cmd >> 16) & 255;
     uint16_t *cell = &spi->analog[cs][spi->page[cs]][reg];
     uint32_t response = 0;
+    int adc_channel = -1;
+    uint64_t adc_version = 0;
     bool pmu_adc = cs == 3 && !spi->page[cs];
     ispi_adc_update(spi);
     if (cmd & (1 << 24)) {
         uint16_t data = *cell;
         if (pmu_adc && reg == 0x5e) {
-            data = (data & ~0xc000) | spi->key_pending;
+            data = (data & ~0xc01c) | spi->key_pending |
+                   (spi->machine->pmu_charger_ac_on ? 4 : 0) |
+                   spi->machine->pmu_charger_edges;
         }
         if (spi->machine->power_adc_fixture && pmu_adc) {
             if (reg == 0x50) {
@@ -2404,6 +2438,10 @@ static void ispi_write(void *opaque, hwaddr offset, uint64_t value,
             } else if (reg == 0x51) {
                 data = spi->adc_pending & spi->analog[3][0][0x1f] &
                        spi->analog[3][0][0x20];
+            } else if (reg >= 0x56 && reg <= 0x5d &&
+                       (spi->adc_converted & (1u << (reg - 0x56)))) {
+                adc_channel = reg - 0x56;
+                adc_version = spi->adc_sampled_version[adc_channel];
             }
         }
         if (pmu_adc) {
@@ -2432,8 +2470,9 @@ static void ispi_write(void *opaque, hwaddr offset, uint64_t value,
         uint16_t data = cmd;
         if (pmu_adc && reg == 0x5e) {
             spi->key_pending &= ~(data & 0xc000);
-            *cell = data & ~0xc000;
-            pmu_key_update_irq(spi);
+            spi->machine->pmu_charger_edges &= ~(data & 0x18);
+            *cell = data & ~0xc01c;
+            pmu_update_irq(spi);
         } else if (spi->machine->power_adc_fixture && pmu_adc && reg == 0x51) {
             spi->adc_pending &= ~data;
         } else if (!(spi->machine->power_adc_fixture && pmu_adc &&
@@ -2444,8 +2483,8 @@ static void ispi_write(void *opaque, hwaddr offset, uint64_t value,
             spi->adc_deadline = (data & 0x20) ?
                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 125000 : 0;
         }
-        if (pmu_adc && reg == 0x41) {
-            pmu_key_update_irq(spi);
+        if (pmu_adc && (reg == 0x41 || reg == 0x05)) {
+            pmu_update_irq(spi);
         }
         if (pmu_adc) {
             ispi_adc_trace(spi, "write", reg, data);
@@ -2455,7 +2494,10 @@ static void ispi_write(void *opaque, hwaddr offset, uint64_t value,
      * transfers also produce RX data when RXCR.EN is zero (Q66 uses this).
      */
     if (spi->count < 8) {
-        spi->rx[(spi->head + spi->count) % 8] = response;
+        unsigned slot = (spi->head + spi->count) % 8;
+        spi->rx[slot] = response;
+        spi->adc_channel[slot] = adc_channel;
+        spi->adc_version[slot] = adc_version;
         spi->count++;
     }
 }
@@ -2912,7 +2954,7 @@ static void lower_button_input(Best1503State *s, bool down)
     value = (value & ~(1u << 31)) | (down ? 1u << 31 : 0);
     stl_le_p(iomux + 0x40, value);
     s->ispi.key_pending |= down ? 0x4000 : 0x8000;
-    pmu_key_update_irq(&s->ispi);
+    pmu_update_irq(&s->ispi);
     qemu_log_mask(LOG_GUEST_ERROR,
                   "BES lower button: down=%u GPIO83=%u PMU-pending=0x%04x "
                   "PMU-mask=0x%04x time-ns=%" PRId64 "\n",
@@ -4521,9 +4563,12 @@ static void best1503_peripheral_reset(void *opaque)
     s->ispi.head = s->ispi.count = 0;
     s->ispi.logged_reads = 0;
     s->ispi.logged_adc = 0;
-    s->ispi.adc_pending = 0;
+    s->ispi.adc_pending = s->ispi.adc_converted = 0;
+    memset(s->ispi.adc_sampled_version, 0, sizeof(s->ispi.adc_sampled_version));
     s->ispi.key_pending = 0;
-    pmu_key_update_irq(&s->ispi);
+    s->pmu_charger_edges = 0;
+    s->pmu_charger_ac_on = s->pmu_charger_armed = false;
+    pmu_update_irq(&s->ispi);
     s->ispi.adc_deadline = 0;
     memset(s->spi0.regs, 0, sizeof(s->spi0.regs));
     gh_reset(&s->spi0);
@@ -5601,6 +5646,139 @@ static void best1503_set_power_adc_fixture(Object *obj, bool value, Error **errp
     ((Best1503State *)obj)->power_adc_fixture = value;
 }
 
+static void best1503_apply_adc_ntc(Best1503State *s)
+{
+    qemu_mutex_lock(&s->adc_lock);
+    for (unsigned i = 0; i < BES_ADC_CHANNELS; i++) {
+        if (s->adc_ntc_channels & (1u << i)) {
+            s->adc_input.values[i] = s->adc_ntc_room;
+        }
+    }
+    qemu_mutex_unlock(&s->adc_lock);
+}
+
+static void best1503_get_adc_ntc(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    uint32_t value = ((Best1503State *)obj)->adc_ntc_channels;
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void best1503_set_adc_ntc(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    uint32_t value;
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value >> BES_ADC_CHANNELS) {
+        error_setg(errp, "pmu-adc-ntc is a mask of channels 0..7");
+        return;
+    }
+    s->adc_ntc_channels = value;
+    best1503_apply_adc_ntc(s);
+}
+
+static void best1503_get_adc_ntc_room(Object *obj, Visitor *v, const char *name,
+                                      void *opaque, Error **errp)
+{
+    uint32_t value = ((Best1503State *)obj)->adc_ntc_room;
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void best1503_set_adc_ntc_room(Object *obj, Visitor *v, const char *name,
+                                      void *opaque, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    uint32_t value;
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value > 0xffff) {
+        error_setg(errp, "pmu-adc-ntc-room is a raw ADC word 0..65535");
+        return;
+    }
+    s->adc_ntc_room = value;
+    best1503_apply_adc_ntc(s);
+}
+
+static void best1503_set_adc_raw(Object *obj, const char *value, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    uint16_t next[BES_ADC_CHANNELS];
+    if (!s->power_adc_fixture) {
+        error_setg(errp, "pmu.adcRaw requires power-adc-fixture");
+        return;
+    }
+    if (!bes_adc_parse(value, next)) {
+        error_setg(errp, "pmu.adcRaw requires eight decimal values in 0..65535");
+        return;
+    }
+    qemu_mutex_lock(&s->adc_lock);
+    bool applied = bes_adc_replace(&s->adc_input, next);
+    qemu_mutex_unlock(&s->adc_lock);
+    if (!applied) {
+        error_setg(errp, "pmu.adcRaw version exhausted");
+    }
+}
+
+static char *best1503_get_adc_state(Object *obj, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    BesAdcInput snapshot;
+    qemu_mutex_lock(&s->adc_lock);
+    snapshot = s->adc_input;
+    qemu_mutex_unlock(&s->adc_lock);
+    GString *result = g_string_new(NULL);
+    g_string_append_printf(result,
+        "{\"schema\":1,\"fixtureEnabled\":%s,\"version\":%" PRIu64,
+        s->power_adc_fixture ? "true" : "false", snapshot.version);
+    g_string_append(result, ",\"values\":[");
+    for (unsigned i = 0; i < BES_ADC_CHANNELS; i++) {
+        g_string_append_printf(result, "%s%u", i ? "," : "", snapshot.values[i]);
+    }
+    g_string_append(result, "],\"readCount\":[");
+    for (unsigned i = 0; i < BES_ADC_CHANNELS; i++) {
+        g_string_append_printf(result, "%s%" PRIu64, i ? "," : "", snapshot.reads[i]);
+    }
+    g_string_append(result, "],\"lastReadVersion\":[");
+    for (unsigned i = 0; i < BES_ADC_CHANNELS; i++) {
+        g_string_append_printf(result, "%s%" PRIu64, i ? "," : "",
+                               snapshot.last_read_version[i]);
+    }
+    g_string_append(result, "]}");
+    return g_string_free(result, false);
+}
+
+static char *best1503_get_battery_charger(Object *obj, Error **errp)
+{
+    static const char *names[] = { "unplugged", "charging", "full" };
+    return g_strdup(names[MIN(((Best1503State *)obj)->charger_state, 2)]);
+}
+
+static void best1503_set_battery_charger(Object *obj, const char *value, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    if (!strcmp(value, "unplugged")) { s->charger_state = 0; }
+    else if (!strcmp(value, "charging")) { s->charger_state = 1; }
+    else if (!strcmp(value, "full")) { s->charger_state = 2; }
+    else { error_setg(errp, "battery-charger must be unplugged, charging or full"); return; }
+    pmu_update_irq(&s->ispi);
+}
+
+static char *best1503_get_battery_gauge(Object *obj, Error **errp)
+{
+    return g_strdup("soft");
+}
+
+static void best1503_set_battery_gauge(Object *obj, const char *value, Error **errp)
+{
+    if (strcmp(value, "soft")) {
+        error_setg(errp, "P65 battery-gauge must be soft");
+    }
+}
+
 static void best1503_set_touch(Object *obj, bool value, Error **errp)
 {
     ((Best1503State *)obj)->touch.enabled = value;
@@ -5817,6 +5995,16 @@ static void best1503_finalize(Object *obj)
     g_free(l->frame_file);
 }
 
+static void best1503_instance_init(Object *obj)
+{
+    Best1503State *s = (Best1503State *)obj;
+    qemu_mutex_init(&s->adc_lock);
+    bes_adc_init(&s->adc_input);
+    s->adc_input.values[3] = 12090;
+    s->adc_input.values[6] = 15968;
+    s->adc_ntc_room = 12090;
+}
+
 static void best1503_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -5858,7 +6046,27 @@ static void best1503_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "power-adc-fixture",
         best1503_get_power_adc_fixture, best1503_set_power_adc_fixture);
     object_class_property_set_description(oc, "power-adc-fixture",
-        "Constant raw ADC test inputs; P65 battery and skin temperature channels");
+        "Adjustable raw ADC inputs for enabled P65 PMU channels 0..7");
+    object_class_property_add_str(oc, "pmu-adc-raw", NULL, best1503_set_adc_raw);
+    object_class_property_set_description(oc, "pmu-adc-raw",
+        "Atomically replace eight raw ADC words; dedicated runner input only");
+    object_class_property_add_str(oc, "pmu-adc-state", best1503_get_adc_state, NULL);
+    object_class_property_add(oc, "pmu-adc-ntc", "uint32",
+        best1503_get_adc_ntc, best1503_set_adc_ntc, NULL, NULL);
+    object_class_property_set_description(oc, "pmu-adc-ntc",
+        "Bit mask of raw ADC channels with room-temperature inputs");
+    object_class_property_add(oc, "pmu-adc-ntc-room", "uint32",
+        best1503_get_adc_ntc_room, best1503_set_adc_ntc_room, NULL, NULL);
+    object_class_property_set_description(oc, "pmu-adc-ntc-room",
+        "P65 room-temperature raw ADC input (default 12090; not a converted temperature)");
+    object_class_property_add_str(oc, "battery-charger", best1503_get_battery_charger,
+                                  best1503_set_battery_charger);
+    object_class_property_set_description(oc, "battery-charger",
+        "PMU AC_ON input: unplugged, charging or full; adjustable while running");
+    object_class_property_add_str(oc, "battery-gauge", best1503_get_battery_gauge,
+                                  best1503_set_battery_gauge);
+    object_class_property_set_description(oc, "battery-gauge",
+        "P65 firmware fuel gauge; soft is the only supported value");
     object_class_property_set_description(oc, "touch", "CST9217 I2C5 reports and GPIO76 IRQ from absolute pointer input");
     object_class_property_add_bool(oc, "gpu-software-renderer",
         best1503_get_gpu_software_renderer, best1503_set_gpu_software_renderer);
@@ -5927,6 +6135,7 @@ static const TypeInfo azki_p65_type = {
     .name = MACHINE_TYPE_NAME("azki-p65"),
     .parent = TYPE_MACHINE,
     .instance_size = sizeof(Best1503State),
+    .instance_init = best1503_instance_init,
     .instance_finalize = best1503_finalize,
     .class_init = best1503_class_init,
 };

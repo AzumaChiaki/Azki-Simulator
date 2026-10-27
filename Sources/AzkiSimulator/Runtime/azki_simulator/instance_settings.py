@@ -34,7 +34,7 @@ MAX_VALUE = 1024
 MAX_OFFSET = 100 * 366 * 86400
 MAX_SAMPLE = 65535
 CHARGERS = ("auto", "unplugged", "charging", "full")
-GAUGES = ("auto", "hp4560", "hp4570")
+GAUGES = ("auto", "hp4560", "hp4570", "soft")
 MAX_STEPS = 10_000_000
 MAX_HEART_RATE = 255
 RESTING_HEART_RATE = 72  # pulse of a worn band without a saved value
@@ -77,7 +77,7 @@ def _battery(value):
         resolved["charger"] = charger
     gauge = value.get("gauge", "auto")
     if gauge not in GAUGES:
-        raise SettingsError("电量计型号只能是 auto、hp4560 或 hp4570")
+        raise SettingsError("电量计型号只能是 auto、hp4560、hp4570 或 soft")
     if gauge != "auto":
         resolved["gauge"] = gauge
     return resolved

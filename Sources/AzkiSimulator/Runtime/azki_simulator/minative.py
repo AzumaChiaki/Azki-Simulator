@@ -291,9 +291,11 @@ def _geometry(model):
 # BESPOWER manager reads it on channel 4 (x4.9; N67 .187 0x0c0e2f00, P67 .043
 # 0x0c3dbf48), where channels 2 and 5 are its shell/skin thermistors.
 BATTERY_ADC_CHANNEL = 2
-BATTERY_ADC_CHANNELS = {"miwear.watch.n67": 4, "miwear.watch.p67": 4}
+BATTERY_ADC_CHANNELS = {"miwear.watch.n67": 4, "miwear.watch.p67": 4,
+                        "miwear.watch.p65": 6}
 BATTERY_GAUGES = {"hp4560": ("miwear.watch.n66", "miwear.watch.n67", "miwear.watch.o66"),
-                  "hp4570": ("miwear.watch.p67", "miwear.watch.q66")}
+                  "hp4570": ("miwear.watch.p67", "miwear.watch.q66"),
+                  "soft": ("miwear.watch.p65",)}
 
 
 def board_hardware(model):
@@ -467,6 +469,9 @@ BATTERY_INPUTS = {
     "miwear.watch.q66": {"ocvMillivolts": BAND11_OCV_MV, "adcSlope": 0.051538,
                          "adcOffset": -23.3, "divider": 7.0, "uiScale": 1.055,
                          "charger": True},
+    # P65 exposes raw channel 6 and PMU AC_ON. Its percentage conversion stays
+    # hidden until the soft gauge's own OCV table and UI result are calibrated.
+    "miwear.watch.p65": {"charger": True},
 }
 
 
@@ -751,9 +756,13 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
     profile = rows[profile_id]
     expected_chip = "best1502p" if profile["model"] in ("miwear.watch.p65", "miwear.watch.q65") else "best1503"
     if expected_chip == "best1502p":
-        # Q65 has independent AP-derived storage, but no band ADC ABI.
+        # P65 implements the pinned ADC ABI; Q65 has independent storage but
+        # must continue to reject band ADC/live hardware inputs.
+        allowed = ("nandPersistence", "norPersistence", "virtualPeer")
+        if profile["model"] == "miwear.watch.p65":
+            allowed += ("pmuAdcRaw",)
         runtime_capabilities = {key: value for key, value in runtime_capabilities.items()
-                                if key in ("nandPersistence", "norPersistence", "virtualPeer")}
+                                if key in allowed}
     declarations[str(_path(profile["ap_path"]))] = (profile["ap"]["sha256"], "catalog")
     if profile.get("ota_path"):
         declarations[str(_path(profile["ota_path"]))] = (profile.get("ota_sha256"), "catalog")

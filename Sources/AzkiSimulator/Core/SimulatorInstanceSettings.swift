@@ -12,7 +12,7 @@ nonisolated struct InstanceFirmwareSettings: Codable, Equatable, Sendable {
     /// Board inputs of the instance's hardware preset. The preset decides which
     /// devices exist, so only options the emulated board has are offered.
     enum Charger: String, Codable, Sendable { case auto, unplugged, charging, full }
-    enum Gauge: String, Codable, Sendable { case auto, hp4560, hp4570 }
+    enum Gauge: String, Codable, Sendable { case auto, hp4560, hp4570, soft }
     struct Battery: Codable, Equatable, Sendable {
         /// Boot level in percent; the helper turns it into the firmware's own
         /// saved state of charge and battery voltage sample.

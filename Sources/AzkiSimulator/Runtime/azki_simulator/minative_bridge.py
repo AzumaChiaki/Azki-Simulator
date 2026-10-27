@@ -186,7 +186,7 @@ class MinativeSessionBridge(SessionBridge):
         return set_raw(self.adapter, arguments)
 
     def live_get(self, arguments):
-        if supports_buttons(self.plan):
+        if self.plan["identity"]["profile"]["model"] == "miwear.watch.q65":
             if arguments:
                 raise MError("invalid_live", "live-get takes no arguments")
             return {"supported": {key: False for key in

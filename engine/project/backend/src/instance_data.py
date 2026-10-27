@@ -277,7 +277,7 @@ def load_instance_settings(path, storage):
 # runner only formats them into core properties; it never decides which model
 # has which device, so no firmware or version knowledge lives here.
 SETTINGS_CHARGERS = ('unplugged', 'charging', 'full')
-SETTINGS_GAUGES = ('hp4560', 'hp4570')
+SETTINGS_GAUGES = ('hp4560', 'hp4570', 'soft')
 
 
 def validate_board_settings(value):

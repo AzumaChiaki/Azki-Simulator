@@ -669,10 +669,10 @@ def main():
                 machine += f',revision-id={value}'
             elif value:
                 machine += ',' + name.replace('_', '-') + '=on'
-        if instance_settings is not None and not isolated_p65:
-            # Host-authored board inputs resolved against this instance's
-            # hardware preset; a rejected value stops the boot instead of
-            # silently running with a different device.
+        if instance_settings is not None:
+            # P65 accepts only its resolved battery/ADC options. Its preset
+            # does not resolve NAND data, RTC or health-sensor settings.
+            # A rejected value stops boot instead of silently changing inputs.
             try:
                 for option in instance_settings_options(instance_settings, adc_fixture=args.power_adc_fixture,
                                                         ntc_channels=geometry.get('pmu-adc-ntc', 0),
@@ -750,19 +750,17 @@ def main():
                             raise RuntimeError('GDB server port could not be determined')
                         print(f"GDB server: target remote 127.0.0.1:{gdb_endpoint['port']}"
                               + ('; CPU held at reset until the debugger continues.' if args.gdb_wait else ''), flush=True)
-                    # best1502p machines (azki-p65) have no band ADC ABI: the
-                    # parent strips the pmuAdcRaw capability from their plan
-                    # and its control validator rejects a hardware_inputs
-                    # record, so only best1503 runners publish one.
+                    # Publish ADC only after the running core proves its schema.
+                    # P65 and generic BEST1503 share the narrow ADC/live ABI;
+                    # Q65 uses a separate runner and never reaches this record.
                     control_record = dict(
                         qmp=str(qmp_path), framebuffer=str(frame_file), pid=proc.pid,
                         input_socket=str(input_socket) if has_input else None)
-                    if not isolated_p65:
-                        control_record['hardware_inputs'] = {'pmu.adcRaw': {
-                            'supported': adc_raw, 'schema': 1, 'channels': 8,
-                            'minimum': 0, 'maximum': 65535,
-                            'unit': 'uncalibrated-raw',
-                            'readEvidence': 'guest-ispi-fifo-dequeue'}}
+                    control_record['hardware_inputs'] = {'pmu.adcRaw': {
+                        'supported': adc_raw, 'schema': 1, 'channels': 8,
+                        'minimum': 0, 'maximum': 65535,
+                        'unit': 'uncalibrated-raw',
+                        'readEvidence': 'guest-ispi-fifo-dequeue'}}
                     if virtual_peer is not None:
                         control_record['virtual_peer'] = virtual_peer.descriptor()
                     if gdb_endpoint is not None:
@@ -778,12 +776,11 @@ def main():
                         native_window = NativeWindow(control)
                         native_window.start()
                         print('Python window started (direct QEMU LCD; 30 FPS refresh).', flush=True)
-                    # azki-p65 does not expose the generic battery-charger
-                    # QOM property used by BEST1503 sessions. Keep settings
-                    # for host bookkeeping, but never issue unsupported QMP
-                    # writes to the isolated P65 core.
+                    # Apply a saved charger only after the guest's power-on
+                    # charger check; P65 PMU AC_ON and generic chargers use
+                    # the same delayed runtime path.
                     runtime_settings = (instance_settings_runtime(instance_settings)
-                                        if instance_settings is not None and not isolated_p65 else [])
+                                        if instance_settings is not None else [])
                     # Guest-progress seconds: wall time minus time the CPU was
                     # held by a debugger (or -S). Without --gdb this is wall time.
                     halted_total, halted_since, state_check_due = 0.0, None, 0
