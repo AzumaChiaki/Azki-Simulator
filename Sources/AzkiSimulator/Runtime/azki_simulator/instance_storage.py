@@ -11,7 +11,9 @@ Synthetic virtual identity/authentication state is a separate revision object.
 No imported factory/authkey, AP or resource image is accepted by this API.
 """
 from __future__ import annotations
+import ctypes
 from dataclasses import asdict, dataclass
+import errno
 import fcntl
 import hashlib
 import json
@@ -370,7 +372,178 @@ def _blank(path, size):
             amount = min(size, len(chunk)); f.write(chunk[:amount]); size -= amount
 
 
+# APFS can share every unchanged block between a snapshot, its successor and
+# the private session copy. The old implementation wrote a complete new file
+# for each of those steps, so one 384 MiB NAND image became 4-8 physically
+# distinct 384 MiB files per instance. clonefile(2) is the same primitive APFS
+# uses for `cp -c`; both paths remain ordinary read/write files and copy-on-write
+# separate them on the first changed block.
+try:
+    _libc = ctypes.CDLL(None, use_errno=True)
+    _clonefile = _libc.clonefile
+    _clonefile.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int)
+    _clonefile.restype = ctypes.c_int
+except (AttributeError, OSError):
+    _clonefile = None
+
+# Support is a property of the volume, not of each file. Probe the destination
+# volume once with a 4 KiB file so a non-APFS library never pays for a useless
+# 384 MiB "template" that then falls back to a byte copy.
+_CLONE_SUPPORT = {}
+_ERASED_SHA256 = {}
+
+
+def _storage_folder(library_root):
+    """Owner-only app-managed folder for shared storage metadata."""
+    root = Path(library_root)
+    folder = root / ".storage"
+    try:
+        folder.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    _private(folder, directory=True)
+    return folder
+
+
+def clonefile_supported(library_root):
+    """True when this volume can clone files; cached by directory identity."""
+    if _clonefile is None:
+        return False
+    folder = _storage_folder(library_root)
+    info = folder.stat()
+    key = (info.st_dev, info.st_ino)
+    if key in _CLONE_SUPPORT:
+        return _CLONE_SUPPORT[key]
+    probe = folder / ("probe-" + uuid.uuid4().hex)
+    clone = folder / ("clone-" + uuid.uuid4().hex)
+    ok = False
+    try:
+        _blank(probe, 4096)
+        ok = _clone_file(probe, clone)
+    except (OSError, ValueError):
+        ok = False
+    finally:
+        for path in (probe, clone):
+            try: path.unlink()
+            except OSError: pass
+    _CLONE_SUPPORT[key] = ok
+    return ok
+
+
+def _clone_file(source, target):
+    """Create target as an APFS clone of source; False when unsupported.
+
+    The source and both parent directories are validated with lstat before the
+    syscall. clonefile is atomic: on failure no partial target is published.
+    """
+    if _clonefile is None:
+        return False
+    source, target = Path(source), Path(target)
+    _private(source)
+    _private(target.parent, directory=True)
+    if os.path.lexists(target):
+        raise FileExistsError(errno.EEXIST, "clone target exists", str(target))
+    if _clonefile(os.fsencode(source), os.fsencode(target), 0) != 0:
+        # ENOTSUP/EXDEV/EINVAL/EPERM: the caller has a byte-copy fallback.
+        return False
+    try:
+        os.chmod(target, 0o600)
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try: os.fsync(fd)
+        finally: os.close(fd)
+    except BaseException:
+        try: target.unlink()
+        except OSError: pass
+        raise
+    return True
+
+
+def _erased_sample_ok(path, size):
+    """A cheap sanity check that a shared blank template is still erased."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        if os.fstat(fd).st_size != size:
+            return False
+        for offset in {0, max(0, size // 2), max(0, size - 65536)}:
+            length = min(65536, size - offset)
+            if os.pread(fd, length, offset) != b"\xff" * length:
+                return False
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def erased_template(library_root, size):
+    """The one physically-erased 0xFF image shared by all blank snapshots."""
+    folder = _storage_folder(library_root) / "erased"
+    try:
+        folder.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    _private(folder, directory=True)
+    path = folder / ("%d.bin" % size)
+    if path.exists() and _erased_sample_ok(path, size):
+        _private(path, size=size)
+        return path
+    temporary = folder / (".tmp-" + uuid.uuid4().hex)
+    try:
+        _blank(temporary, size)
+        os.replace(temporary, path)
+        _sync_dir(folder)
+    finally:
+        try: temporary.unlink()
+        except OSError: pass
+    _private(path, size=size)
+    return path
+
+
+def _blank_shared(library_root, target, size):
+    """Create a blank 0xFF image, sharing one template per size when possible.
+
+    Returns the origin label recorded in revision.json. A byte copy is still
+    correct on a non-APFS volume; it is only slower and larger.
+    """
+    if clonefile_supported(library_root):
+        try:
+            template = erased_template(library_root, size)
+            if _clone_file(template, target):
+                return "shared-erased-template"
+        except (OSError, ValueError):
+            try: target.unlink()
+            except OSError: pass
+    _blank(target, size)
+    return "blank-erased-nand"
+
+
+def erased_sha256(size):
+    """SHA-256 of a completely erased image of this geometry (cached)."""
+    if size in _ERASED_SHA256:
+        return _ERASED_SHA256[size]
+    digest = hashlib.sha256()
+    chunk = b"\xff" * (1024 * 1024)
+    remaining = size
+    while remaining:
+        amount = min(remaining, len(chunk))
+        digest.update(chunk[:amount])
+        remaining -= amount
+    _ERASED_SHA256[size] = digest.hexdigest()
+    return _ERASED_SHA256[size]
+
+
 def _copy(source, target, *, erased_prefix=0, preserved_prefix=0):
+    if not erased_prefix and not preserved_prefix:
+        try:
+            if _clone_file(source, target):
+                return
+        except (OSError, ValueError):
+            # Validated, unsupported or racing: the byte-copy path below
+            # repeats every safety check and remains the authority.
+            pass
     source_fd, before = _open_file(source, MAX_DATA)
     directory = _directory_fd(target.parent, private=True)
     target_fd = None
@@ -667,6 +840,8 @@ class InstanceStorage:
         _atomic_json(self.root / "pending.json", marker)
         self.active = folder
         try:
+            # <library>/instances/<uuid>/storage -> <library>
+            library_root = self.root.parents[2]
             data, spare = folder / "nand-data.bin", folder / "nand-spare.bin"
             if carry:
                 _copy(old[0] / data.name, data); _copy(old[0] / spare.name, spare)
@@ -675,7 +850,7 @@ class InstanceStorage:
                 origin = "accepted-instance-revision"
             else:
                 if synthetic_seed is None:
-                    _blank(data, firmware.data_bytes); origin = "blank-erased-nand"
+                    origin = _blank_shared(library_root, data, firmware.data_bytes)
                 else:
                     # Only the host's independently verified synthetic UI seed
                     # may be passed here. Never accept factory/identity dumps.
@@ -685,13 +860,13 @@ class InstanceStorage:
                     if sha != synthetic_seed_sha256:
                         raise ValueError("Synthetic seed hash mismatch")
                     _copy(synthetic_seed, data); origin = "host-verified-synthetic-ui-seed"
-                _blank(spare, firmware.data_bytes // 2048 * 64)
+                _blank_shared(library_root, spare, firmware.data_bytes // 2048 * 64)
             if firmware.nor_bytes:
                 if nor_carry:
                     _copy(nor_source, folder / "nor-config.bin",
                           erased_prefix=nor_prefix, preserved_prefix=firmware.nor_config_bytes)
                 else:
-                    _blank(folder / "nor-config.bin", firmware.nor_bytes)
+                    _blank_shared(library_root, folder / "nor-config.bin", firmware.nor_bytes)
             dormant_kept = False
             if dormant and not firmware.nor_bytes:
                 _copy(dormant["file"], folder / "nor-config.dormant.bin")
@@ -1491,22 +1666,38 @@ def finish_session_storage(library_root, session_root, instance_id):
             raise ValueError("此实例的未完成运行记录属于另一次会话；请重置该实例后再启动，已保存的数据不受影响")
         store.active = store.root / "revisions" / pending["revision"]
         if healthy:
-            for source_fd, (name, _, _, _) in zip(held, firmware.images):
+            for source_fd, (name, _, _, role) in zip(held, firmware.images):
                 target = store.active / (".accepted-" + uuid.uuid4().hex + "-" + name)
-                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                cloned = False
                 try:
-                    offset = 0
-                    while chunk := os.pread(source_fd, 1024 * 1024, offset):
-                        view = memoryview(chunk)
-                        while view:
-                            amount = os.write(fd, view)
-                            if amount <= 0: raise OSError("Short instance image write")
-                            view = view[amount:]
-                        offset += len(chunk)
-                    os.fsync(fd)
+                    source = Path(binding[role])
+                    opened, at_path = os.fstat(source_fd), os.lstat(source)
+                    if (opened.st_dev, opened.st_ino) != (at_path.st_dev, at_path.st_ino):
+                        raise ValueError("Session image path changed before commit")
+                    cloned = _clone_file(source, target)
+                except (OSError, ValueError):
+                    cloned = False
+                if not cloned:
+                    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    try:
+                        offset = 0
+                        while chunk := os.pread(source_fd, 1024 * 1024, offset):
+                            view = memoryview(chunk)
+                            while view:
+                                amount = os.write(fd, view)
+                                if amount <= 0: raise OSError("Short instance image write")
+                                view = view[amount:]
+                            offset += len(chunk)
+                        os.fsync(fd)
+                    except BaseException:
+                        os.close(fd)
+                        try: target.unlink()
+                        except OSError: pass
+                        raise
+                    os.close(fd)
+                try:
                     os.replace(target, store.active / name)
                 finally:
-                    os.close(fd)
                     if target.exists(): target.unlink()
             if virtual_raw is not None:
                 target = store.active / (".accepted-" + uuid.uuid4().hex + "-" + VIRTUAL_STATE)

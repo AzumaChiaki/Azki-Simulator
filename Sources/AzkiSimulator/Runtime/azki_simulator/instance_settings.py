@@ -283,22 +283,42 @@ def discard(library_root, instance_id):
     another user abort the removal instead of being deleted.
     """
     from .instance_storage import _uuid
+    from .maintenance import remove_instance_sessions
     identifier = _uuid(instance_id)
     container = _path(library_root) / "instances"
     root = container / identifier
+    entries = 0
+    removed = False
     try:
         info = os.lstat(root)
     except FileNotFoundError:
-        return {"ok": True, "version": 1, "instanceID": identifier, "removed": False, "entries": 0}
-    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
-        raise SettingsError("实例数据目录不是本用户的普通目录，已停止删除")
-    entries = _remove_tree(root)
+        info = None
+    if info is not None:
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+            raise SettingsError("实例数据目录不是本用户的普通目录，已停止删除")
+        entries = _remove_tree(root)
+        removed = True
+        try:
+            if not any(True for _ in os.scandir(container)):
+                os.rmdir(container)
+        except OSError:
+            pass
+    # The working image pair lives in a temporary session, outside the library
+    # folder. Deleting only instances/<uuid> used to leave those 396 MiB copies
+    # behind until a later launch cleanup; remove every session that names this
+    # deleted instance, while keeping any session still running.
     try:
-        if not any(True for _ in os.scandir(container)):
-            os.rmdir(container)
-    except OSError:
-        pass
-    return {"ok": True, "version": 1, "instanceID": identifier, "removed": True, "entries": entries}
+        sessions = remove_instance_sessions(identifier)
+    except (OSError, ValueError) as error:
+        # The instance folder is already gone; report the session cleanup
+        # problem without pretending the whole deletion failed.
+        sessions = {"removed": [], "kept": [], "error": str(error)[:240]}
+    result = {"ok": True, "version": 1, "instanceID": identifier, "removed": removed,
+              "entries": entries, "sessionsRemoved": sessions["removed"],
+              "sessionsKept": sessions["kept"]}
+    if sessions.get("error"):
+        result["sessionsError"] = sessions["error"]
+    return result
 
 
 def resolve(settings, model):

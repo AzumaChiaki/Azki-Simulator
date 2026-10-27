@@ -9,6 +9,7 @@ A standalone wearable-device simulator for Apple Silicon Macs. Its native SwiftU
 - Create, name and manage independent instances, with multiple device displays.
 - Mouse-based touch input, live logs, screenshots and recordings saved to the Desktop.
 - Start, stop, cold restart and persistent instance storage, with unlimited sessions by default.
+- Storage management: APFS copy-on-write snapshots, a shared erased-NAND template, automatic deduplication and session cleanup, with per-instance space accounting. Open it from the toolbar, the Storage menu, or Settings → Storage; see [storage notes](docs/STORAGE.md).
 - Install quick apps and watchfaces; configure synthetic serial numbers, virtual Bluetooth addresses and initial setup options.
 - Edit raw PMU ADC inputs. Confirmed purposes are labelled; uncalibrated values do not imply physical units.
 
@@ -52,7 +53,7 @@ Full Xcode with Swift 6.2 or later is required. Every build outputs final artifa
 | `engine/qemu-overlay` | Device implementation and customized files for QEMU 10.1.0 |
 | `engine/third-party` | Third-party helper sources needed for the build |
 | `Assets` | Application icons |
-| `scripts` | Engine, application and DMG build scripts |
+| `scripts` | Engine, application and DMG build scripts, plus external-library storage audit/dedupe |
 | `.github/workflows` | GitHub Actions build workflow |
 | `docs` | Chinese and English build documentation |
 

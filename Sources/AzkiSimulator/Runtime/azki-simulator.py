@@ -14,7 +14,8 @@ from azki_simulator.bridge import SessionBridge, create_session, request, privat
 
 
 BUNDLED_ACTIONS = ("library-catalog", "library-import", "library-delete", "library-delete-all", "library-probe", "prepare-bundled", "instance-storage-finish",
-                   "instance-identity", "instance-settings", "instance-parameters", "instance-delete", "instance-reset", "sessions-cleanup")
+                   "instance-identity", "instance-settings", "instance-parameters", "instance-delete", "instance-reset", "sessions-cleanup",
+                   "storage-report", "storage-maintain")
 ACTION_FAILURES = {
     "library-catalog": "读取固件库失败，请稍后重试",
     "library-import": "导入固件失败，请确认所选文件是完整的 OTA 固件包后重试",
@@ -29,6 +30,8 @@ ACTION_FAILURES = {
     "instance-delete": "删除实例数据失败",
     "instance-reset": "整理实例数据失败；已保存的数据未被删除",
     "sessions-cleanup": "清理临时会话失败",
+    "storage-report": "读取存储占用失败",
+    "storage-maintain": "整理存储失败；已保存的数据未被删除",
 }
 
 
@@ -74,6 +77,13 @@ def main():
         if action == "instance-storage-finish":
             library.add_argument("--session", type=Path, required=True)
             library.add_argument("--instance-id", required=True)
+        if action == "storage-maintain":
+            library.add_argument("--keep", type=int, default=4,
+                                 help="Committed snapshots to keep on each HEAD chain")
+            library.add_argument("--instance-id")
+            library.add_argument("--auto", action="store_true",
+                                 help="Deduplicate, share erased images and clean sessions without pruning")
+            library.add_argument("--dry-run", action="store_true")
     commands.add_parser("discover", help="List unconnected same-user session candidates; never auto-connect")
     power = commands.add_parser("power", help="Bounded core shutdown/cold restart/switch; never live reload")
     power.add_argument("session", type=Path)
@@ -195,6 +205,17 @@ def failure(action, error):
 
 
 def bundled_action(args):
+    if args.action == "storage-report":
+        from azki_simulator.storage_maintenance import report
+        return report(args.library_root)
+    if args.action == "storage-maintain":
+        from azki_simulator.instance_storage import MAX_REVISIONS
+        from azki_simulator.storage_maintenance import maintain
+        keep = MAX_REVISIONS if getattr(args, "auto", False) else getattr(args, "keep", 4)
+        return maintain(args.library_root, keep=keep, prune=not getattr(args, "auto", False),
+                        dedupe=True, clean_sessions=True,
+                        dry_run=getattr(args, "dry_run", False),
+                        instance_id=getattr(args, "instance_id", None))
     if args.action == "instance-reset":
         from azki_simulator.maintenance import reset_instance
         return reset_instance(args.library_root, args.instance_id)

@@ -605,3 +605,60 @@ def cleanup_sessions(library_root=None, tmp_root=TMP_ROOT, *, now=None):
             continue
         result["removed"].append(path)
     return result
+
+
+def remove_instance_sessions(instance_id, tmp_root=TMP_ROOT):
+    """Remove this app's session roots that still hold one deleted instance.
+
+    The instance record and its library folder are already gone when this runs.
+    A running session is always kept. A recent unknown session is kept because
+    it may still be preparing; an older one cannot be reset and would otherwise
+    leak its working images forever. Removal remains bounded to this user's own
+    azki-b-/azki-sim- roots.
+    """
+    try:
+        from .instance_storage import _uuid
+        identifier = _uuid(instance_id)
+    except (ValueError, TypeError, AttributeError) as error:
+        raise MaintenanceError("invalid_instance", "实例 ID 无效，应为小写 UUID") from error
+    tmp_root = _path(tmp_root)
+    result = {"ok": True, "version": 1, "removed": [], "kept": [], "reasons": {}}
+    try:
+        names = sorted(os.listdir(tmp_root))
+    except OSError as error:
+        raise MaintenanceError("tmp_unavailable", "无法读取临时目录 " + str(tmp_root) + "：" + error.strerror) from error
+    for name in names:
+        if not name.startswith(("azki-b-", "azki-sim-")) or "/" in name:
+            continue
+        path = tmp_root / name
+        try:
+            info = os.lstat(path)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            continue
+        session = path / "session"
+        binding = _read_json(session / "instance-storage.json")
+        if not isinstance(binding, dict) or binding.get("instanceID") != identifier:
+            continue
+        state, newest = session_state(path)
+        if state == "running":
+            result["kept"].append(str(path)); result["reasons"][str(path)] = "running"
+            continue
+        if (state == "unknown" and not (session / "instance-storage-result.json").exists()
+                and time.time() - newest < GRACE_SECONDS):
+            # A just-prepared session may not have written its first process
+            # record yet. Older unknown roots cannot be reset: the instance is
+            # gone, so keeping them would leak their working images forever.
+            result["kept"].append(str(path)); result["reasons"][str(path)] = "recent-unknown-session"
+            continue
+        try:
+            remove_tree(str(tmp_root), name)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            result["kept"].append(str(path))
+            result["reasons"][str(path)] = "remove-failed: " + (error.strerror or str(error))[:160]
+            continue
+        result["removed"].append(str(path))
+    return result
