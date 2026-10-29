@@ -229,6 +229,30 @@ def pypi_artifact_urls(url):
     return [host + path for host in PYPI_ARTIFACT_HOSTS]
 
 
+def _normalize_distribution(name):
+    """PEP 503 distribution name: runs of -_. collapse to a single -."""
+    return re.sub(r'[-_.]+', '-', name).lower()
+
+
+def find_cached_wheel(wheels, package, version):
+    """Locate a cached wheel for exactly this distribution and version.
+
+    Wheel files spell the distribution with underscores (littlefs_python) while
+    PyPI metadata spells it with dashes (littlefs-python), so the two are
+    compared through the normalized form instead of a raw prefix test. The
+    version is compared exactly: a substring test would also match a wheel
+    built for 0.19.0 when 0.19.10 was requested.
+    """
+    wanted=_normalize_distribution(package)
+    for path in sorted(wheels.glob('*.whl')):
+        parts=path.name[:-len('.whl')].split('-')
+        if len(parts)<5: continue
+        if _normalize_distribution(parts[0])!=wanted: continue
+        if parts[1]!=version: continue
+        return path
+    return None
+
+
 def download(url, target, alternates=(), sha256=None):
     """Download from URL candidates, preserving the first working artifact."""
     urls = [url] if isinstance(url, str) else list(url)
@@ -360,6 +384,49 @@ def linux_verify(engine):
             system.add(soname)
     return sorted(system), sorted(({'soname': s, 'directory': d} for d, s in seen),
                                   key=lambda entry:(entry['directory'], entry['soname']))
+
+
+def c_tool_smoke(build, env):
+    """Run the three host C tools against a synthetic NAND, without firmware.
+
+    legacy-ui-db and yaffs-image verify their own output, but what the runtime
+    depends on is the pairing: instance-props must mount a yaffs-image image,
+    read the seeded persist.db back, edit it, and survive a cold remount. A
+    loff_t/time_t or in-band-tag difference breaks silently at exactly that
+    seam, and a compile-only acceptance never sees it.
+    """
+    data_bytes = 8 * 1024 * 1024
+    with tempfile.TemporaryDirectory(prefix='azki-c-tools-') as name:
+        work = Path(name)
+        tree = work / 'nand'
+        tree.mkdir()
+        run([build / 'legacy-ui-db', tree / 'persist.db'], env=env)
+        data = work / 'nand-data.bin'
+        run([build / 'yaffs-image', data, '--bytes', data_bytes, '--tree', tree], env=env)
+        # instance-props only opens private, single-link images.
+        data.chmod(0o600)
+        spare = work / 'nand-spare.bin'
+        with spare.open('xb') as handle:
+            handle.write(b'\xff' * (data_bytes // 2048 * 64))
+        spare.chmod(0o600)
+
+        def props(*args):
+            return subprocess.run([build / 'instance-props', data, spare, *args], check=True,
+                                  capture_output=True, text=True, env={**env, 'TMPDIR': str(work)}).stdout
+
+        copy = work / 'persist-copy.db'
+        props('extract', '/nand/persist.db', str(copy))
+        run([build / 'legacy-ui-db', '--verify', copy], env=env)
+        seed = json.loads(props('get'))
+        if seed.get('persist.locale') != 'zh_CN' or seed.get('persist.setup_wizard') != '1':
+            raise RuntimeError(f'instance-props read-back mismatch: {seed}')
+        changes = work / 'changes.txt'
+        changes.write_bytes(b'S\tpersist.locale\tfr_FR\nD\tpersist.setup_wizard\n')
+        changes.chmod(0o600)
+        props('set', changes)
+        after = json.loads(props('get'))
+        if after.get('persist.locale') != 'fr_FR' or 'persist.setup_wizard' in after:
+            raise RuntimeError(f'instance-props set/get mismatch: {after}')
 
 
 def load_commands(path):
@@ -610,9 +677,9 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
     for package,version in PACKAGES.items():
         # Reuse a previously built wheel for this exact package/version so the
         # PyPI metadata fetch, sdist download and native build are all skipped.
-        cached=[p for p in wheels.glob('*.whl') if p.name.lower().startswith(package.lower()+'-') and version in p.name]
+        cached=find_cached_wheel(wheels,package,version)
         if cached:
-            print(f'Reusing cached wheel {cached[0].name}', flush=True)
+            print(f'Reusing cached wheel {cached.name}', flush=True)
             continue
         # Always deliver the pinned source and build it with this recipe.  A
         # cached wheel may use different optional features or dependencies and
@@ -706,6 +773,10 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
     smoke="import sys; from pathlib import Path; assert Path(sys.prefix).resolve()==Path(sys.executable).resolve().parent.parent; sys.path.insert(0,sys.argv[1]); import PIL.Image, littlefs, ctypes, socket, zlib; print('Engine Python imports ready')"
     run([engine/'python/bin/python3.12','-I','-S','-B','-c',smoke,site],env={**env,'PYTHONDONTWRITEBYTECODE':'1'})
     run([build/'qemu-system-arm','--version'],env=env)
+    if HOST_OS=='Linux':
+        # The Darwin pipeline keeps its historical compile-only acceptance; the
+        # Linux toolchain is what the loff_t/time_t break would first hit.
+        c_tool_smoke(build,env)
     for p in engine.rglob('*'):
         if p.is_file():p.chmod(p.stat().st_mode & ~0o022)
     files=[{'path':p.relative_to(engine).as_posix(),'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'executable':bool(p.stat().st_mode&0o111)} for p in sorted(engine.rglob('*')) if p.is_file()]

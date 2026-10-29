@@ -25,6 +25,10 @@ instances/
 .build-debug
 
 tests
+# ...but the two source test trees are tracked, and the bare rule above was
+# silently dropping every new file added to them.
+!tests/
+!linux/tests/
 # .NET build output lives one directory deeper per project (src/*, tests/*).
 linux/**/bin/
 linux/**/obj/

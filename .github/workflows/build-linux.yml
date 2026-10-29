@@ -32,7 +32,7 @@ jobs:
         run: |
           echo "Server = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch" > /etc/pacman.d/mirrorlist
           pacman -Syu --noconfirm --needed base-devel meson ninja pkgconf python git curl bzip2 \
-            glib2 pixman zlib libffi pcre2 zstd dtc libcap openssl bubblewrap dotnet-sdk
+            glib2 pixman zlib libffi pcre2 zstd dtc libcap openssl bubblewrap dotnet-sdk ffmpeg
       - name: Assign build number
         id: number
         # The same starting point and increment rule as the DMG workflow, so a
@@ -42,13 +42,20 @@ jobs:
           case "$base" in ''|*[!0-9]*) echo 'BUILD_NUMBER must be a positive integer' >&2; exit 1;; esac
           number=$((base - 1 + GITHUB_RUN_NUMBER))
           version="$(tr -d '\n\r' < VERSION)"
+          # The build script reads the number back from the file, so the package
+          # name carries the same number as the Release tag. Without this the
+          # artifact would be named after the base number and the Release would
+          # point at a build that no file agrees with.
+          printf '%s\n' "$number" > BUILD_NUMBER
           echo "number=$number" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version-build$number" >> "$GITHUB_OUTPUT"
       - name: Build engine and Linux package
         run: ./scripts/build-linux.sh release
       - name: Test the desktop supervisor
-        run: dotnet test linux/AzkiSimulator.Linux.sln
+        # The bwrap integration test is excluded: a GitHub container job cannot create
+        # user namespaces, so it runs from an extracted package locally instead.
+        run: dotnet test linux/AzkiSimulator.Linux.sln --filter "Category!=Integration"
       - name: Run Python runtime and device-code tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
       - name: Upload package artifacts
@@ -129,6 +136,36 @@ jobs:
             echo "Package: https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$primary"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  boot:
+    needs: build
+    # The container job cannot unshare a user namespace, so the full boot
+    # acceptance belongs to a runner that can: one with bwrap, a dotnet SDK and
+    # the authorized firmware on disk. The job stays off until a repository
+    # variable turns it on, and the firmware itself never travels through the
+    # workflow -- the secret names the path the runner already holds.
+    if: github.event_name == 'workflow_dispatch' && vars.AZKI_BOOT_RUNNER == 'true'
+    runs-on: [self-hosted, linux, azki-boot]
+    timeout-minutes: 60
+    env:
+      AZKI_FIRMWARE: ${{ secrets.AZKI_FIRMWARE_PATH }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: command -v dotnet >/dev/null || sudo pacman -S --noconfirm --needed dotnet-sdk
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: dist
+      - name: Extract the package
+        run: |
+          mkdir -p package
+          tar -xzf "$(ls dist/*-linux-*.tar.gz | grep -v -- '-source.tar.gz' | head -1)" -C package
+      - name: Boot the authorized firmware
+        run: ./scripts/verify-linux-boot.sh package/azki-simulator
+
   tests-macos:
     # Same Python contract tests on the macOS toolchain, which never ran in CI before.
     runs-on: macos-15
@@ -142,4 +179,7 @@ jobs:
           brew install python@3.12
           echo "$(brew --prefix python@3.12)/libexec/bin" >> "$GITHUB_PATH"
       - name: Test
-        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+        # The versioned interpreter is named explicitly: the runner's own
+        # python3 is the Xcode command line tools one, which is not the
+        # interpreter the engine was built against.
+        run: python3.12 -m unittest discover -s tests -p 'test_*.py' -v

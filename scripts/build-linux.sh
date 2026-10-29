@@ -75,7 +75,7 @@ if [ -d "$root/linux" ]; then
   fi
 fi
 tar -czf "$azki_work/linux-package.tar.gz" -C "$azki_work/package" azki-simulator
-source_items=(Package.swift VERSION BUILD_NUMBER LICENSE README.md README.en.md docs Assets Sources engine scripts .github .gitignore)
+source_items=(Package.swift VERSION BUILD_NUMBER LICENSE README.md README.en.md docs Assets Sources engine scripts tests .github .gitignore)
 test -d "$root/linux" && source_items+=(linux)
 tar -czf "$azki_work/source.tar.gz" -C "$root" \
   --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' \
