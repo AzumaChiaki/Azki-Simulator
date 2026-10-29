@@ -21,6 +21,7 @@ public sealed class ManagerViewModel : ObservableObject
     private readonly EngineLayout? _layout;
     private readonly InspectionRunner? _inspection;
     private readonly InstanceStore _store = new();
+    private readonly SemaphoreSlim _refreshGate = new(1, 1);
 
     /// <summary>A tarball without its Engine tree is a readable status message, not an
     /// exception escaping an async command where no caller could report it.</summary>
@@ -37,13 +38,17 @@ public sealed class ManagerViewModel : ObservableObject
         OpenDeviceCommand = new AsyncRelayCommand(OpenDeviceAsync, () => SelectedInstance is not null);
         ImportFirmwareCommand = new AsyncRelayCommand(ImportFirmwareHintAsync);
         DeleteFirmwareCommand = new AsyncRelayCommand(DeleteFirmwareAsync, () => SelectedFirmware is not null);
+        DeleteAllFirmwareCommand = new AsyncRelayCommand(DeleteAllFirmwareAsync, () => FirmwareItems.Count > 0);
         CleanupSessionsCommand = new AsyncRelayCommand(CleanupSessionsAsync);
+        RefreshHostStatusCommand = new AsyncRelayCommand(RefreshHostStatusAsync);
         _ = RefreshAsync();
     }
 
     public ObservableCollection<InstanceRecord> Instances { get; } = new();
     public ObservableCollection<FirmwarePreset> Presets { get; } = new();
     public ObservableCollection<FirmwareItem> FirmwareItems { get; } = new();
+    public ObservableCollection<HostStatusSession> HostStatuses { get; } = new();
+    public bool HasHostStatuses => HostStatuses.Count > 0;
 
     private InstanceRecord? _selectedInstance;
     public InstanceRecord? SelectedInstance { get => _selectedInstance; set { Set(ref _selectedInstance, value); RaiseCommands(); } }
@@ -60,13 +65,32 @@ public sealed class ManagerViewModel : ObservableObject
     public AsyncRelayCommand ResetInstanceCommand { get; }
     public AsyncRelayCommand ImportFirmwareCommand { get; }
     public AsyncRelayCommand DeleteFirmwareCommand { get; }
+    public AsyncRelayCommand DeleteAllFirmwareCommand { get; }
     public AsyncRelayCommand CleanupSessionsCommand { get; }
+    public AsyncRelayCommand RefreshHostStatusCommand { get; }
 
     public event Func<InstanceRecord, Task>? OpenDeviceRequested;
 
     /// <summary>Nothing this fires may escape into an async void: the constructor starts it
     /// without a caller that could report a failure.</summary>
     public async Task RefreshAsync()
+    {
+        // The constructor starts one refresh and the user can start another
+        // while it is still running. Two overlapping refreshes both see an
+        // empty list and both add the same record, so the window would show
+        // every instance twice.
+        await _refreshGate.WaitAsync();
+        try
+        {
+            await RefreshCoreAsync();
+        }
+        finally
+        {
+            _refreshGate.Release();
+        }
+    }
+
+    private async Task RefreshCoreAsync()
     {
         try
         {
@@ -119,6 +143,18 @@ public sealed class ManagerViewModel : ObservableObject
         {
             StatusText = error.Message;
         }
+        await RefreshHostStatusAsync();
+    }
+
+    /// <summary>The scan is pure reading (no publishing, no request dispatch — the
+    /// approved Linux scope of the status-file protocol), so it never fails loud.</summary>
+    private async Task RefreshHostStatusAsync()
+    {
+        var tmpRoot = DataLocations.TmpRoot;
+        var found = await Task.Run(() => HostStatusReader.Scan(tmpRoot));
+        HostStatuses.Clear();
+        foreach (var session in found) HostStatuses.Add(session);
+        Raise(nameof(HasHostStatuses));
     }
 
     private async Task OpenDeviceAsync()
@@ -226,10 +262,9 @@ public sealed class ManagerViewModel : ObservableObject
         {
             var arguments = new List<string> { "--input", path };
             if (!string.IsNullOrEmpty(model)) { arguments.Add("--model"); arguments.Add(model); }
-            // The OTA lives outside the sandbox; expose exactly this file read-only
-            // and let the catalog write only into the library.
-            await Engine.RunCheckedAsync("library-import", arguments,
-                libraryWritable: true, readOnlyFiles: new[] { path });
+            // The OTA lives outside the sandbox; the grant table exposes exactly this file
+            // read-only (from --input) and lets the catalog write only into the library.
+            await Engine.RunCheckedAsync("library-import", arguments);
             StatusText = "固件导入完成。";
             await RefreshAsync();
         }
@@ -266,12 +301,35 @@ public sealed class ManagerViewModel : ObservableObject
         await RefreshAsync();
     }
 
+    /// <summary>Clears the whole firmware library with the one action the reference uses:
+    /// the helper removes every imported object and rewrites the index under a single lock,
+    /// so an object the visible list does not name is reclaimed too.</summary>
+    public async Task DeleteAllFirmwareAsync()
+    {
+        try
+        {
+            var receipt = await Engine.RunCheckedAsync("library-delete-all", Array.Empty<string>());
+            var removed = (receipt["removed"] as JsonArray)?.Count ?? 0;
+            StatusText = $"已清空固件库（删除 {removed} 个镜像）。";
+        }
+        catch (Exception error) when (error is BridgeRemoteError or TimeoutException or IOException)
+        {
+            StatusText = error.Message;
+        }
+        await RefreshAsync();
+        DeleteAllFirmwareCommand.RaiseCanExecute();
+    }
+
     private async Task CleanupSessionsAsync()
     {
         try
         {
-            await Engine.RunCheckedAsync("sessions-cleanup", Array.Empty<string>());
-            StatusText = "已清理过期临时会话。";
+            // Snapshot before the call: those are the roots the sandbox is shown, and the
+            // only ones the host may take away afterwards.
+            var candidates = CliGrants.StaleSessionRoots().ToList();
+            var receipt = await Engine.RunCheckedAsync("sessions-cleanup", Array.Empty<string>());
+            var reclaimed = SessionCleanup.Reclaim(receipt, candidates).Count;
+            StatusText = reclaimed > 0 ? $"已清理过期临时会话（回收 {reclaimed} 个会话目录）。" : "已清理过期临时会话。";
         }
         catch (Exception error) when (error is BridgeRemoteError or TimeoutException or IOException)
         {
@@ -285,6 +343,7 @@ public sealed class ManagerViewModel : ObservableObject
         ResetInstanceCommand.RaiseCanExecute();
         OpenDeviceCommand.RaiseCanExecute();
         DeleteFirmwareCommand.RaiseCanExecute();
+        DeleteAllFirmwareCommand.RaiseCanExecute();
     }
 
     public EngineLayout? Layout => _layout;

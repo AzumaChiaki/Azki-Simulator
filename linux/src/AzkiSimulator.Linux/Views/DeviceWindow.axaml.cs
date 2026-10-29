@@ -13,8 +13,7 @@ namespace AzkiSimulator.Linux.Views;
 public partial class DeviceWindow : Window
 {
     private DeviceViewModel? _attached;
-    private bool _pressing;
-    private (int X, int Y) _lastPoint;
+    private readonly TouchContactTracker _touch = new();
     private bool _scrollQueued;
 
     public DeviceWindow()
@@ -23,9 +22,9 @@ public partial class DeviceWindow : Window
         Canvas.PointerPressed += OnPointerPressed;
         Canvas.PointerMoved += OnPointerMoved;
         Canvas.PointerReleased += OnPointerReleased;
-        // Releasing at the pressed position: sending (0,0) would lift the finger in the
+        // Releasing at the remembered contact: sending (0,0) would lift the finger in the
         // corner and read to the guest as a drag to the edge.
-        Canvas.PointerCaptureLost += (_, _) => ReleasePress();
+        Canvas.PointerCaptureLost += (_, _) => Emit(_touch.Cancelled());
         DataContextChanged += (_, _) => Attach();
         Closed += (_, _) => Detach();
     }
@@ -37,12 +36,20 @@ public partial class DeviceWindow : Window
         if (_attached is { } previous)
         {
             previous.LogLines.CollectionChanged -= OnLogLinesChanged;
+            previous.FirmwareSettingsRequested -= OnFirmwareSettingsRequested;
             foreach (var channel in previous.AdcChannels) channel.PropertyChanged -= OnChannelTextChanged;
         }
         _attached = Model;
         if (_attached is not { } model) return;
         model.LogLines.CollectionChanged += OnLogLinesChanged;
+        model.FirmwareSettingsRequested += OnFirmwareSettingsRequested;
         foreach (var channel in model.AdcChannels) channel.PropertyChanged += OnChannelTextChanged;
+        // The firmware picker needs the library catalog; it is a sandboxed CLI call,
+        // so it loads after the window is up rather than blocking Attach.
+        Dispatcher.UIThread.Post(async () =>
+        {
+            try { await model.RefreshFirmwareOptionsAsync(); } catch (Exception error) { UiFault.Report(error); }
+        });
     }
 
     private void Detach()
@@ -50,6 +57,7 @@ public partial class DeviceWindow : Window
         var model = _attached;
         if (model is null) return;
         model.LogLines.CollectionChanged -= OnLogLinesChanged;
+        model.FirmwareSettingsRequested -= OnFirmwareSettingsRequested;
         foreach (var channel in model.AdcChannels) channel.PropertyChanged -= OnChannelTextChanged;
         _attached = null;
         // Closing the window owns the session teardown; it is awaited by the dispatcher
@@ -58,6 +66,18 @@ public partial class DeviceWindow : Window
         {
             try { await model.DisposeAsync(); } catch (Exception error) { UiFault.Report(error); }
         });
+    }
+
+    private async void OnFirmwareSettingsRequested(FirmwareSettingsViewModel sheet)
+    {
+        try
+        {
+            await sheet.LoadAsync();
+            var dialog = new FirmwareSettingsWindow { DataContext = sheet };
+            sheet.SavedRequested += () => Dispatcher.UIThread.Post(dialog.Close);
+            await dialog.ShowDialog(this);
+        }
+        catch (Exception error) { UiFault.Report(error); }
     }
 
     private void OnLogLinesChanged(object? sender, NotifyCollectionChangedEventArgs e)
@@ -81,48 +101,31 @@ public partial class DeviceWindow : Window
 
     private void OnPointerPressed(object? sender, PointerPressedEventArgs e)
     {
-        _pressing = true;
         e.Pointer.Capture(Canvas);
-        if (TryPoint(e, out var x, out var y)) Send(x, y, true);
+        Emit(_touch.Pressed(Map(e)));
     }
 
-    private void OnPointerMoved(object? sender, PointerEventArgs e)
-    {
-        if (!_pressing || !TryPoint(e, out var x, out var y)) return;
-        Send(x, y, true);
-    }
+    private void OnPointerMoved(object? sender, PointerEventArgs e) => Emit(_touch.Moved(Map(e)));
 
     private void OnPointerReleased(object? sender, PointerReleasedEventArgs e)
     {
         e.Pointer.Capture(null);
-        if (_pressing && TryPoint(e, out var x, out var y)) Send(x, y, false);
-        _pressing = false;
+        Emit(_touch.Released(Map(e)));
     }
 
-    private void ReleasePress()
+    /// <summary>The device pixel under the pointer, or null outside the drawn screen.</summary>
+    private (int X, int Y)? Map(PointerEventArgs e)
     {
-        if (!_pressing) return;
-        _pressing = false;
-        var (x, y) = _lastPoint;
-        Send(x, y, false);
-    }
-
-    private bool TryPoint(PointerEventArgs e, out int x, out int y)
-    {
-        x = y = 0;
-        if (Model is not { } model) return false;
-        var point = e.GetPosition(Canvas);
-        var input = CanvasGeometry.Input(point, new global::Avalonia.Rect(0, 0, Canvas.Bounds.Width, Canvas.Bounds.Height),
+        if (Model is not { } model) return null;
+        return CanvasGeometry.Input(e.GetPosition(Canvas),
+            new global::Avalonia.Rect(0, 0, Canvas.Bounds.Width, Canvas.Bounds.Height),
             new global::Avalonia.Size(model.PixelWidth, model.PixelHeight));
-        if (input is null) return false;
-        (x, y) = input.Value;
-        _lastPoint = (x, y);
-        return true;
     }
 
-    private void Send(int x, int y, bool down)
+    private void Emit((int X, int Y, bool Down)? input)
     {
-        try { Model?.Touch(x, y, down); }
+        if (input is not { } contact) return;
+        try { Model?.Touch(contact.X, contact.Y, contact.Down); }
         catch (Exception error) { UiFault.Report(error); }
     }
 

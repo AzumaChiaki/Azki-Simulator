@@ -37,6 +37,27 @@
             </ListBox>
           </StackPanel>
 
+          <StackPanel DockPanel.Dock="Bottom" Spacing="8" Margin="0,12,0,0">
+            <StackPanel Orientation="Horizontal" Spacing="8">
+              <TextBlock Classes="sectionHeader" Text="主机状态共享" VerticalAlignment="Center" />
+              <Button Content="刷新" Command="{Binding RefreshHostStatusCommand}" />
+            </StackPanel>
+            <TextBlock Classes="captionSecondary" Text="只读展示其他 Azki 宿主在本机共享的状态会话；本应用不参与共享。"
+                       TextWrapping="Wrap" />
+            <TextBlock Classes="captionSecondary" Text="未发现共享会话。" IsVisible="{Binding !HasHostStatuses}" />
+            <ScrollViewer MaxHeight="120" IsVisible="{Binding HasHostStatuses}">
+              <ItemsControl ItemsSource="{Binding HostStatuses}">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate x:DataType="core:HostStatusSession">
+                    <StackPanel Spacing="1" Margin="0,2">
+                      <TextBlock Text="{Binding Summary}" FontSize="12" TextWrapping="Wrap" />
+                      <TextBlock Classes="captionSecondary" Text="{Binding PathLine}" FontSize="11" />
+                    </StackPanel>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </ScrollViewer>
+          </StackPanel>
           <Border Height="1" Background="{DynamicResource CardStrokeColorDefaultBrush}" Margin="0,4,0,12" />
 
           <StackPanel Spacing="8">
@@ -78,6 +99,7 @@
             <Button Content="导入 OTA" Command="{Binding ImportFirmwareCommand}" Click="ImportFirmware_Click"
                     Classes="accent" />
             <Button Content="删除所选" Command="{Binding DeleteFirmwareCommand}" />
+            <Button Content="删除全部镜像" Click="DeleteAll_Click" />
           </StackPanel>
           <ListBox ItemsSource="{Binding FirmwareItems}" SelectedItem="{Binding SelectedFirmware}">
             <ListBox.ItemTemplate>

@@ -22,13 +22,18 @@ public sealed class PmuAdcChannelViewModel : ObservableObject
     public string CountText { get => _count; set => Set(ref _count, value); }
 }
 
+public sealed record FirmwareOption(string Id, string DisplayName);
+
 /// <summary>One live instance session: supervisor lifecycle, RPC commands and the frame display.
 /// Every bridge exchange is a blocking Unix socket round trip, so nothing on this class's
 /// command path runs on the UI thread; state that views bind to is set back on the UI thread.</summary>
 public sealed class DeviceViewModel : ObservableObject, IAsyncDisposable
 {
     private readonly EngineLayout _layout;
-    private readonly InstanceRecord _record;
+    private InstanceRecord _record;
+    private readonly InspectionRunner _runner;
+    private readonly InstanceStore _store = new();
+    private readonly RecordingModel _recording = new();
     private readonly List<(int X, int Y, bool Down)> _inputPending = new();
     private readonly object _inputGate = new();
     private Task? _inputPump;
@@ -40,15 +45,30 @@ public sealed class DeviceViewModel : ObservableObject, IAsyncDisposable
     {
         _layout = layout;
         _record = record;
+        _runner = new InspectionRunner(layout);
+        _selectedProfileId = record.SelectedProfileId;
+        Data = new DeviceDataViewModel(record, _runner,
+            () => _supervisor?.Client, () => Running);
         StartCommand = new AsyncRelayCommand(StartAsync, () => !Running);
         StopCommand = new AsyncRelayCommand(StopAsync, () => Running);
         RestartCommand = new AsyncRelayCommand(RestartAsync, () => Running);
         ScreenshotCommand = new AsyncRelayCommand(ScreenshotAsync, () => Running);
+        RecordCommand = new AsyncRelayCommand(ToggleRecordingAsync, () => Running && !_recording.IsFinishing);
         ApplyAdcCommand = new AsyncRelayCommand(ApplyAdcAsync, () => Running && _adcDraft.HasChanges);
         RefreshAdcCommand = new AsyncRelayCommand(RefreshAdcAsync, () => Running);
         CrownClickCommand = new AsyncRelayCommand(() => ButtonAsync("crown", 1), () => Running && SupportsButtons);
         LowerClickCommand = new AsyncRelayCommand(() => ButtonAsync("lower", 1), () => Running && SupportsButtons);
         LowerDoubleClickCommand = new AsyncRelayCommand(() => ButtonAsync("lower", 2), () => Running && SupportsButtons);
+        OpenSystemSettingsCommand = new AsyncRelayCommand(OpenSystemSettingsAsync);
+        SwitchPendingCommand = new AsyncRelayCommand(SwitchPendingAsync, () => Running && _pendingProfileId is not null);
+        CancelPendingCommand = new AsyncRelayCommand(CancelPendingAsync, () => _pendingProfileId is not null);        // The recorder samples off the UI thread; its state reaches the view only
+        // through this marshalled event.
+        _recording.Changed += () => Dispatcher.UIThread.Post(() =>
+        {
+            RecordCommand.RaiseCanExecute();
+            Raise(nameof(RecordingLabel));
+            StatusText = RecordingStatus();
+        });
         for (var channel = 0; channel < 8; channel++)
             AdcChannels.Add(new PmuAdcChannelViewModel
             {
@@ -59,6 +79,8 @@ public sealed class DeviceViewModel : ObservableObject, IAsyncDisposable
     }
 
     public InstanceRecord Record => _record;
+    public ConnectionSettings Settings => ConnectionSettings.Shared;
+    public DeviceDataViewModel Data { get; }
     public ObservableCollection<PmuAdcChannelViewModel> AdcChannels { get; } = new();
     public ObservableCollection<string> LogLines { get; } = new();
 
@@ -82,18 +104,30 @@ public sealed class DeviceViewModel : ObservableObject, IAsyncDisposable
     public AsyncRelayCommand StopCommand { get; }
     public AsyncRelayCommand RestartCommand { get; }
     public AsyncRelayCommand ScreenshotCommand { get; }
+    public AsyncRelayCommand RecordCommand { get; }
     public AsyncRelayCommand ApplyAdcCommand { get; }
     public AsyncRelayCommand RefreshAdcCommand { get; }
     public AsyncRelayCommand CrownClickCommand { get; }
     public AsyncRelayCommand LowerClickCommand { get; }
     public AsyncRelayCommand LowerDoubleClickCommand { get; }
+    public AsyncRelayCommand OpenSystemSettingsCommand { get; }
+
+    public event Action<FirmwareSettingsViewModel>? FirmwareSettingsRequested;
+
+    private Task OpenSystemSettingsAsync()
+    {
+        if (FirmwareSettingsRequested is not { } request) return Task.CompletedTask;
+        var sheet = new FirmwareSettingsViewModel(_record, _runner, RestartAsync, () => Running);
+        request(sheet);
+        return Task.CompletedTask;
+    }
 
     public event Action<WriteableBitmap>? FrameUpdated;
 
     public async Task StartAsync()
     {
         if (Running) return;
-        var profileId = _record.SelectedProfileId
+        var profileId = _selectedProfileId
             ?? throw new InvalidOperationException("请先为实例选择固件版本。");
         try
         {
@@ -121,6 +155,8 @@ public sealed class DeviceViewModel : ObservableObject, IAsyncDisposable
             StatusText = "运行中";
             await PollStatusOnce();
             _ = LogPumpAsync();
+            await Data.LoadAsync();
+            _ = DataPollLoopAsync();
         }
         catch (Exception error) when (error is IOException or InvalidOperationException or InvalidDataException
             or BridgeRemoteError or TimeoutException)
@@ -288,6 +324,139 @@ public sealed class DeviceViewModel : ObservableObject, IAsyncDisposable
 
     public void UpdateAdcDraft(int channel, string text) => _adcDraft.Text[channel] = text;
 
+    private string? _selectedProfileId;
+    private FirmwareOption? _selectedFirmware;
+    private string? _pendingProfileId;
+
+    public ObservableCollection<FirmwareOption> FirmwareOptions { get; } = new();
+    public bool HasPendingFirmware => _pendingProfileId is not null;
+
+    public FirmwareOption? SelectedFirmware
+    {
+        get => _selectedFirmware;
+        set
+        {
+            if (value is null || !Set(ref _selectedFirmware, value)) return;
+            if (!Running)
+            {
+                _ = SwitchFirmwareAsync(value.Id);
+                return;
+            }
+            _pendingProfileId = value.Id == _selectedProfileId ? null : value.Id;
+            Raise(nameof(HasPendingFirmware));
+            SwitchPendingCommand.RaiseCanExecute();
+            CancelPendingCommand.RaiseCanExecute();
+        }
+    }
+
+    public AsyncRelayCommand SwitchPendingCommand { get; }
+    public AsyncRelayCommand CancelPendingCommand { get; }
+
+    /// <summary>Port of SimulatorFirmwareControls: switching while serving is held
+    /// as a pending choice until the explicit restart, which stops the recording first.</summary>
+    private async Task SwitchPendingAsync()
+    {
+        var pending = _pendingProfileId;
+        if (pending is null) return;
+        _pendingProfileId = null;
+        Raise(nameof(HasPendingFirmware));
+        await _recording.StopAsync();
+        await StopAsync();
+        await SwitchFirmwareAsync(pending);
+        await StartAsync();
+    }
+
+    private async Task CancelPendingAsync()
+    {
+        _pendingProfileId = null;
+        _selectedFirmware = FirmwareOptions.FirstOrDefault(option => option.Id == _selectedProfileId);
+        Raise(nameof(HasPendingFirmware));
+        Raise(nameof(SelectedFirmware));
+        SwitchPendingCommand.RaiseCanExecute();
+        CancelPendingCommand.RaiseCanExecute();
+    }
+
+    private async Task SwitchFirmwareAsync(string profileId)
+    {
+        try
+        {
+            await Task.Run(() =>
+            {
+                var records = _store.Load().ToList();
+                var index = records.FindIndex(candidate => candidate.Id == _record.Id);
+                if (index < 0) throw new InvalidOperationException("实例记录已不存在。");
+                var updated = records[index] with { SelectedProfileId = profileId };
+                records[index] = updated;
+                _store.Save(records);
+                _record = updated;
+                _selectedProfileId = profileId;
+            });
+            StatusText = "已切换固件（下次开机生效）。";
+        }
+        catch (Exception error) when (error is IOException or InvalidOperationException or TimeoutException
+            or UnauthorizedAccessException)
+        {
+            StatusText = "切换固件失败：" + error.Message;
+        }
+        Raise(nameof(Record));
+    }
+
+    public async Task RefreshFirmwareOptionsAsync()
+    {
+        try
+        {
+            var catalog = await Task.Run(() => _runner.RunCheckedAsync("library-catalog", Array.Empty<string>()));
+            var options = (catalog["items"] as JsonArray ?? new JsonArray()).OfType<JsonObject>()
+                .Select(row => (Id: JsonRead.AsString(row["id"]), Model: JsonRead.AsString(row["model"]),
+                    Name: JsonRead.AsString(row["displayName"]), Ready: JsonRead.AsBool(row["availability"]?["ready"])))
+                .Where(item => item.Id is not null && item.Model == _record.Model && item.Ready)
+                .Select(item => new FirmwareOption(item.Id!, item.Name ?? item.Id!))
+                .ToList();
+            FirmwareOptions.Clear();
+            foreach (var option in options) FirmwareOptions.Add(option);
+            _selectedFirmware = FirmwareOptions.FirstOrDefault(option => option.Id == _selectedProfileId);
+            Raise(nameof(SelectedFirmware));
+        }
+        catch (Exception error) when (error is BridgeRemoteError or TimeoutException or IOException
+            or InvalidDataException)
+        {
+            StatusText = error.Message;
+        }
+    }
+
+    public string RecordingLabel => _recording.IsRecording ? "停止录屏" : "录屏";
+
+    private string RecordingStatus()
+    {
+        if (_recording.IsRecording) return $"录屏中 {_recording.Elapsed:hh\\:mm\\:ss}";
+        if (_recording.ErrorMessage is { } error) return error;
+        if (_recording.SavedFile is { } saved) return $"录屏已保存：{saved}";
+        return "录屏已结束";
+    }
+
+    private async Task ToggleRecordingAsync()
+    {
+        if (_recording.IsRecording)
+        {
+            await _recording.StopAsync();
+            StatusText = RecordingStatus();
+            RecordCommand.RaiseCanExecute();
+            Raise(nameof(RecordingLabel));
+            return;
+        }
+        // The source reads the frame service's latest decoded frame; a null means the
+        // session ended, which finalizes the movie rather than splicing a new session.
+        if (!_recording.Start(_record.Name, () => _frames?.Latest))
+        {
+            StatusText = _recording.ErrorMessage ?? "无法开始录屏";
+            RecordCommand.RaiseCanExecute();
+            return;
+        }
+        StatusText = RecordingStatus();
+        RecordCommand.RaiseCanExecute();
+        Raise(nameof(RecordingLabel));
+    }
+
     public async Task InstallAsync(string? packagePath, string kind)
     {
         if (packagePath is null || _supervisor is not { } supervisor)
@@ -299,18 +468,13 @@ public sealed class DeviceViewModel : ObservableObject, IAsyncDisposable
         try
         {
             var label = kind == "watchface" ? "表盘" : "快应用";
-            var stagedName = Guid.NewGuid() + ".bin";
-            // Copy, hashing and the blocking install exchange all run off the UI thread,
-            // and the hash streams: a watchface pack is tens of megabytes and must not be
-            // buffered whole.
+            var identifier = Guid.NewGuid();
+            // Copy, hashing and the blocking install exchange all run off the UI thread, and
+            // the staging helper streams the bytes while it hashes: a watchface pack is tens
+            // of megabytes and must not be buffered whole.
             await Task.Run(() =>
             {
-                var staging = Path.Combine(supervisor.SessionDirectory, "incoming");
-                Directory.CreateDirectory(staging);
-                var staged = Path.Combine(staging, stagedName);
-                File.Copy(packagePath, staged);
-                using var handle = File.OpenRead(staged);
-                var sha = Convert.ToHexString(SHA256.HashData(handle)).ToLowerInvariant();
+                var (stagedName, sha, _) = PackageStaging.Stage(supervisor.SessionDirectory, packagePath, identifier);
                 var status = supervisor.Client.Command("status");
                 supervisor.Client.Command("guest-install", new JsonObject
                 {
@@ -354,19 +518,32 @@ public sealed class DeviceViewModel : ObservableObject, IAsyncDisposable
         return status;
     }
 
+    private async Task DataPollLoopAsync()
+    {
+        // Same cadence as the Swift task(id: liveContext) loop: 3 s, or 1 s while
+        // the modeled wearer is still walking steps.
+        while (Running && _supervisor is not null)
+        {
+            await Data.PollOnceAsync();
+            try { await Task.Delay(Data.WalkingNow ? 1_000 : 3_000); }
+            catch (Exception) { return; }
+        }
+    }
+
     private async Task LogPumpAsync()
     {
-        var cursor = new JsonObject();
+        // The reference stream begins with a null cursor: the helper reads an absent cursor
+        // as "start at the tail", while an empty object is a cursor it refuses.
+        JsonNode? cursor = null;
         while (Running && _supervisor is not null)
         {
             List<string>? appended = null;
             bool reset = false;
-            JsonObject? next = null;
+            var fault = (string?)null;
             try
             {
                 var supervisor = _supervisor;
-                var response = await Task.Run(() => supervisor.Client.Command("logs",
-                    new JsonObject { ["stream"] = true, ["name"] = "stderr.log", ["limit"] = 8192, ["cursor"] = cursor }));
+                var response = await Task.Run(() => supervisor.Client.Command("logs", LogStream.Request(cursor)));
                 if (response is not null)
                 {
                     reset = JsonRead.AsBool(response["reset"]);
@@ -374,12 +551,9 @@ public sealed class DeviceViewModel : ObservableObject, IAsyncDisposable
                     if (!string.IsNullOrEmpty(data))
                         appended = Encoding.UTF8.GetString(Convert.FromBase64String(data))
                             .Split('\n', StringSplitOptions.RemoveEmptyEntries).ToList();
-                    if (response["nextOffset"] is not null)
-                        next = new JsonObject
-                        {
-                            ["streamID"] = JsonRead.AsString(response["streamID"]),
-                            ["offset"] = JsonRead.AsInt(response["nextOffset"]),
-                        };
+                    var (next, error) = LogStream.Advance(response);
+                    cursor = next;
+                    fault = error;
                 }
             }
             catch (Exception error)
@@ -387,9 +561,8 @@ public sealed class DeviceViewModel : ObservableObject, IAsyncDisposable
                 // A dropped poll is retried on the next pass; the cursor simply stays put.
                 if (error is not IOException and not BridgeRemoteError) UiFault.Report(error);
             }
-            if (reset || appended is not null || next is not null)
+            if (reset || appended is not null || cursor is not null)
             {
-                if (next is not null) cursor = next;
                 var captured = appended;
                 // The collection is bound to a list view, so it changes on the UI thread.
                 Dispatcher.UIThread.Post(() =>
@@ -403,7 +576,12 @@ public sealed class DeviceViewModel : ObservableObject, IAsyncDisposable
                     }
                 });
             }
-            await Task.Delay(500);
+            if (fault is { } message)
+            {
+                Dispatcher.UIThread.Post(() => StatusText = message);
+                return;
+            }
+            await Task.Delay(250);
         }
     }
 
@@ -413,6 +591,9 @@ public sealed class DeviceViewModel : ObservableObject, IAsyncDisposable
         StopCommand.RaiseCanExecute();
         RestartCommand.RaiseCanExecute();
         ScreenshotCommand.RaiseCanExecute();
+        RecordCommand.RaiseCanExecute();
+        SwitchPendingCommand.RaiseCanExecute();
+        CancelPendingCommand.RaiseCanExecute();
         ApplyAdcCommand.RaiseCanExecute();
         RefreshAdcCommand.RaiseCanExecute();
         CrownClickCommand.RaiseCanExecute();
@@ -422,10 +603,18 @@ public sealed class DeviceViewModel : ObservableObject, IAsyncDisposable
 
     private async Task DisposeSessionAsync()
     {
+        // Finalize an in-flight recording first: it samples the frame service, and
+        // Swift's comment about stopping before teardown applies to the movie too.
+        try { await _recording.DisposeAsync(); }
+        catch (Exception error) when (error is IOException or InvalidOperationException)
+        {
+            StatusText = "录屏收尾失败：" + error.Message;
+        }
         if (_frames is not null) await _frames.DisposeAsync();
         _frames = null;
         if (_supervisor is not null) await _supervisor.DisposeAsync();
         _supervisor = null;
+        Data.Reset();
         lock (_inputGate) { _inputPending.Clear(); }
         Frame = null;
     }

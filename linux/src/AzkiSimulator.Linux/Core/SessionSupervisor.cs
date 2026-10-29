@@ -21,6 +21,9 @@ public sealed class SessionSupervisor : IAsyncDisposable
     private readonly string _brokerDirectory;
     private Process? _helper;
     private volatile Process? _guest;
+    // The supervisor inside the guest sandbox, not the bwrap launcher: its process
+    // group is what gets published as the session PID and what has to be reaped.
+    private volatile int _guestGroup;
     private LogWriter? _helperLog;
     // Written by the broker watcher, read by teardown on another thread.
     private volatile LogWriter? _guestLog;
@@ -28,6 +31,9 @@ public sealed class SessionSupervisor : IAsyncDisposable
     private CancellationTokenSource? _watchCancellation;
     private Task? _watchTask;
     private string _runName = "";
+    private string _sessionId = "";
+    // Written by the launch, read by the broker watcher on its own thread.
+    private volatile int _maxRuntime;
     private volatile bool _publishedTerminal;
 
     private SessionSupervisor(EngineLayout layout, InspectionRunner inspection, string sessionRoot)
@@ -78,7 +84,7 @@ public sealed class SessionSupervisor : IAsyncDisposable
         if (!string.IsNullOrEmpty(virtualSerial)) { arguments.Add("--virtual-serial"); arguments.Add(virtualSerial); }
         if (!string.IsNullOrEmpty(virtualAddress)) { arguments.Add("--virtual-address"); arguments.Add(virtualAddress); }
         var receipt = await _inspection.RunCheckedAsync("prepare-bundled", arguments,
-            libraryWritable: false, readWriteTrees: new[] { _sessionRoot }, cancellationToken: cancellationToken);
+            cancellationToken: cancellationToken);
         ApprovalDigest = JsonRead.AsString(receipt["approvalDigest"])
                          ?? throw new InvalidDataException("准备回执缺少 identityDigest/approvalDigest");
         IdentityDigest = JsonRead.AsString(receipt["identityDigest"]) ?? ApprovalDigest;
@@ -91,6 +97,8 @@ public sealed class SessionSupervisor : IAsyncDisposable
     {
         if (_client is not null) return _client;
         var sessionId = Guid.NewGuid();
+        _sessionId = sessionId.ToString();
+        _maxRuntime = maxRuntimeSeconds;
         _runName = "m-" + Guid.NewGuid().ToString("N")[..12];
         var run = Path.Combine(_sessionDirectory, _runName);
         DataLocations.EnsurePrivateDirectory(Path.Combine(_sessionDirectory, "host-tmp"));
@@ -105,7 +113,7 @@ public sealed class SessionSupervisor : IAsyncDisposable
             ["approvalDigest"] = ApprovalDigest,
             ["maxRuntimeSeconds"] = maxRuntimeSeconds,
         };
-        PublishExclusive(Path.Combine(_brokerDirectory, "config.json"), config.ToJsonString());
+        UnixNative.PublishRecord(_brokerDirectory, "config", "config.json", config.ToJsonString(), mayReplace: false);
 
         var helper = StartProcess(BuildHelperInvocation(maxRuntimeSeconds), Path.Combine(_sessionDirectory, "host-tmp"),
             Path.Combine(_sessionDirectory, $"helper-{sessionId:N}.log"), redirectStdinNull: true);
@@ -132,7 +140,11 @@ public sealed class SessionSupervisor : IAsyncDisposable
     {
         var policy = new SandboxPolicy
         {
-            ReadOnlyTrees = { _layout.EngineRoot, _layout.RuntimeRoot, _layout.FirmwareRoot },
+            ReadOnlyTrees = { _layout.EngineRoot, _layout.RuntimeRoot, _layout.FirmwareRoot,
+                // start revalidates every path the plan pins, and an imported
+                // package's AP/OTA objects live in the private library. Without
+                // this the helper failed on the first command it was asked to run.
+                DataLocations.FirmwareLibraryRoot },
             // The whole azki-b root is writable: session (socket, logs, broker
             // files, state) plus prepared/ (the plan pins H must read and the
             // receipt it validates). Seatbelt granted the pin files read-only;
@@ -158,14 +170,23 @@ public sealed class SessionSupervisor : IAsyncDisposable
         var assets = Path.Combine(projectDirectory, "assets");
         var policy = new SandboxPolicy
         {
-            ReadOnlyTrees = { _layout.EngineRoot, projectDirectory },
+            ReadOnlyTrees = { _layout.EngineRoot, projectDirectory,
+                // The runner opens the AP and resource images the prepared catalog
+                // names, and for an imported package those are library objects.
+                DataLocations.FirmwareLibraryRoot },
+            // bwrap's root is an empty tmpfs, so a script the argv names has to be
+            // bound or the interpreter reports ENOENT for it. Only the supervisor
+            // itself, not the whole Runtime tree: the payload it execs is Engine's
+            // bootstrap.py plus the project's runner, and the reference guest reads
+            // the supervisor as a pinned file rather than as part of a tree.
+            ReadOnlyFiles = { _layout.MinativeLaunch },
             ReadWriteTrees = { run },
         };
         if (Directory.Exists(instanceData)) policy.ReadWriteTrees.Add(instanceData);
         if (Directory.Exists(assets)) policy.ReadWriteTrees.Add(assets);
         var args = policy.BuildArguments().ToList();
         args.Add(_layout.Python);
-        args.AddRange(new[] { "-I", "-S", "-B", _layout.MinativeLaunch, "--native", "0",
+        args.AddRange(new[] { "-I", "-S", "-B", _layout.MinativeLaunch, "--native", _maxRuntime.ToString(),
             Path.Combine(run, "runner-process.json"), Environment.ProcessId.ToString(),
             _layout.EngineRoot, projectDirectory, profileId, run });
         var storage = backendPlan["identity"]?["instanceStorage"] as JsonObject;
@@ -183,8 +204,27 @@ public sealed class SessionSupervisor : IAsyncDisposable
                 args.AddRange(new[] { "--instance-nor-image", nor, "--instance-nor-sha256", PathOf("norSHA256") });
                 if (JsonRead.AsBool(storage["norInitialize"])) args.Add("--instance-nor-initialize");
             }
+            // The synthetic peer is a plan-bound input: the state file and its digest
+            // come from the same snapshot the guest's identity is checked against, and
+            // the pending copy is written inside this run. Order matters here -- the
+            // guest supervisor validates the exact argv shape, including which argument
+            // positions the peer may occupy.
+            if (JsonRead.AsBool(storage["virtualPeerEnabled"]))
+            {
+                args.AddRange(new[]
+                {
+                    "--virtual-peer-state", PathOf("virtualPeerStatePath"),
+                    "--virtual-peer-state-sha256", PathOf("virtualPeerStateSHA256"),
+                    "--virtual-peer-output", Path.Combine(run, "virtual-peer-state.pending.json"),
+                });
+            }
+            // Host-authored firmware settings, applied by the runner before boot.
+            if (JsonRead.AsString(storage["settingsPath"]) is { } settings)
+                args.AddRange(new[] { "--instance-settings", settings });
         }
-        args.Add("--skip-oobe");
+        // The plan owns the OOBE choice, so it is read back rather than re-decided:
+        // only an explicit false asks the guest to run setup.
+        args.Add(backendPlan["skipOOBE"]?.GetValueKind() is JsonValueKind.False ? "--no-skip-oobe" : "--skip-oobe");
         var environment = ScrubbedEnvironment(run, Path.Combine(run, "tmp"));
         return (SandboxPolicy.Launcher, args, environment, projectDirectory);
     }
@@ -203,7 +243,10 @@ public sealed class SessionSupervisor : IAsyncDisposable
     private (Process Process, LogWriter Log) StartProcess((string FileName, List<string> Arguments, Dictionary<string, string> Environment, string WorkingDirectory) invocation,
         string workingDirectory, string logPath, bool redirectStdinNull = false)
     {
-        var writer = new LogWriter(File.Open(logPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None));
+        // 0600, never the umask default: the helper refuses any run output that is
+        // world-readable or a symlink, and it inspects the guest log the app itself
+        // creates -- exactly the rule Swift's O_CREAT|O_EXCL ... 0o600 open enforces.
+        var writer = new LogWriter(UnixNative.CreatePrivateExclusive(logPath));
         Directory.CreateDirectory(workingDirectory);
         var info = new ProcessStartInfo
         {
@@ -288,24 +331,36 @@ public sealed class SessionSupervisor : IAsyncDisposable
     /// <summary>Watches native-broker requests from H: launch.json spawns G under its own sandbox; stop.json reaps it.</summary>
     private async Task WatchBrokerAsync(CancellationToken cancellationToken)
     {
-        var launchPath = Path.Combine(_brokerDirectory, "launch.json");
-        var stopPath = Path.Combine(_brokerDirectory, "stop.json");
+        // Both requests are read through one validated directory handle, bounded
+        // and identity-checked, exactly like the helper's own record reader: the
+        // watcher is about to start a sandboxed process from what it parses.
+        using var broker = UnixNative.OpenDirectory(_brokerDirectory);
         var deadline = (MonotonicClock.Now + TimeSpan.FromSeconds(120));
         try
         {
-            while (!File.Exists(launchPath))
+            string? launch;
+            while ((launch = UnixNative.ReadRecord(broker, "launch.json", 4096)) is null)
             {
                 if (MonotonicClock.Now > deadline || _guest is { HasExited: true }) return;
                 await Task.Delay(50, cancellationToken);
             }
-            var request = JsonNode.Parse(File.ReadAllText(launchPath)) as JsonObject
+            var request = JsonNode.Parse(launch) as JsonObject
                           ?? throw new InvalidDataException("launch.json 不是 JSON 对象");
-            if (JsonRead.AsInt(request["version"], -1) != 1 || JsonRead.AsString(request["run"]) != _runName)
+            // The reference compares the request against the configuration it sealed,
+            // so the identity this app wrote into config.json is what must come back:
+            // an id from another session would be published as this session's status.
+            if (JsonRead.AsInt(request["version"], -1) != 1 || SetOfKeys(request) != "id,run,version"
+                || JsonRead.AsString(request["run"]) != _runName
+                || JsonRead.AsString(request["id"]) != _sessionId)
                 throw new InvalidDataException("launch.json 与本次会话不符");
-            var requestId = JsonRead.AsString(request["id"]) ?? throw new InvalidDataException("launch.json 缺少 id");
 
-            var plan = JsonNode.Parse(File.ReadAllText(Path.Combine(_sessionDirectory, "backend-plan.json"))) as JsonObject
-                       ?? throw new InvalidDataException("会话缺少 backend-plan.json");
+            // The plan drives the guest's mount arguments, so it is read under the
+            // same guard as the broker requests: no symlink, bounded, unchanged.
+            using var session = UnixNative.OpenDirectory(_sessionDirectory);
+            var planText = UnixNative.ReadRecord(session, "backend-plan.json", 4 << 20)
+                           ?? throw new InvalidDataException("会话缺少 backend-plan.json");
+            var plan = JsonNode.Parse(planText) as JsonObject
+                       ?? throw new InvalidDataException("backend-plan.json 不是 JSON 对象");
             var spec = plan["spec"] as JsonObject ?? throw new InvalidDataException("backend-plan 缺少 spec");
             var projectDirectory = JsonRead.AsString(spec["project"])
                                    ?? throw new InvalidDataException("backend-plan 缺少 project");
@@ -315,39 +370,34 @@ public sealed class SessionSupervisor : IAsyncDisposable
                 Path.Combine(_sessionDirectory, _runName, "adapter-runner.log"));
             _guest = guest.Process;
             _guestLog = guest.Log;
-
-            var setsid = (MonotonicClock.Now + TimeSpan.FromSeconds(1));
-            while (UnixNative.getpgid(_guest.Id) != _guest.Id)
-            {
-                if (_guest.HasExited) throw new IOException("客户监督进程未能建立自己的进程组");
-                if (MonotonicClock.Now > setsid) throw new IOException("客户监督进程建立进程组超时");
-                await Task.Delay(10, cancellationToken);
-            }
+            _guestGroup = await WaitForGuestGroupAsync(cancellationToken);
             _guest.StandardInput.Write("AZKI-GUEST-GO\n");
             _guest.StandardInput.Flush();
             _guest.StandardInput.Close();
-            PublishState(new JsonObject { ["version"] = 1, ["id"] = requestId,
-                ["run"] = _runName, ["state"] = "running", ["pid"] = _guest.Id });
+            PublishState(new JsonObject { ["version"] = 1, ["id"] = _sessionId,
+                ["run"] = _runName, ["state"] = "running", ["pid"] = _guestGroup });
 
             while (true)
             {
-                if (File.Exists(stopPath))
+                if (UnixNative.ReadRecord(broker, "stop.json", 4096) is { } stop)
                 {
+                    // The reference validates the stop request before it reaps: an
+                    // unrelated or stale record must not tear down this session's guest.
+                    var record = JsonNode.Parse(stop) as JsonObject
+                                 ?? throw new InvalidDataException("stop.json 不是 JSON 对象");
+                    if (JsonRead.AsInt(record["version"], -1) != 1 || JsonRead.AsString(record["id"]) != _sessionId
+                        || SetOfKeys(record) != "id,version")
+                        throw new InvalidDataException("stop.json 不是本次会话的停止请求");
                     StopGuest();
-                    var exit = _guest.WaitForExit(13_000) ? _guest.ExitCode : 137;
-                    PublishState(new JsonObject { ["version"] = 1, ["id"] = requestId,
-                        ["run"] = _runName, ["state"] = exit == 0 ? "exited" : "failed",
-                        ["exitCode"] = exit, ["cleanup"] = "reaped", ["pid"] = _guest.Id });
-                    _publishedTerminal = true;
+                    PublishTerminal(_guest);
                     return;
                 }
                 if (_guest.HasExited)
                 {
-                    var exit = _guest.ExitCode;
-                    PublishState(new JsonObject { ["version"] = 1, ["id"] = requestId,
-                        ["run"] = _runName, ["state"] = exit == 0 ? "exited" : "failed",
-                        ["exitCode"] = exit, ["cleanup"] = CleanupConfirmed() ? "reaped" : "unconfirmed", ["pid"] = _guest.Id });
-                    _publishedTerminal = true;
+                    // A supervisor that left on its own still owns the group the runner
+                    // and the emulator are in, so only the stop path can confirm the reap.
+                    StopGuest();
+                    PublishTerminal(_guest);
                     return;
                 }
                 await Task.Delay(50, cancellationToken);
@@ -359,88 +409,125 @@ public sealed class SessionSupervisor : IAsyncDisposable
         }
         catch (Exception error)
         {
-            if (!_publishedTerminal)
+            if (_publishedTerminal) return;
+            // Reap first, exactly like the reference broker: asking whether the
+            // group is gone without stopping it would publish "unconfirmed" over
+            // a live guest, and that guest owns a QEMU child.
+            StopGuest();
+            // The record carries a fixed sentence. Exception text belongs in the
+            // fault log -- it has no length bound, and the helper rejects any
+            // terminal status whose error field exceeds its 1024-byte cap, which
+            // would turn one failure into a protocol error. The id comes from the
+            // sealed configuration rather than from a record that may never have
+            // arrived, so a failure this early still reads as a real terminal state.
+            UiFault.Report(error);
+            try
             {
-                try
-                {
-                    PublishState(new JsonObject { ["version"] = 1, ["id"] = _brokerSessionId, ["run"] = _runName,
-                        ["state"] = "failed", ["exitCode"] = -1, ["cleanup"] = CleanupConfirmed() ? "reaped" : "unconfirmed",
-                        ["error"] = error.Message });
-                }
-                catch (IOException) { }
+                PublishState(new JsonObject { ["version"] = 1, ["id"] = _sessionId, ["run"] = _runName,
+                    ["state"] = "failed", ["exitCode"] = -1, ["cleanup"] = CleanupConfirmed() ? "reaped" : "unconfirmed",
+                    ["error"] = "原生代理拒绝无效或已改变的请求" });
             }
+            catch (IOException) { }
         }
     }
 
-    private string _brokerSessionId = "";
+    /// <summary>The terminal record, in the reference's shape: the verdict is whether the
+    /// owned group was reaped, and what the guest thought of itself travels as exitCode.
+    /// bwrap exits with its payload's status, so the launcher is the right place to read
+    /// that from once the group is gone.</summary>
+    private void PublishTerminal(Process launcher)
+    {
+        var reaped = CleanupConfirmed();
+        PublishState(new JsonObject { ["version"] = 1, ["id"] = _sessionId,
+            ["run"] = _runName, ["state"] = reaped ? "exited" : "failed",
+            ["exitCode"] = launcher.HasExited ? launcher.ExitCode : -1,
+            ["cleanup"] = reaped ? "reaped" : "unconfirmed", ["pid"] = _guestGroup });
+        _publishedTerminal = true;
+    }
 
     private bool CleanupConfirmed()
     {
-        var group = _guest?.Id ?? 0;
+        var group = _guestGroup;
         if (group == 0) return true;
-        // /proc is read directly rather than through Process.GetProcesses plus getpgid:
-        // another user's pid answers EPERM, which would make every shared machine report
-        // "unconfirmed", and a pid that vanishes mid-scan is not evidence of a survivor.
-        foreach (var entry in Directory.EnumerateDirectories("/proc"))
-        {
-            var name = Path.GetFileName(entry);
-            if (name.Length == 0 || !name.All(char.IsAsciiDigit) || !int.TryParse(name, out var pid) || pid == group)
-                continue;
-            try
-            {
-                var text = File.ReadAllText(Path.Combine(entry, "stat"));
-                var close = text.LastIndexOf(')');
-                if (close < 1 || text.Length <= close + 2) continue;
-                // After the parenthesised command: state, ppid, pgrp.
-                var fields = text.Substring(close + 2).Split(' ');
-                if (fields.Length > 2 && int.TryParse(fields[2], out var pgrp) && pgrp == group) return false;
-            }
-            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
-            {
-                continue;
-            }
-        }
-        return true;
+        return !ProcessGroupSurvivors.Any(group);
     }
 
+    /// <summary>Waits for the guest supervisor to become the process .NET can see the
+    /// sandbox through. The payload bwrap forks is its own process-group leader because
+    /// --new-session calls setsid before the exec, and that group is the one the runner
+    /// and QEMU share.</summary>
+    private async Task<int> WaitForGuestGroupAsync(CancellationToken cancellationToken)
+    {
+        var launcher = _guest ?? throw new InvalidOperationException("客户沙箱尚未启动");
+        var deadline = MonotonicClock.Now + TimeSpan.FromSeconds(3);
+        while (true)
+        {
+            var group = ProcessGroupSurvivors.GroupLeadingChild(launcher.Id);
+            if (group > 0) return group;
+            if (group < 0) throw new IOException("客户沙箱里出现了多个进程组领导者");
+            if (launcher.HasExited) throw new IOException("客户监督进程在交出进程组前退出");
+            if (MonotonicClock.Now > deadline) throw new IOException("等待客户监督进程组超时");
+            await Task.Delay(10, cancellationToken);
+        }
+    }
+
+    /// <summary>Stops the guest through the group its supervisor owns. The launcher is
+    /// deliberately not signalled: killing bwrap reaps the supervisor with SIGKILL through
+    /// --die-with-parent, which skips the supervisor's bounded graceful stop, its storage
+    /// receipt, and leaves QEMU alive as an orphan in the supervisor's group.</summary>
     private void StopGuest()
     {
-        if (_guest is null || _guest.HasExited) return;
+        var guest = _guest;
+        if (guest is null) return;
+        var group = _guestGroup;
+        if (group == 0)
+        {
+            // Nothing was ever shown to be inside the sandbox, so the launcher is all
+            // there is to stop.
+            if (guest.HasExited) return;
+            try { guest.Kill(entireProcessTree: false); } catch (InvalidOperationException) { }
+            return;
+        }
         try
         {
-            UnixNative.killpg(_guest.Id, 15); // SIGTERM to the owned group
-            if (!_guest.WaitForExit(8_000)) UnixNative.killpg(_guest.Id, 9);
-            _guest.WaitForExit(2_000);
+            UnixNative.killpg(group, 15); // SIGTERM to the owned group
+            if (!GroupGone(guest, group, 13_000))
+            {
+                UnixNative.killpg(group, 9);
+                GroupGone(guest, group, 2_000);
+            }
         }
         catch (Exception) { /* group may already be gone */ }
     }
 
-    private void PublishState(JsonObject state)
+    private static bool GroupGone(Process launcher, int group, int milliseconds)
     {
-        _brokerSessionId = state["id"]?.GetValue<string>() ?? _brokerSessionId;
-        var path = Path.Combine(_brokerDirectory, "state.json");
-        var temporary = Path.Combine(_brokerDirectory, $".state-{Guid.NewGuid():N}.tmp");
-        File.WriteAllText(temporary, state.ToJsonString(new JsonSerializerOptions { WriteIndented = false }));
-        File.SetUnixFileMode(temporary, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        if (!File.Exists(path))
+        var deadline = MonotonicClock.Now + TimeSpan.FromMilliseconds(milliseconds);
+        while (true)
         {
-            UnixNative.TryHardLink(temporary, path, out _);
+            // The launcher exits only once its payload is reaped, so both halves are
+            // needed: an exited launcher with a member left behind is an orphaned QEMU.
+            if (launcher.HasExited && !ProcessGroupSurvivors.Any(group)) return true;
+            if (MonotonicClock.Now > deadline) return false;
+            Thread.Sleep(50);
         }
-        else
-        {
-            File.Move(temporary, path, overwrite: true);
-        }
-        try { File.Delete(temporary); } catch (IOException) { }
     }
 
-    private static void PublishExclusive(string path, string content)
+    /// <summary>Exact field-set check: the reference refuses a broker record that
+    /// carries anything beyond the agreed keys, so extra fields cannot be ignored.</summary>
+    private static string SetOfKeys(JsonObject value) => string.Join(",", value.Select(pair => pair.Key).OrderBy(key => key, StringComparer.Ordinal));
+
+    private bool _statePublished;
+
+    private void PublishState(JsonObject state)
     {
-        var temporary = path + ".tmp";
-        File.WriteAllText(temporary, content);
-        File.SetUnixFileMode(temporary, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        if (!UnixNative.TryHardLink(temporary, path, out var error))
-            throw new IOException($"原子发布失败 (errno {error})");
-        File.Delete(temporary);
+        // The running record is published exclusively; only a later terminal record
+        // may replace it. Publication goes through rename, never a hard link, because
+        // the helper refuses a status file whose link count is not one.
+        UnixNative.PublishRecord(_brokerDirectory, "state", "state.json",
+            state.ToJsonString(new JsonSerializerOptions { WriteIndented = false }),
+            mayReplace: _statePublished);
+        _statePublished = true;
     }
 
     public async ValueTask DisposeAsync()

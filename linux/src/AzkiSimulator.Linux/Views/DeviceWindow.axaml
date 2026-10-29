@@ -21,6 +21,7 @@
             <Button Content="停止" Command="{Binding StopCommand}" />
             <Button Content="冷重启" Command="{Binding RestartCommand}" />
             <Button Content="截图" Command="{Binding ScreenshotCommand}" />
+            <Button Content="{Binding RecordingLabel}" Command="{Binding RecordCommand}" />
             <Button Content="表冠单击" Command="{Binding CrownClickCommand}" IsVisible="{Binding SupportsButtons}" />
             <Button Content="下键单击" Command="{Binding LowerClickCommand}" IsVisible="{Binding SupportsButtons}" />
             <Button Content="下键双击" Command="{Binding LowerDoubleClickCommand}" IsVisible="{Binding SupportsButtons}" />
@@ -36,6 +37,87 @@
           <TabItem Header="日志">
             <ListBox x:Name="LogList" ItemsSource="{Binding LogLines}"
                      FontFamily="Consolas,monospace" FontSize="12" />
+          </TabItem>
+          <TabItem Header="设备数据">
+            <ScrollViewer>
+              <StackPanel Margin="4,12" Spacing="8">
+                <TextBlock Classes="captionSecondary" Text="{Binding Data.NoRowsNote}" TextWrapping="Wrap"
+                           IsVisible="{Binding Data.ShowsNoRowsNote}" />
+                <TextBlock Classes="captionSecondary" Text="{Binding Data.LiveUnavailableText}" TextWrapping="Wrap"
+                           IsVisible="{Binding Data.ShowsLiveUnavailable}" />
+                <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding Data.ShowsWear}">
+                  <TextBlock Text="佩戴" Width="72" VerticalAlignment="Center" />
+                  <TextBlock Classes="captionSecondary" Text="{Binding Data.WornCurrent}" Width="130" VerticalAlignment="Center" />
+                  <ComboBox Width="150" SelectedIndex="{Binding Data.WornIndex}">
+                    <ComboBoxItem>佩戴</ComboBoxItem>
+                    <ComboBoxItem>未佩戴</ComboBoxItem>
+                  </ComboBox>
+                  <Button Content="应用" Command="{Binding Data.ApplyWornCommand}" />
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding Data.ShowsWear}">
+                  <TextBlock Text="心率" Width="72" VerticalAlignment="Center" />
+                  <TextBlock Classes="captionSecondary" Text="{Binding Data.HeartRateCurrent}" Width="130" VerticalAlignment="Center" />
+                  <TextBox Text="{Binding Data.HeartRateText}" Width="80" Watermark="30–220" />
+                  <TextBlock Classes="captionSecondary" Text="次/分" VerticalAlignment="Center" />
+                  <Button Content="应用" Command="{Binding Data.ApplyHeartRateCommand}" />
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding Data.ShowsSteps}">
+                  <TextBlock Text="步频" Width="72" VerticalAlignment="Center" />
+                  <TextBlock Classes="captionSecondary" Text="{Binding Data.CadenceCurrent}" Width="130" VerticalAlignment="Center" />
+                  <TextBox Text="{Binding Data.CadenceText}" Width="80" Watermark="40–200" />
+                  <TextBlock Classes="captionSecondary" Text="步/分" VerticalAlignment="Center" />
+                  <Button Content="应用" Command="{Binding Data.ApplyCadenceCommand}" />
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding Data.ShowsSteps}">
+                  <TextBlock Text="走路" Width="72" VerticalAlignment="Center" />
+                  <TextBlock Classes="captionSecondary" Text="{Binding Data.WalkCurrent}" Width="130" VerticalAlignment="Center" />
+                  <TextBox Text="{Binding Data.WalkText}" Width="80" Watermark="1–100000" />
+                  <TextBlock Classes="captionSecondary" Text="步" VerticalAlignment="Center" />
+                  <Button Content="走" Command="{Binding Data.ApplyWalkCommand}" />
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding Data.ShowsSteps}">
+                  <TextBlock Text="开机后步行" Width="72" VerticalAlignment="Center" />
+                  <TextBlock Classes="captionSecondary" Text="{Binding Data.BootWalkCurrent}" Width="130" VerticalAlignment="Center" />
+                  <TextBox Text="{Binding Data.BootWalkText}" Width="80" Watermark="0–10000000" />
+                  <TextBlock Classes="captionSecondary" Text="步" VerticalAlignment="Center" />
+                  <Button Content="保存" Command="{Binding Data.ApplyBootWalkCommand}" />
+                </StackPanel>
+                <TextBlock Classes="sectionHeader" Text="电池" IsVisible="{Binding Data.ShowsBattery}" />
+                <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding Data.ShowsLevel}">
+                  <TextBlock Text="电量" Width="72" VerticalAlignment="Center" />
+                  <TextBlock Classes="captionSecondary" Text="{Binding Data.LevelCurrent}" Width="130" VerticalAlignment="Center" />
+                  <TextBox Text="{Binding Data.LevelText}" Width="80" Watermark="0–100" />
+                  <TextBlock Classes="captionSecondary" Text="%" VerticalAlignment="Center" />
+                  <Button Content="应用" Command="{Binding Data.ApplyLevelCommand}" />
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding Data.ShowsCharger}">
+                  <TextBlock Text="充电" Width="72" VerticalAlignment="Center" />
+                  <TextBlock Classes="captionSecondary" Text="{Binding Data.ChargerCurrent}" Width="130" VerticalAlignment="Center" />
+                  <ComboBox Width="150" SelectedIndex="{Binding Data.ChargerIndex}">
+                    <ComboBoxItem>未接充电器</ComboBoxItem>
+                    <ComboBoxItem>充电中</ComboBoxItem>
+                    <ComboBoxItem>已充满</ComboBoxItem>
+                  </ComboBox>
+                  <Button Content="应用" Command="{Binding Data.ApplyChargerCommand}" />
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding Data.ShowsTemperature}">
+                  <TextBlock Text="电池温度" Width="72" VerticalAlignment="Center" />
+                  <TextBlock Classes="captionSecondary" Text="{Binding Data.TemperatureCurrent}" Width="130" VerticalAlignment="Center" />
+                  <TextBox Text="{Binding Data.TemperatureText}" Width="80" Watermark="-40–85" />
+                  <TextBlock Classes="captionSecondary" Text="°C" VerticalAlignment="Center" />
+                  <Button Content="应用" Command="{Binding Data.ApplyTemperatureCommand}" />
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                  <TextBlock Classes="captionSecondary" Text="语言、时区、时间格式、开机时间和系统属性：" VerticalAlignment="Center" />
+                  <Button Content="系统设置…" Command="{Binding OpenSystemSettingsCommand}" />
+                </StackPanel>
+                <TextBlock Text="{Binding Data.Message}" TextWrapping="Wrap" FontSize="12"
+                           Foreground="#C42B1C" IsVisible="{Binding Data.HasError}" />
+                <TextBlock Classes="captionSecondary" Text="{Binding Data.Message}" TextWrapping="Wrap"
+                           FontSize="12" IsVisible="{Binding Data.HasNote}" />
+                <TextBlock Classes="captionSecondary" Text="{Binding Data.Footer}" TextWrapping="Wrap" />
+              </StackPanel>
+            </ScrollViewer>
           </TabItem>
           <TabItem Header="PMU ADC">
             <ScrollViewer>
@@ -71,6 +153,21 @@
           </TabItem>
           <TabItem Header="固件">
             <StackPanel Margin="4,12" Spacing="8">
+              <TextBlock Classes="sectionHeader" Text="启动固件" />
+              <ComboBox ItemsSource="{Binding FirmwareOptions}" SelectedItem="{Binding SelectedFirmware}"
+                        HorizontalAlignment="Stretch">
+                <ComboBox.ItemTemplate>
+                  <DataTemplate x:DataType="vm:FirmwareOption">
+                    <TextBlock Text="{Binding DisplayName}" />
+                  </DataTemplate>
+                </ComboBox.ItemTemplate>
+              </ComboBox>
+              <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding HasPendingFirmware}">
+                <Button Content="切换并重新开机" Command="{Binding SwitchPendingCommand}" Classes="accent" />
+                <Button Content="取消" Command="{Binding CancelPendingCommand}" />
+              </StackPanel>
+              <TextBlock Classes="captionSecondary" Text="将停止设备、保存数据盘，然后用所选固件冷启动。"
+                         TextWrapping="Wrap" IsVisible="{Binding HasPendingFirmware}" />
               <TextBlock Classes="sectionHeader" Text="Guest 安装包" />
               <TextBlock Classes="captionSecondary" Text="向设备 guest 安装快应用或表盘包" TextWrapping="Wrap" />
               <Button Content="安装包…" Click="Install_Click" Classes="accent" HorizontalAlignment="Left" />
@@ -78,6 +175,16 @@
                 <TextBlock Classes="captionSecondary"
                            Text="真实手机蓝牙射频配对在 Linux 尚未实现。" TextWrapping="Wrap" />
               </Border>
+            </StackPanel>
+          </TabItem>
+          <TabItem Header="设置">
+            <StackPanel Margin="4,12" Spacing="8">
+              <TextBlock Classes="sectionHeader" Text="会话" />
+              <TextBlock Classes="captionSecondary" Text="连接超时（秒）" />
+              <ui:NumberBox Value="{Binding Settings.TimeoutSecondsDisplay}" Minimum="1" Maximum="300"
+                            SmallChange="1" LargeChange="10" SpinButtonPlacementMode="Inline"
+                            HorizontalAlignment="Left" Width="200" />
+              <TextBlock Classes="captionSecondary" Text="1–300，用于虚拟设备连接；下次操作生效。" TextWrapping="Wrap" />
             </StackPanel>
           </TabItem>
         </TabControl>

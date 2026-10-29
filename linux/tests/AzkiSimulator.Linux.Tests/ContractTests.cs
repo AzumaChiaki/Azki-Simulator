@@ -1,6 +1,9 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
+using System.Text;
 using System.Text.Json.Nodes;
 using AzkiSimulator.Linux.Core;
+using AzkiSimulator.Linux.Services;
 using Xunit;
 
 namespace AzkiSimulator.Linux.Tests;
@@ -292,5 +295,219 @@ public class JsonReadTests
         Assert.False(JsonRead.AsBool(node["count"]));
         Assert.Equal(new[] { "x" }, JsonRead.AsStringList(node["list"]));
         Assert.Empty(JsonRead.AsStringList(node["text"]));
+    }
+}
+
+public class ConnectionSettingsTests
+{
+    private static string ScratchPath(out string root)
+    {
+        root = Path.Combine(Path.GetTempPath(), $"azki-settings-{Guid.NewGuid():N}");
+        return Path.Combine(root, "settings.json");
+    }
+
+    [Fact]
+    public void ValueSurvivesReloadAndRangeIsEnforced()
+    {
+        var path = ScratchPath(out var root);
+        try
+        {
+            var first = new ConnectionSettings(path);
+            Assert.Equal(ConnectionSettings.DefaultTimeoutSeconds, first.TimeoutSeconds);
+            first.TimeoutSeconds = 45;
+            // The Swift didSet drops an out-of-range write; the persisted value must not follow it.
+            first.TimeoutSeconds = 0;
+            first.TimeoutSeconds = 301;
+            Assert.Equal(45, new ConnectionSettings(path).TimeoutSeconds);
+            Assert.Equal(45d, first.TimeoutSecondsDisplay);
+            first.TimeoutSecondsDisplay = 60.4;
+            Assert.Equal(60, new ConnectionSettings(path).TimeoutSeconds);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public void FileUsesTheMacOsUserDefaultsKeyAndStaysPrivate()
+    {
+        var path = ScratchPath(out var root);
+        try
+        {
+            new ConnectionSettings(path) { TimeoutSeconds = 90 };
+            Assert.Contains(ConnectionSettings.TimeoutKey, File.ReadAllText(path));
+            Assert.Equal(0x180, UnixNative.ModeBits(UnixNative.Stat(path).Mode)); // 0600
+            Assert.Equal(0x1C0, UnixNative.ModeBits(UnixNative.Stat(root).Mode)); // 0700
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public void DamagedFileFallsBackToDefaultAndHealsOnWrite()
+    {
+        var path = ScratchPath(out var root);
+        try
+        {
+            Directory.CreateDirectory(root);
+            foreach (var damaged in new[] { "not json", "[1,2]", """{"version":1}""" })
+            {
+                File.WriteAllText(path, damaged);
+                Assert.Equal(ConnectionSettings.DefaultTimeoutSeconds, new ConnectionSettings(path).TimeoutSeconds);
+            }
+            var healed = new ConnectionSettings(path);
+            healed.TimeoutSeconds = 120;
+            Assert.Equal(120, new ConnectionSettings(path).TimeoutSeconds);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+}
+
+public class RecordingTests
+{
+    private static bool FfmpegAvailable() =>
+        (Environment.GetEnvironmentVariable("PATH") ?? string.Empty)
+            .Split(Path.PathSeparator)
+            .Any(directory => File.Exists(Path.Combine(directory, "ffmpeg")));
+
+    private static RawFrame Frame(int width, int height)
+    {
+        var pixels = new byte[width * 2 * height];
+        for (var index = 0; index < pixels.Length; index++) pixels[index] = (byte)(index % 251);
+        return new RawFrame(2, width, height, width * 2, pixels);
+    }
+
+    [Fact]
+    public void SafeNameMatchesTheMacOsContract()
+    {
+        // Same rules as SimulatorRecordingEncoder.safeName: keep alphanumerics and
+        // " -_", replace everything else with "-", cap at 96 bytes, fall back to 设备.
+        Assert.Equal("Q66 pro_1-A", FfmpegEncoder.SafeName("Q66 pro_1/A"));
+        // A lone slash still yields a non-empty "-", exactly like the Swift trim;
+        // only an all-whitespace name falls back to 设备.
+        Assert.Equal("-", FfmpegEncoder.SafeName("  /  "));
+        Assert.Equal("设备", FfmpegEncoder.SafeName("   "));
+        Assert.Equal(96, Encoding.UTF8.GetByteCount(FfmpegEncoder.SafeName(new string('a', 400))));
+        // Non-ASCII names survive as letters (char.IsLetterOrDigit), not dashes.
+        Assert.Equal("小扣", FfmpegEncoder.SafeName("小扣"));
+    }
+
+    [Fact]
+    public void OddGeometryIsRefusedBeforeAnythingIsCreated()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"azki-record-{Guid.NewGuid():N}");
+        try
+        {
+            var failure = Assert.Throws<IOException>(() => FfmpegEncoder.Launch("ffmpeg", 33, 32, 30, root, "x"));
+            Assert.Contains("不适合", failure.Message);
+            // The guard runs before anything is created, so the output root stays absent.
+            Assert.False(Directory.Exists(root));
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public void MissingFfmpegRefusesWithoutStagingRemnants()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"azki-record-{Guid.NewGuid():N}");
+        try
+        {
+            var failure = Assert.Throws<IOException>(() => FfmpegEncoder.Launch(
+                Path.Combine(root, "definitely-not-here"), 64, 64, 30, root, "x"));
+            Assert.Contains("未找到 ffmpeg", failure.Message);
+            Assert.Empty(Directory.GetDirectories(root, ".azki-recording-*"));
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public void StartRefusesWithoutAFrame()
+    {
+        var model = new RecordingModel(Path.GetTempPath());
+        Assert.False(model.Start("x", () => null));
+        Assert.Contains("请等待设备启动", model.ErrorMessage);
+        Assert.False(model.IsRecording);
+    }
+
+    [Fact]
+    public async Task RecordsThroughFfmpegWhenAvailable()
+    {
+        // Returning quietly here would be counted as a pass, so a missing encoder says so:
+        // ffmpeg is in the documented build dependencies of both the Arch container and a
+        // developer machine, and this is the only test that watches the real pipe.
+        Assert.True(FfmpegAvailable(), "需要 ffmpeg 才能验真录屏链路（安装 ffmpeg 后重跑）");
+        var root = Path.Combine(Path.GetTempPath(), $"azki-record-{Guid.NewGuid():N}");
+        try
+        {
+            var frame = Frame(64, 64);
+            var model = new RecordingModel(root);
+            Assert.True(model.Start("测试 实例", () => frame));
+            await Task.Delay(250);
+            var first = model.StopAsync();
+            var second = model.StopAsync(); // concurrent stops share one finalization
+            await Task.WhenAll(first, second);
+            Assert.False(model.IsRecording);
+            Assert.False(model.IsFinishing);
+            Assert.NotNull(model.SavedFile);
+            Assert.True(File.Exists(model.SavedFile));
+            Assert.StartsWith("Azki-", Path.GetFileName(model.SavedFile!));
+            Assert.Contains("测试 实例", Path.GetFileName(model.SavedFile!));
+            Assert.Empty(Directory.GetDirectories(root, ".azki-recording-*"));
+            Assert.Equal(0x180, UnixNative.ModeBits(UnixNative.Stat(model.SavedFile!).Mode)); // 0600
+            var startInfo = new ProcessStartInfo("ffprobe") { RedirectStandardOutput = true, UseShellExecute = false };
+            // ArgumentList, not an argument string: the .NET parser only understands
+            // double quotes, and this path must arrive byte-for-byte.
+            foreach (var argument in new[]
+            {
+                "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name,width,height", "-of", "csv=p=0", model.SavedFile!,
+            }) startInfo.ArgumentList.Add(argument);
+            var probe = Process.Start(startInfo)!;
+            var output = await probe.StandardOutput.ReadToEndAsync();
+            await probe.WaitForExitAsync();
+            Assert.Equal(0, probe.ExitCode);
+            Assert.Contains("h264", output);
+            Assert.Contains("64,64", output);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    /// <summary>The pipe is framed by hand: rgb565le is width*2 bytes per row with no
+    /// padding, so a wrong stride shows up as a frame count that does not match what was
+    /// written rather than as an error. Feeding a known count makes that the assertion.</summary>
+    [Fact]
+    public async Task EveryFedFrameSurvivesTheRawVideoPipe()
+    {
+        Assert.True(FfmpegAvailable(), "需要 ffmpeg 才能验真录屏链路（安装 ffmpeg 后重跑）");
+        var root = Path.Combine(Path.GetTempPath(), $"azki-record-{Guid.NewGuid():N}");
+        try
+        {
+            const int frames = 12;
+            var encoder = FfmpegEncoder.Launch("ffmpeg", 64, 64, 30, root, "count");
+            for (var index = 0; index < frames; index++)
+            {
+                var pixels = new byte[64 * 64 * 2];
+                for (var byteIndex = 0; byteIndex < pixels.Length; byteIndex++)
+                    pixels[byteIndex] = (byte)((byteIndex + index * 7) % 251);
+                await encoder.WriteAsync(pixels, CancellationToken.None);
+            }
+            var path = await encoder.FinishAsync();
+            var probed = await ProbeAsync(path, "stream=codec_name,width,height,nb_frames");
+            Assert.Contains("h264", probed);
+            Assert.True(probed.Contains($",{frames},"), $"frame count lost through the pipe: {probed}");
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    private static async Task<string> ProbeAsync(string path, string entries)
+    {
+        var startInfo = new ProcessStartInfo("ffprobe") { RedirectStandardOutput = true, UseShellExecute = false };
+        foreach (var argument in new[]
+        { "-v", "error", "-select_streams", "v:0", "-show_entries", entries, "-of", "csv=p=0", path })
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+        var probe = Process.Start(startInfo)!;
+        var output = await probe.StandardOutput.ReadToEndAsync();
+        await probe.WaitForExitAsync();
+        Assert.Equal(0, probe.ExitCode);
+        return output.Replace("\n", ",");
     }
 }

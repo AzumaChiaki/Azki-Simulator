@@ -22,6 +22,7 @@ public sealed class DeviceFrameService : IAsyncDisposable
     private Task? _loop;
     private WriteableBitmap? _bitmap;
     private RawFrame? _pending;
+    private volatile RawFrame? _latest;
     private bool _blitQueued;
 
     public DeviceFrameService(string sessionDirectory, SessionManifest manifest)
@@ -30,6 +31,12 @@ public sealed class DeviceFrameService : IAsyncDisposable
     }
 
     public WriteableBitmap? Current => _bitmap;
+
+    /// <summary>Newest decoded frame, read by the recorder's sampler without going
+    /// through the UI thread. Null once the session ended, so a recording in flight
+    /// finalizes instead of sampling a replaced session — the Swift frameSource
+    /// contract ("nil means the originating session ended") in another shape.</summary>
+    public RawFrame? Latest => _latest;
 
     /// <summary>Every event is raised on the UI thread: subscribers bind to views.</summary>
     public event Action<WriteableBitmap>? Updated;
@@ -52,6 +59,7 @@ public sealed class DeviceFrameService : IAsyncDisposable
             }
             catch (Exception error) when (error is BridgeConnectionClosed)
             {
+                _latest = null;
                 Dispatch(() => Disconnected?.Invoke(error));
                 return;
             }
@@ -76,6 +84,7 @@ public sealed class DeviceFrameService : IAsyncDisposable
         lock (_gate)
         {
             _pending = frame;
+            _latest = frame;
             if (_blitQueued) return;
             _blitQueued = true;
         }
@@ -124,6 +133,10 @@ public sealed class DeviceFrameService : IAsyncDisposable
         {
             try { await _loop; } catch (Exception) { }
         }
+        // Cleared only after the loop is done: QueueBlit could still have stored a
+        // frame between the cancel and the loop's exit, and the recorder treats a
+        // non-null Latest as "session still live".
+        _latest = null;
         _reader.Dispose();
         // The bitmap belongs to the UI thread that renders it, even when the window
         // closed on a different dispatcher turn.
@@ -136,7 +149,11 @@ public static class CanvasGeometry
 {
     public static Rect ContentRect(Rect bounds, Size pixelSize)
     {
-        if (!double.IsFinite(bounds.Width) || !double.IsFinite(bounds.Height) || bounds.Width <= 0 || bounds.Height <= 0 ||
+        // The reference guards the origin too: a non-finite origin leaves the
+        // rectangle's position undefined, and the point mapping would then read
+        // NaN comparisons as false and hand the guest a negative pixel.
+        if (!double.IsFinite(bounds.X) || !double.IsFinite(bounds.Y) ||
+            !double.IsFinite(bounds.Width) || !double.IsFinite(bounds.Height) || bounds.Width <= 0 || bounds.Height <= 0 ||
             !double.IsFinite(pixelSize.Width) || !double.IsFinite(pixelSize.Height) || pixelSize.Width <= 0 || pixelSize.Height <= 0)
             return default;
         var scale = Math.Min(bounds.Width / pixelSize.Width, bounds.Height / pixelSize.Height);
@@ -154,5 +171,48 @@ public static class CanvasGeometry
         var x = Math.Min((int)pixelSize.Width - 1, (int)((point.X - rect.X) / rect.Width * pixelSize.Width));
         var y = Math.Min((int)pixelSize.Height - 1, (int)((point.Y - rect.Y) / rect.Height * pixelSize.Height));
         return (x, y);
+    }
+}
+
+/// <summary>The canvas-side contact state machine of SimulatorNativeCanvas, with the
+/// mapped device point as its only input: a press outside the screen starts no contact,
+/// dragging off it lifts the finger, and releasing outside lifts at the remembered
+/// contact. Every emitted event is what the caller must send; null means send nothing.</summary>
+public sealed class TouchContactTracker
+{
+    private bool _active;
+    private (int X, int Y) _last;
+
+    public (int X, int Y, bool Down)? Pressed((int X, int Y)? point)
+    {
+        if (point is not { } start) return null;
+        _active = true;
+        _last = start;
+        return (start.X, start.Y, true);
+    }
+
+    public (int X, int Y, bool Down)? Moved((int X, int Y)? point)
+    {
+        if (!_active) return null;
+        if (point is { } next)
+        {
+            _last = next;
+            return (next.X, next.Y, true);
+        }
+        return Cancelled();
+    }
+
+    public (int X, int Y, bool Down)? Released((int X, int Y)? point)
+    {
+        if (!_active) return null;
+        if (point is { } up) _last = up;
+        return Cancelled();
+    }
+
+    public (int X, int Y, bool Down)? Cancelled()
+    {
+        if (!_active) return null;
+        _active = false;
+        return (_last.X, _last.Y, false);
     }
 }

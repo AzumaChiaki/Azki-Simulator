@@ -19,6 +19,11 @@ public sealed class SandboxPolicy
     public List<string> ReadWriteTrees { get; init; } = new();
     public List<string> ReadOnlyFiles { get; init; } = new();
 
+    /// <summary>Directories re-bound read-only *after* a writable parent, so a command
+    /// granted a folder cannot reach the siblings inside it. Only meaningful as a
+    /// restriction on a writable tree; a bind is applied in argument order.</summary>
+    public List<string> ProtectedTrees { get; init; } = new();
+
     /// <summary>bwrap flags only: callers put Launcher in ProcessStartInfo.FileName,
     /// so repeating it here would make bwrap try to exec itself as the payload.</summary>
     public List<string> BuildArguments()
@@ -34,9 +39,15 @@ public sealed class SandboxPolicy
             "--symlink", "usr/lib64", "/lib64", "--symlink", "usr/lib", "/lib", "--symlink", "usr/bin", "/bin",
             "--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc", "--tmpfs", "/tmp",
         };
-        foreach (var tree in ReadOnlyTrees.Distinct()) args.AddRange(new[] { "--ro-bind", tree, tree });
+        // A tree the command may write must not also be bound read-only at the same path:
+        // the later bind would win, and the duplicate mount only makes the argv harder to read.
+        var writable = ReadWriteTrees.Distinct().ToList();
+        foreach (var tree in ReadOnlyTrees.Distinct().Except(writable)) args.AddRange(new[] { "--ro-bind", tree, tree });
         foreach (var file in ReadOnlyFiles.Distinct()) args.AddRange(new[] { "--ro-bind", file, file });
-        foreach (var tree in ReadWriteTrees.Distinct()) args.AddRange(new[] { "--bind", tree, tree });
+        foreach (var tree in writable) args.AddRange(new[] { "--bind", tree, tree });
+        // Last so they win over the writable parent: what is bound here is visible but
+        // cannot be unlinked, because a mount point is not removable from inside.
+        foreach (var tree in ProtectedTrees.Distinct()) args.AddRange(new[] { "--ro-bind", tree, tree });
         args.Add("--");
         return args;
     }

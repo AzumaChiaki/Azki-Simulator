@@ -4,7 +4,7 @@ using System.Text.Json.Nodes;
 
 namespace AzkiSimulator.Linux.Core;
 
-public sealed record CliResult(int ExitCode, JsonNode? Payload, string Raw);
+public sealed record CliResult(int ExitCode, JsonNode? Payload, string Raw, string Error = "");
 
 /// <summary>
 /// Runs one-shot azki-simulator.py commands inside bwrap, mirroring
@@ -24,9 +24,9 @@ public sealed class InspectionRunner(EngineLayout Layout)
     };
 
     public async Task<CliResult> RunAsync(string action, IEnumerable<string> extraArguments,
-        bool libraryWritable = false, IEnumerable<string>? readOnlyFiles = null,
-        IEnumerable<string>? readWriteTrees = null, CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default)
     {
+        var argv = extraArguments.ToList();
         var work = DataLocations.NewCommandWorkRoot();
         DataLocations.EnsurePrivateDirectory(work);
         DataLocations.EnsurePrivateDirectory(DataLocations.FirmwareLibraryRoot);
@@ -35,13 +35,17 @@ public sealed class InspectionRunner(EngineLayout Layout)
         {
             var policy = new SandboxPolicy
             {
-                ReadOnlyTrees = { Layout.EngineRoot, Layout.RuntimeRoot, Layout.FirmwareRoot, DataLocations.InstancesRoot },
+                ReadOnlyTrees =
+                {
+                    Layout.EngineRoot, Layout.RuntimeRoot, Layout.FirmwareRoot,
+                    DataLocations.InstancesRoot, DataLocations.FirmwareLibraryRoot,
+                },
                 ReadWriteTrees = { work },
             };
-            foreach (var file in readOnlyFiles ?? []) policy.ReadOnlyFiles.Add(file);
-            if (libraryWritable) policy.ReadWriteTrees.Add(DataLocations.FirmwareLibraryRoot);
-            else policy.ReadOnlyTrees.Add(DataLocations.FirmwareLibraryRoot);
-            foreach (var tree in readWriteTrees ?? []) policy.ReadWriteTrees.Add(tree);
+            CliGrants.Apply(policy, action, argv, DataLocations.FirmwareLibraryRoot);
+            // bwrap binds an existing source path, so a grant the command needs before it
+            // can create the folder itself has to be created here, as the reference host does.
+            foreach (var tree in policy.ReadWriteTrees.Distinct()) DataLocations.EnsurePrivateDirectory(tree);
 
             var info = new ProcessStartInfo
             {
@@ -57,7 +61,7 @@ public sealed class InspectionRunner(EngineLayout Layout)
             foreach (var argument in new[] { "-I", "-S", "-B", Layout.Cli, action,
                                              "--engine-root", Layout.EngineRoot, "--library-root", DataLocations.FirmwareLibraryRoot })
                 info.ArgumentList.Add(argument);
-            foreach (var argument in extraArguments) info.ArgumentList.Add(argument);
+            foreach (var argument in argv) info.ArgumentList.Add(argument);
             info.Environment.Clear();
             info.Environment["PATH"] = "/usr/bin:/bin";
             info.Environment["LANG"] = "C";
@@ -73,6 +77,12 @@ public sealed class InspectionRunner(EngineLayout Layout)
             using var timeout = new CancellationTokenSource(Timeouts.GetValueOrDefault(action, DefaultTimeout));
             try
             {
+                // The pipes are drained before the wait, not after: the sandboxed payload
+                // inherits them, and a process object that goes away closes them, so a
+                // payload still writing at that moment is killed instead of finishing.
+                // Waiting for the streams first is also what .NET documents for redirected
+                // output, and the hard deadline still covers both waits.
+                await Task.WhenAll(stdoutTask, stderrTask).WaitAsync(timeout.Token);
                 await process.WaitForExitAsync(timeout.Token);
             }
             catch (OperationCanceledException)
@@ -90,7 +100,7 @@ public sealed class InspectionRunner(EngineLayout Layout)
             var raw = stdout.Length == 0 ? stderr : stdout;
             JsonNode? payload = null;
             try { payload = JsonNode.Parse(raw); } catch (JsonException) { /* non-JSON output surfaces through Raw */ }
-            return new CliResult(process.ExitCode, payload, raw);
+            return new CliResult(process.ExitCode, payload, raw, stderr);
         }
         finally
         {
@@ -108,14 +118,25 @@ public sealed class InspectionRunner(EngineLayout Layout)
 
     /// <summary>Runs an action and requires ok:true; failures throw BridgeRemoteError with the CLI message.</summary>
     public async Task<JsonNode> RunCheckedAsync(string action, IEnumerable<string> extraArguments,
-        bool libraryWritable = false, IEnumerable<string>? readOnlyFiles = null,
-        IEnumerable<string>? readWriteTrees = null, CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default)
     {
-        var result = await RunAsync(action, extraArguments, libraryWritable, readOnlyFiles, readWriteTrees, cancellationToken);
+        var result = await RunAsync(action, extraArguments, cancellationToken);
         if (result.Payload is not JsonObject body || !JsonRead.AsBool(body["ok"]))
         {
             var message = JsonRead.AsString(result.Payload?["error"]?["message"]);
-            throw new BridgeRemoteError(message ?? $"{action} 失败：{(result.Raw.Length > 400 ? result.Raw[..400] : result.Raw)}");
+            // The launcher writes its own refusals to stderr while the command writes
+            // JSON to stdout, so both are needed to say why a command did not run.
+            var detail = string.IsNullOrEmpty(result.Error) ? result.Raw : result.Error;
+            if (string.IsNullOrEmpty(detail) && !string.IsNullOrEmpty(result.Raw)) detail = result.Raw;
+            if (string.IsNullOrEmpty(detail))
+            {
+                // 128 + signal is how a killed process reports itself. On this machine the
+                // kernel's OOM killer is the usual reason, and saying so beats a bare code.
+                detail = result.ExitCode > 128
+                    ? $"命令被信号 {result.ExitCode - 128} 终止（退出码 {result.ExitCode}，常见于内存压力下的系统 OOM）"
+                    : $"退出码 {result.ExitCode}";
+            }
+            throw new BridgeRemoteError(message ?? $"{action} 失败：{(detail.Length > 400 ? detail[..400] : detail)}");
         }
         return body;
     }

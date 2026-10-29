@@ -17,6 +17,14 @@ public static class DataLocations
     public static string GuiLogPath => Path.Combine(AppSupportRoot, "logs", "gui.log");
     public static string TmpRoot => Environment.GetEnvironmentVariable("AZKI_TMP_ROOT") ?? "/tmp";
 
+    // The plan pins settings.json at ~/.config/azki-simulator, separate from the
+    // XDG data root: settings are per-login preferences, not instance content.
+    public static string ConfigRoot =>
+        Environment.GetEnvironmentVariable("AZKI_CONFIG_ROOT")
+        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "azki-simulator");
+
+    public static string SettingsPath => Path.Combine(ConfigRoot, "settings.json");
+
     /// <summary>Methods, not properties: every call hands out a different directory, so
     /// reading the same name twice must not look like it returns the same value.</summary>
     public static string NewSessionRoot() =>
@@ -37,10 +45,26 @@ public static class DataLocations
             var stat = UnixNative.Stat(path);
             if (stat.Uid != UnixNative.getuid())
                 throw new IOException($"目录已存在且不属于当前用户：{path}");
-            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            MakePrivate(path);
             return;
         }
+        // Creating a private directory also creates the ancestors it is missing, and
+        // those come out at the umask default: the guest run directory was left 0755
+        // as a side effect of creating its "tmp" child, which the session helper then
+        // refused. Every component this call brings into existence is made private.
+        var missing = new List<string>();
+        for (var walk = Path.GetFullPath(path); !Directory.Exists(walk);)
+        {
+            missing.Add(walk);
+            var parent = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(walk));
+            if (string.IsNullOrEmpty(parent)) break;
+            walk = parent;
+        }
         Directory.CreateDirectory(path);
-        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        MakePrivate(path);
+        foreach (var created in missing) MakePrivate(created);
     }
+
+    private static void MakePrivate(string path) =>
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 }

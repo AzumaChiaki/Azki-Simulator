@@ -65,13 +65,9 @@ public sealed class InstanceStore
             EnsureRoot();
             using var diskLock = Lock();
             var path = Path.Combine(Root, Filename);
-            if (File.Exists(path)) ParseDocument(File.ReadAllText(path)); // refuse to overwrite malformed data
-            var temporary = Path.Combine(Root, $".instances-{Guid.NewGuid():N}.tmp");
-            File.WriteAllText(temporary, bytes);
-            File.SetUnixFileMode(temporary, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-            if (File.Exists(path)) File.Move(temporary, path, overwrite: true);
-            else UnixNative.HardLink(temporary, path);
-            try { File.Delete(temporary); } catch (IOException) { }
+            var existed = File.Exists(path);
+            if (existed) ParseDocument(File.ReadAllText(path)); // refuse to overwrite malformed data
+            UnixNative.PublishRecord(Root, "instances", Filename, bytes, mayReplace: existed);
         }
     }
 

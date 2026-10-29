@@ -76,6 +76,28 @@ public partial class ManagerWindow : Window
             model.OpenDeviceCommand.Execute(null);
     }
 
+    private async void DeleteAll_Click(object? sender, RoutedEventArgs e)
+    {
+        if (DataContext is not ManagerViewModel model) return;
+        try
+        {
+            var count = model.FirmwareItems.Count;
+            // Destructive and irreversible, so it confirms first and defaults to no
+            // button — the same posture as the macOS settings sheet.
+            var confirm = new FluentAvalonia.UI.Controls.ContentDialog
+            {
+                Title = "删除全部镜像",
+                Content = $"将清空整个固件库：移除全部 {count} 个已导入的 OTA 及其对象文件，并回收对应磁盘空间。此操作不可撤销，已创建的实例记录保留。",
+                PrimaryButtonText = $"删除全部 {count} 个镜像",
+                CloseButtonText = "取消",
+                DefaultButton = FluentAvalonia.UI.Controls.ContentDialogButton.None,
+            };
+            if (await confirm.ShowAsync() == FluentAvalonia.UI.Controls.ContentDialogResult.Primary)
+                await model.DeleteAllFirmwareAsync();
+        }
+        catch (Exception error) { UiFault.Report(error); }
+    }
+
     private async void ImportFirmware_Click(object? sender, RoutedEventArgs e)
     {
         if (DataContext is not ManagerViewModel model) return;

@@ -33,6 +33,20 @@ public abstract class ObservableObject : INotifyPropertyChanged
     }
 }
 
+/// <summary>Synchronous command for pure state edits (sheet rows). Anything that
+/// reaches processes or sockets must use AsyncRelayCommand instead.</summary>
+public sealed class RelayCommand(Action execute, Func<bool>? canExecute = null) : ICommand
+{
+    public event EventHandler? CanExecuteChanged;
+    public bool CanExecute(object? parameter) => canExecute?.Invoke() ?? true;
+    public void Execute(object? parameter)
+    {
+        try { execute(); }
+        catch (Exception error) { UiFault.Report(error); }
+    }
+    public void RaiseCanExecute() => CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+}
+
 /// <summary>Async command that refuses to overlap itself and reports anything it throws.
 /// Command bodies reach processes and sockets, so a second click during an in-flight
 /// start would otherwise spawn a second sandboxed session for the same instance.</summary>

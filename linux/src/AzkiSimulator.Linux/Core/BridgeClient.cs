@@ -39,7 +39,9 @@ public sealed record SessionManifest(string Id, string SocketName, string Frameb
 /// </summary>
 public sealed class BridgeClient : IDisposable
 {
-    private static readonly HashSet<string> Permitted = new()
+    // Internal rather than private: the permitted set is the reference's contract,
+    // and a command that drifts out of it is refused at runtime with no other trace.
+    internal static readonly HashSet<string> Permitted = new()
     {
         "status", "start", "stop", "input", "device-button", "screenshot", "logs", "inspect-package", "stage-package",
         "pmu-adc-get", "pmu-adc-set", "guest-status", "guest-connect", "guest-install", "guest-operation",
@@ -91,7 +93,14 @@ public sealed class BridgeClient : IDisposable
         EnsureOpen();
         if (!Permitted.Contains(command)) throw new BridgeRemoteError("不受支持的会话命令");
         if (command == "stop") ReleaseInput();
-        return Exchange(command, arguments ?? new JsonObject(), DefaultDeadline);
+        // The user-settable connection timeout governs the commands that open upstream
+        // connections inside the helper, matching the macOS label ("用于虚拟设备连接").
+        // Control and input commands keep their fixed budgets so a wedged helper cannot
+        // pin a UI action for the full five minutes the setting allows.
+        var budget = command.StartsWith("guest-") || command.StartsWith("external-")
+            ? TimeSpan.FromSeconds(ConnectionSettings.Shared.TimeoutSeconds)
+            : DefaultDeadline;
+        return Exchange(command, arguments ?? new JsonObject(), budget);
     }
 
     public void Input(int x, int y, bool down)
@@ -143,12 +152,13 @@ public sealed class BridgeClient : IDisposable
         if (_closed) throw new BridgeConnectionClosed();
         var deadline = MonotonicClock.Now + deadlineLength;
         ValidateRoot();
-        // guest-/external- commands open upstream connections inside the helper's own
-        // budget, so they are told how long the host is still willing to wait. The
-        // caller's arguments object is copied rather than mutated: a retried command
-        // must send exactly what the caller built.
+        // Only guest-* commands are told how long the host is still willing to wait:
+        // the helper validates an exact field set per command, and among the external
+        // bridge commands only external-open accepts the key. The caller's arguments
+        // object is copied rather than mutated, so a retried command sends exactly
+        // what the caller built.
         var body = arguments.DeepClone().AsObject();
-        if (command.StartsWith("guest-") || command.StartsWith("external-"))
+        if (command.StartsWith("guest-"))
             body["connectionTimeoutSeconds"] = (int)Math.Ceiling(deadlineLength.TotalSeconds);
         using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
         var remaining = Math.Clamp((int)(deadline - MonotonicClock.Now).TotalMilliseconds, 250, 3_600_000);
