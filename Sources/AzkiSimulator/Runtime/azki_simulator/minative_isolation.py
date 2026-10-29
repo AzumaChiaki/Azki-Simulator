@@ -17,7 +17,7 @@ from pathlib import Path
 import sys
 import stat
 
-from .bwrap_policy import PREAMBLE as BWRAP_PREAMBLE
+from .bwrap_policy import LAUNCHER as BWRAP_LAUNCHER, PREAMBLE as BWRAP_PREAMBLE
 from .minative import MError
 
 
@@ -29,7 +29,9 @@ def execution_prefix(adapter):
         if not Path("/usr/bin/sandbox-exec").is_file():
             raise MError("isolation_unavailable", "Required macOS sandbox launcher is unavailable")
     elif sys.platform.startswith("linux"):
-        if not Path("/usr/bin/bwrap").is_file():
+        # The launcher comes from the shared policy module so the argv and the
+        # existence check cannot drift apart.
+        if not Path(BWRAP_LAUNCHER).is_file():
             raise MError("isolation_unavailable", "Required bubblewrap launcher is unavailable")
     else:
         raise MError("isolation_unavailable", "No supported process isolation launcher for this host")

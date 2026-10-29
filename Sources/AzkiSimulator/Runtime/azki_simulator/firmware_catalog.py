@@ -770,7 +770,12 @@ class FirmwareCatalog:
                         models.append(full)
                     elif code in self.hardware_models:
                         models.append(code)
-                if not source.get("declaredModels") and bound is None:
+                if not models and bound is None:
+                    # The AP can name a device this build has no preset for. The
+                    # candidates already fall back to every preset in that case,
+                    # and a receipt whose items do not cover its candidates is
+                    # refused by the decoder, so the listing follows the
+                    # candidates instead of staying empty.
                     models = self.hardware_models
             for model in models:
                 items.append(self._generic_item(model, digest, source, index))

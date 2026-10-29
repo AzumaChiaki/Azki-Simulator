@@ -28,8 +28,36 @@ CPU_FACTOR = 8
 # evidence, reap QEMU and publish the storage receipt before forced cleanup.
 STOP_GRACE_SECONDS = 8
 # The sandboxed payload starts with exactly one supported launcher per host.
-EXPECTED_LAUNCHER = "/usr/bin/sandbox-exec" if sys.platform == "darwin" else "/usr/bin/bwrap"
+# The set is the same on both hosts: the host passes its own launcher, and a
+# launcher outside the set is refused rather than guessed.
+SUPPORTED_LAUNCHERS = ("/usr/bin/sandbox-exec", "/usr/bin/bwrap")
 SUPPORTED_HOSTS = ("darwin", "linux")
+
+
+def native_parent_is(expected):
+    """Whether the announced native parent is the process that supervises this one.
+
+    Darwin's launcher execs in place, so the app is the direct parent. bwrap cannot:
+    it stays as the payload's parent because that is the relationship
+    --die-with-parent watches, so on Linux the app is the grandparent and the step in
+    between has to be the launcher itself. The same test doubles as the liveness
+    check: once the app is gone, the launcher is reparented and the announced pid
+    stops being its parent.
+    """
+    launcher = os.getppid()
+    if launcher == expected:
+        return True
+    if expected < 2 or not sys.platform.startswith("linux"):
+        return False
+    try:
+        with open("/proc/" + str(launcher) + "/status", encoding="ascii", errors="replace") as stream:
+            fields = {}
+            for line in stream:
+                key, _, value = line.partition(":")
+                fields[key] = value.strip()
+    except OSError:
+        return False
+    return fields.get("Name") == "bwrap" and fields.get("PPid") == str(expected)
 
 
 def publish_metadata(path, child_pid):
@@ -190,7 +218,7 @@ def await_native_go(parent, stopped, *, descriptor=0, timeout=2):
     expected = b"AZKI-GUEST-GO\n"
     deadline, data = time.monotonic() + min(timeout, 2), b""
     while time.monotonic() < deadline:
-        if stopped() or os.getppid() != parent:
+        if stopped() or not native_parent_is(parent):
             raise RuntimeError("Native parent exited or cancelled before guest start")
         ready, _, _ = select.select([descriptor], [], [], min(.05, max(0, deadline - time.monotonic())))
         if ready:
@@ -209,7 +237,7 @@ def main():
     native = len(sys.argv) > 1 and sys.argv[1] == "--native"
     if native:
         duration, metadata, parent, command = native_invocation(sys.argv[1:])
-        if sys.platform not in SUPPORTED_HOSTS or os.getppid() != parent:
+        if sys.platform not in SUPPORTED_HOSTS or not native_parent_is(parent):
             raise SystemExit("Invalid native parent")
         if os.getpgrp() != os.getpid():
             os.setsid()
@@ -219,7 +247,7 @@ def main():
         duration, metadata, parent = int(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
         if (sys.platform not in SUPPORTED_HOSTS or not 0 <= duration <= MAX_RUN_SECONDS + 15 or
                 os.getppid() != parent or os.getpgrp() != os.getpid() or
-                sys.argv[4] != EXPECTED_LAUNCHER or metadata.name != "runner-process.json"):
+                sys.argv[4] not in SUPPORTED_LAUNCHERS or metadata.name != "runner-process.json"):
             raise SystemExit("Invalid isolated runner invocation")
         command = sys.argv[4:]
     # The helper rejects any run output readable by others; the runner and QEMU
@@ -244,7 +272,7 @@ def main():
     try:
         publish_metadata(metadata, child.pid)
         while child.poll() is None:
-            if stopping or os.getppid() != parent or (deadline is not None and time.monotonic() >= deadline):
+            if stopping or not native_parent_is(parent) or (deadline is not None and time.monotonic() >= deadline):
                 terminate_group(child)
                 break
             time.sleep(.05)
