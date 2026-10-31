@@ -370,12 +370,14 @@ private struct SimulatorInspectorAttachment: ViewModifier {
                         .frame(maxWidth: .infinity, minHeight: 120,
                                idealHeight: logPanelHeight, maxHeight: logPanelHeight)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 canvas
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
     }
 
     @ViewBuilder private var canvas: some View {

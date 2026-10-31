@@ -13,26 +13,11 @@ import SwiftUI
             Label(instanceName.map { "\($0) · 日志" } ?? "日志", systemImage: "text.alignleft")
                 .font(.headline)
                 .accessibilityAddTraits(.isHeader)
-            HStack {
-                Picker("日志来源", selection: $stream.selectedName) {
-                    Text("UART 0").tag("uart0.log")
-                    Text("UART 1").tag("uart1.log")
-                    Text("UART 2").tag("uart2.log")
-                    Text("QEMU").tag("qemu.log")
-                    Text("虚拟手环连接").tag("virtual-peer.log")
-                    Text("标准错误").tag("stderr.log")
-                }.disabled(!session.isAttached)
-                    .accessibilityIdentifier("simulator.log-source")
-                Toggle("跟随最新日志", isOn: $stream.followBottom).toggleStyle(.checkbox)
-                    .accessibilityIdentifier("simulator.log-follow")
-                Button("重连日志", systemImage: "arrow.clockwise") {
-                    if let id = session.manifest?.id, let directory = runtime.sessionURL {
-                        stream.start(directory: directory, sessionID: id, name: stream.selectedName)
-                    }
-                }
-                .disabled(!allowsReconnect || !session.isAttached)
-                .accessibilityIdentifier("simulator.log-reconnect")
+            ViewThatFits(in: .horizontal) {
+                HStack { controls }
+                VStack(alignment: .leading) { controls }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             if session.isAttached && stream.detail != "实时刷新 · 最多保留 256 KiB" {
                 Text(stream.detail).font(.caption).foregroundStyle(.secondary)
             }
@@ -43,6 +28,28 @@ import SwiftUI
                 .accessibilityIdentifier("simulator.live-log")
         }
         .padding(12)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    @ViewBuilder private var controls: some View {
+        Picker("日志来源", selection: $stream.selectedName) {
+            Text("UART 0").tag("uart0.log")
+            Text("UART 1").tag("uart1.log")
+            Text("UART 2").tag("uart2.log")
+            Text("QEMU").tag("qemu.log")
+            Text("虚拟手环连接").tag("virtual-peer.log")
+            Text("标准错误").tag("stderr.log")
+        }
+        .disabled(!session.isAttached)
+        .accessibilityIdentifier("simulator.log-source")
+        Toggle("跟随最新日志", isOn: $stream.followBottom).toggleStyle(.checkbox)
+            .accessibilityIdentifier("simulator.log-follow")
+        Button("重连日志", systemImage: "arrow.clockwise") {
+            if let id = session.manifest?.id, let directory = runtime.sessionURL {
+                stream.start(directory: directory, sessionID: id, name: stream.selectedName)
+            }
+        }
+        .disabled(!allowsReconnect || !session.isAttached)
+        .accessibilityIdentifier("simulator.log-reconnect")
     }
 }

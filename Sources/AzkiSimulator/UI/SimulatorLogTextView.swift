@@ -37,7 +37,6 @@ struct SimulatorLogTextView: NSViewRepresentable {
         guard let view = scroll.documentView as? NSTextView else { return }
         let removed = epoch == coordinator.epoch ? max(0, discardedUTF16 - coordinator.discardedUTF16) : Int.max
         coordinator.discardedUTF16 = discardedUTF16; coordinator.epoch = epoch
-        view.minSize = scroll.contentSize
         if view.string != text {
             let old = view.string
             let origin = scroll.contentView.bounds.origin
@@ -67,8 +66,11 @@ struct SimulatorLogTextView: NSViewRepresentable {
         if let manager = view.layoutManager, let container = view.textContainer {
             manager.ensureLayout(for: container)
             let used = manager.usedRect(for: container)
-            view.setFrameSize(NSSize(width: max(scroll.contentSize.width, used.maxX + view.textContainerInset.width * 2),
-                                     height: max(scroll.contentSize.height, used.maxY + view.textContainerInset.height * 2)))
+            let size = NSSize(width: max(scroll.contentSize.width, used.maxX + view.textContainerInset.width * 2),
+                              height: max(scroll.contentSize.height, used.maxY + view.textContainerInset.height * 2))
+            // Equal-size assignments still invalidate AppKit constraints during
+            // window layout. Keep document resizing idempotent to avoid reentry.
+            if view.frame.size != size { view.setFrameSize(size) }
         }
         if followBottom { view.scrollToEndOfDocument(nil) }
     }
