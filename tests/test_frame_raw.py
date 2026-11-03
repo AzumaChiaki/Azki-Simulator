@@ -59,7 +59,7 @@ class RawFrameTests(unittest.TestCase):
                 bridge.read_frame_raw(self.root, previous_sequence=value)
 
     def test_unchanged_does_not_bypass_format_or_geometry(self):
-        for change in ({'magic': b'BADFRAME'}, {'version': 2}, {'fmt': 2},
+        for change in ({'magic': b'BADFRAME'}, {'version': 2}, {'fmt': 3},
                        {'width': 192}, {'height': 490}, {'stride': 426}):
             with self.subTest(change=change):
                 self.frame(**change)
@@ -133,6 +133,57 @@ class RawFrameTests(unittest.TestCase):
             with self.assertRaises(bridge.BridgeError) as caught:
                 bridge.read_frame_raw(self.root)
         self.assertEqual('frame_not_ready', caught.exception.code)
+
+
+class RGB888FrameTests(RawFrameTests):
+    """Run every existing ownership/seqlock check against native RGB888 too."""
+    def frame(self, geometry=(212, 520), sequence=2, **changes):
+        width, height = geometry
+        values = dict(magic=b'Q66FRAME', version=1, sequence=sequence,
+                      width=width, height=height, stride=width * 3, fmt=2)
+        values.update(changes)
+        header = struct.pack('<8s6I', *values.values())
+        pixels = bytes((7, 11, 19, 23, 69, 254, 255, 127, 1, 8, 4, 8)) * (width * height // 4)
+        self.path.write_bytes(header + pixels)
+        return header, pixels
+
+    @staticmethod
+    def quantized(pixels):
+        return b''.join(struct.pack('<H', (r // 8) * 2048 + (g // 4) * 32 + b // 8)
+                        for r, g, b in struct.iter_unpack('BBB', pixels))
+
+    def test_raw_all_geometries_and_rgb_compatibility(self):
+        for geometry in bridge.DISPLAY_GEOMETRIES:
+            with self.subTest(geometry=geometry):
+                header, pixels = self.frame(geometry)
+                self.assertEqual((2, *geometry, pixels), bridge.read_frame(self.root, geometry))
+                self.assertEqual((2, *geometry, pixels), bridge.decode_frame(header, pixels, geometry))
+                self.assertEqual((2, *geometry, self.quantized(pixels)), bridge.read_frame_raw(self.root, geometry))
+
+    def test_different_sequence_returns_full_snapshot(self):
+        _, pixels = self.frame(sequence=4)
+        self.assertEqual((4, 212, 520, self.quantized(pixels)), bridge.read_frame_raw(self.root, previous_sequence=2))
+
+    def test_unchanged_double_header_race_retries_then_fails(self):
+        header, _ = self.frame()
+        changed = struct.pack('<8s6I', b'Q66FRAME', 1, 4, 212, 520, 636, 2)
+        with mock.patch.object(bridge.os, 'pread', side_effect=[header, changed] * 3) as read:
+            with self.assertRaises(bridge.BridgeError) as caught:
+                bridge.read_frame_raw(self.root, previous_sequence=2)
+        self.assertEqual('frame_not_ready', caught.exception.code)
+        self.assertEqual(6, read.call_count)
+
+    def test_full_copy_race_retries_using_new_stable_sequence(self):
+        header, pixels = self.frame()
+        changed = struct.pack('<8s6I', b'Q66FRAME', 1, 4, 212, 520, 636, 2)
+        with mock.patch.object(bridge.os, 'pread', side_effect=[header, pixels, changed, changed, pixels, changed]):
+            self.assertEqual((4, 212, 520, pixels), bridge.read_frame(self.root))
+
+    def test_format_does_not_allow_rgb565_stride(self):
+        self.frame(stride=424)
+        for read in (bridge.read_frame, bridge.read_frame_raw):
+            with self.assertRaises(bridge.BridgeError):
+                read(self.root)
 
 
 if __name__ == '__main__':

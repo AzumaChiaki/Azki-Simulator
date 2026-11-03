@@ -6,7 +6,8 @@ let package = Package(
     platforms: [.macOS(.v15)],
     products: [.executable(name: "AzkiSimulator", targets: ["AzkiSimulator"])],
     targets: [
-        .executableTarget(name: "AzkiSimulator", resources: [.copy("Runtime")])
+        .executableTarget(name: "AzkiSimulator", resources: [.copy("Runtime")]),
+        .testTarget(name: "AzkiSimulatorFrameTests", dependencies: ["AzkiSimulator"], path: "tests/SwiftFrames")
     ],
     swiftLanguageModes: [.v5]
 )

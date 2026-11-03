@@ -8,6 +8,7 @@
 #define BEST1503_GPU_H
 #include <inttypes.h>
 #include <math.h>
+#include "best1503-gpu-tiling.h"
 
 #define BES_GPU_REGS 0x1000
 #define BES_GPU_TARGETS 4
@@ -87,13 +88,14 @@ static BesGpuColor gpu_sw_target_load(const BesGpuTarget *t,
         return gpu_sw_color_bgra(pixel);
     }
     /* SDK BGR565 (0x101) has red in bits 15:11; RGB565 (0x121)
-     * reverses red/blue. BGRA5658 (0x10a) prepends an alpha byte. */
-    BesGpuColor color = gpu_sw_color_565(lduw_le_p(pixel + (t->bpp == 3)));
+     * reverses red/blue. BGRA5658 (0x10a) stores the two little-endian
+     * BGR565 bytes followed by alpha; alpha-first is ABGR8565. */
+    BesGpuColor color = gpu_sw_color_565(lduw_le_p(pixel));
     if (t->format == 0x121) {
         unsigned red = color.r; color.r = color.b; color.b = red;
     }
     if (t->bpp == 3) {
-        color.a = pixel[0];
+        color.a = pixel[2];
     }
     return color;
 }
@@ -123,9 +125,9 @@ static void gpu_sw_target_store(const BesGpuTarget *t, uint8_t *pixel,
         unsigned red = color.r; color.r = color.b; color.b = red;
     }
     if (t->bpp == 3) {
-        pixel[0] = color.a;
+        pixel[2] = color.a;
     }
-    stw_le_p(pixel + (t->bpp == 3),
+    stw_le_p(pixel,
              ((color.r >> 3) << 11) | ((color.g >> 2) << 5) | (color.b >> 3));
 }
 
@@ -523,37 +525,39 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                 r[0xa00] != 0x10002181;
     bool image = !solid_rectangle && r[0xa00] != 0x10000102;
     bool color_mode = r[0xa00] == 0x10001102 || r[0xa00] == 0x10001181;
-    bool indexed = r[0xa25] == 0x01000900 || r[0xa25] == 0x01020900;
-    bool packed_source = r[0xa25] == 0x41020100 || r[0xa25] == 0x41000100;
+    unsigned source_tile = (r[0xa25] >> 12) & 3;
+    uint32_t source_format = r[0xa25] & ~0x3000u;
+    bool indexed = source_format == 0x01000900 || source_format == 0x01020900;
+    bool packed_source = source_format == 0x41020100 || source_format == 0x41000100;
     /* SDK convert_source_format(BGR888)=0x20000000. P65 composites
      * its packed BGR888 transition canvas using this source format.
      * Like 5658, its hardware stride is expressed as four bytes/pixel,
      * but memory contains three; unlike 5658 it has no alpha byte. */
-    bool bgr888_source = r[0xa25] == 0x21000100 ||
-                         r[0xa25] == 0x21010100 || r[0xa25] == 0x21020100;
-    bool rgb565_source = r[0xa25] == 0x01000105 ||
-                         r[0xa25] == 0x01010105 || r[0xa25] == 0x01020105;
+    bool bgr888_source = source_format == 0x21000100 ||
+                         source_format == 0x21010100 || source_format == 0x21020100;
+    bool rgb565_source = source_format == 0x01000105 ||
+                         source_format == 0x01010105 || source_format == 0x01020105;
     /* Target format 5 and source format 4 refer to the same BGRA5551
      * storage. Accept the bounded POINT/LINEAR/BI_LINEAR COLOR samplers. */
-    bool bgra5551_source = r[0xa25] == 0x01000104 ||
-                           r[0xa25] == 0x01010104 || r[0xa25] == 0x01020104;
+    bool bgra5551_source = source_format == 0x01000104 ||
+                           source_format == 0x01010104 || source_format == 0x01020104;
     /* Original Q65 launcher glyphs use POINT A8 (01000102), while
      * startup glyphs use LINEAR A8 (01010102). Both share the A8 layout. */
-    bool a8_source = r[0xa25] == 0x01000102 || r[0xa25] == 0x01010102 ||
-                     r[0xa25] == 0x01020102;
+    bool a8_source = source_format == 0x01000102 || source_format == 0x01010102 ||
+                     source_format == 0x01020102;
     /* Public convert_source_format: BGRA8888 = 7. Activity pages composite
      * their offscreen BGRA8888 canvas back into the RGB565 display target. */
     /* VGLite format 7 is BGRA8888.  The activity page uses the
      * 0x01011107 sampler variant in addition to the startup variants. */
-    bool bgra8888_source = (r[0xa25] & 0xff) == 0x07 &&
-                           (r[0xa25] >> 24) == 0x01 &&
-                           ((r[0xa25] >> 16) & 0xff) <= 0x03 &&
-                           (((r[0xa25] >> 8) & 0xff) == 0x01 ||
-                            ((r[0xa25] >> 8) & 0xff) == 0x11 ||
-                            ((r[0xa25] >> 8) & 0xff) == 0x21);
+    bool bgra8888_source = (source_format & 0xff) == 0x07 &&
+                           (source_format >> 24) == 0x01 &&
+                           ((source_format >> 16) & 0xff) <= 0x02 &&
+                           (((source_format >> 8) & 0xff) == 0x01);
     /* The Rive paints in Q65's control center use LINEAR with PAD. Their
      * one-row BGRA ramps extend across the path in the other dimension. */
     bool linear_pad = r[0xa25] == 0x01011107;
+    /* Border addressing applies to every validated source format. */
+    bool pad_source = source_tile == 1;
     bool colored_source = indexed || packed_source || bgr888_source ||
                           rgb565_source || bgra8888_source || bgra5551_source;
     if ((r[0xa00] != 0x2181 && r[0xa00] != 0x2102 &&
@@ -673,13 +677,17 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                 if (!isfinite(u) || !isfinite(v)) {
                     continue;
                 }
-                if (linear_pad) {
+                /* Reduce repeating coordinates before bounded integer casts;
+                 * map each interpolation tap independently at tile seams. */
+                u = gpu_sw_tile_coordinate(u, sw, source_tile);
+                v = gpu_sw_tile_coordinate(v, sh, source_tile);
+                if (pad_source) {
                     /* LINEAR paint already programs its sampling centre.
                      * PAD extends edge texels instead of returning COLOR;
                      * for a one-row gradient every finite v selects row 0. */
                     u = CLAMP(u, 0, (double)sw - 1);
                     v = CLAMP(v, 0, (double)sh - 1);
-                } else if (u < -1 || v < -1 || u >= sw || v >= sh) {
+                } else if (source_tile == 0 && (u < -1 || v < -1 || u >= sw || v >= sh)) {
                     continue;
                 }
                 int ix = (int)u, iy = (int)v;
@@ -690,7 +698,7 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                 /* VGLite's A8 LINEAR path is horizontally filtered while
                  * retaining POINT rows (the Q65 glyph path uses this mode).
                  * Do not vertically blend a neighboring row. */
-                if (r[0xa25] == 0x01010102) {
+                if (source_format == 0x01010102) {
                     fy = 0;
                 }
                 /* SDK FILTER_POINT=0, FILTER_LINEAR=0x10000 and
@@ -702,7 +710,8 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                      * the generic 2x2 tap loop and floating weights: one
                      * bounded texel load has identical point semantics. */
                     ix = floor(u); iy = floor(v);
-                    if (ix >= 0 && iy >= 0 && ix < (int)sw && iy < (int)sh) {
+                    if (gpu_sw_tile_index(&ix, sw, source_tile) &&
+                        gpu_sw_tile_index(&iy, sh, source_tile)) {
                         uint8_t *sample_pixel = source + iy * stride + ix * source_bpp;
                         unsigned texel = sample_pixel[0];
                         if (colored_source) {
@@ -716,8 +725,8 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                             } else if (bgra5551_source) {
                                 color = gpu_sw_color_5551(lduw_le_p(sample_pixel));
                             } else {
-                                color = gpu_sw_color_565(lduw_le_p(sample_pixel + packed_source));
-                                if (packed_source) { color.a = texel; }
+                                color = gpu_sw_color_565(lduw_le_p(sample_pixel));
+                                if (packed_source) { color.a = sample_pixel[2]; }
                             }
                             sample = color.a;
                             unsigned color_weight = packed_source ? 255 : color.a;
@@ -732,11 +741,8 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                 if (filtered) for (unsigned dy = 0; dy < 2; dy++) {
                     for (unsigned dx = 0; dx < 2; dx++) {
                         int xx = ix + (int)dx, yy = iy + (int)dy;
-                        if (linear_pad) {
-                            xx = MIN(xx, (int)sw - 1);
-                            yy = MIN(yy, (int)sh - 1);
-                        }
-                        if (xx >= 0 && yy >= 0 && xx < (int)sw && yy < (int)sh) {
+                        if (gpu_sw_tile_index(&xx, sw, source_tile) &&
+                            gpu_sw_tile_index(&yy, sh, source_tile)) {
                             uint8_t *sample_pixel = source + yy * stride + xx * source_bpp;
                             unsigned texel = sample_pixel[0];
                             double weight = (dx ? fx : 1-fx) * (dy ? fy : 1-fy);
@@ -751,8 +757,8 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                                 } else if (bgra5551_source) {
                                     color = gpu_sw_color_5551(lduw_le_p(sample_pixel));
                                 } else {
-                                    color = gpu_sw_color_565(lduw_le_p(sample_pixel + packed_source));
-                                    if (packed_source) { color.a = texel; }
+                                    color = gpu_sw_color_565(lduw_le_p(sample_pixel));
+                                    if (packed_source) { color.a = sample_pixel[2]; }
                                 }
                                 double opacity = color.a * weight;
                                 sample += opacity;

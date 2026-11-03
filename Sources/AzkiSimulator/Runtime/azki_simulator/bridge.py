@@ -25,7 +25,8 @@ import zlib
 
 MAX_MESSAGE = 65536
 DISPLAY_GEOMETRIES = frozenset(((192, 490), (212, 520), (336, 480), (432, 514)))
-MAX_FRAME = 32 + 432 * 514 * 2
+MAX_FRAME = 32 + 432 * 514 * 3
+FRAME_PIXEL_BYTES = {1: 2, 2: 3}  # LE RGB565; packed R,G,B RGB888
 MAX_LOG = 16 * 1024 * 1024
 CAPABILITIES = ["status", "start", "stop", "input", "screenshot", "logs",
                 "inspect-package", "stage-package"]
@@ -301,10 +302,10 @@ def validate_frame(header: bytes, pixels: bytes, expected: tuple[int, int]):
     if len(header) != 32:
         raise BridgeError("frame_not_ready", "Waiting for a complete guest frame")
     magic, version, seq, width, height, stride, fmt = struct.unpack("<8s6I", header)
-    if magic != b"Q66FRAME" or version != 1 or fmt != 1:
+    if magic != b"Q66FRAME" or version != 1 or fmt not in FRAME_PIXEL_BYTES:
         raise BridgeError("invalid_frame", "Unsupported shared frame format")
     if ((width, height) != expected or expected not in DISPLAY_GEOMETRIES or
-            stride != width * 2 or len(pixels) != stride * height):
+            stride != width * FRAME_PIXEL_BYTES[fmt] or len(pixels) != stride * height):
         raise BridgeError("invalid_frame", "Frame geometry does not match this exact session")
     if seq == 0 or seq & 1:
         raise BridgeError("frame_not_ready", "Frame is being updated")
@@ -313,15 +314,17 @@ def validate_frame(header: bytes, pixels: bytes, expected: tuple[int, int]):
 
 def decode_frame(header: bytes, pixels: bytes, expected: tuple[int, int]):
     seq, width, height = validate_frame(header, pixels, expected)
+    if struct.unpack_from("<I", header, 28)[0] == 2:
+        return seq, width, height, pixels
     rgb = bytearray()
     for (word,) in struct.iter_unpack("<H", pixels):
         rgb.extend(((word >> 11) << 3, ((word >> 5) & 63) << 2, (word & 31) << 3))
     return seq, width, height, bytes(rgb)
 
 
-def read_frame_raw(root: Path, expected: tuple[int, int] = (212, 520),
-                   previous_sequence: int | None = None) -> tuple[int, int, int, bytes] | None:
-    """Read stable little-endian RGB565 pixels without RGB/PNG conversion.
+def _read_frame_native(root: Path, expected: tuple[int, int],
+                       previous_sequence: int | None = None) -> tuple[bytes, bytes] | None:
+    """Copy a validated stable frame without changing its native pixel format.
 
     A matching sequence skips only the pixel copy, after the same ownership,
     regular-file, size, format and exact-geometry checks as a complete read.
@@ -342,9 +345,10 @@ def read_frame_raw(root: Path, expected: tuple[int, int] = (212, 520),
             if len(header) != 32:
                 raise BridgeError("frame_not_ready", "Waiting for a complete guest frame")
             magic, version, seq, width, height, stride, fmt = struct.unpack("<8s6I", header)
-            if magic != b"Q66FRAME" or version != 1 or fmt != 1:
+            if magic != b"Q66FRAME" or version != 1 or fmt not in FRAME_PIXEL_BYTES:
                 raise BridgeError("invalid_frame", "Unsupported shared frame format")
-            if expected not in DISPLAY_GEOMETRIES or (width, height) != expected or stride != width * 2:
+            if (expected not in DISPLAY_GEOMETRIES or (width, height) != expected or
+                    stride != width * FRAME_PIXEL_BYTES[fmt]):
                 raise BridgeError("invalid_frame", "Frame geometry does not match this exact session")
             if info.st_size != 32 + stride * height:
                 raise BridgeError("invalid_frame", "Frame length does not match the declared geometry")
@@ -357,16 +361,37 @@ def read_frame_raw(root: Path, expected: tuple[int, int] = (212, 520),
             pixels = os.pread(fd, stride * height, 32)
             if os.pread(fd, 32, 0) != header or len(pixels) != stride * height:
                 continue
-            return seq, width, height, pixels
+            return header, pixels
         finally:
             os.close(fd)
     raise BridgeError("frame_not_ready", "Frame is being updated")
 
 
+def read_frame_raw(root: Path, expected: tuple[int, int] = (212, 520),
+                   previous_sequence: int | None = None) -> tuple[int, int, int, bytes] | None:
+    """Return stable LE RGB565 pixels, preserving the existing SDK contract.
+
+    RGB565 input is returned unchanged. RGB888 input is quantized to 5/6/5 bits;
+    use read_frame to retain all eight bits of each native RGB888 channel.
+    A matching sequence skips the pixel copy only after full header validation.
+    """
+    frame = _read_frame_native(root, expected, previous_sequence)
+    if frame is None:
+        return None
+    header, pixels = frame
+    _, _, seq, width, height, _, fmt = struct.unpack("<8s6I", header)
+    if fmt == 2:
+        output = bytearray(width * height * 2)
+        for index, (red, green, blue) in enumerate(struct.iter_unpack("BBB", pixels)):
+            struct.pack_into("<H", output, index * 2,
+                             (red >> 3) << 11 | (green >> 2) << 5 | (blue >> 3))
+        pixels = bytes(output)
+    return seq, width, height, pixels
+
+
 def read_frame(root: Path, expected: tuple[int, int] = (212, 520)) -> tuple[int, int, int, bytes]:
-    """Compatibility RGB888 snapshot using the same validated raw reader."""
-    seq, width, height, pixels = read_frame_raw(root, expected)
-    header = struct.pack("<8s6I", b"Q66FRAME", 1, seq, width, height, width * 2, 1)
+    """RGB888 snapshot, retaining the complete native RGB888 channel values."""
+    header, pixels = _read_frame_native(root, expected)
     return decode_frame(header, pixels, expected)
 
 

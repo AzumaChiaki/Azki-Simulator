@@ -241,6 +241,7 @@ def _run(profile, args, logdir):
                 os.chmod(qmp_path, 0o600)
                 connection = QMP(qmp_path)
                 control = WatchControl(connection, temporary, log_directory=logdir, frame_file=frame)
+                adc_raw = control.probe_adc_raw()
                 input_path = Path(temporary) / 'input.sock'
                 control.serve_input(input_path)
                 gdb_endpoint = None
@@ -257,6 +258,12 @@ def _run(profile, args, logdir):
                           + ('; CPU held at reset until the debugger continues.' if args.gdb_wait else ''), flush=True)
                 write_json(logdir / 'control.json', dict(qmp=str(qmp_path), framebuffer=str(frame),
                            pid=proc.pid, input_socket=str(input_path),
+                           **({'hardware_inputs': {'pmu.adcRaw': {
+                               'supported': True, 'schema': 1, 'channels': 8,
+                               'minimum': 0, 'maximum': 65535,
+                               'unit': 'uncalibrated-raw',
+                               'readEvidence': 'guest-ispi-fifo-dequeue'}}}
+                              if adc_raw else {}),
                            **({'gdb': gdb_endpoint} if gdb_endpoint is not None else {}),
                            **({'virtual_peer': peer.descriptor()} if peer is not None else {})))
                 print('Q65 BEST1502P running with AP/resource/audio/sensor from selected OTA', flush=True)

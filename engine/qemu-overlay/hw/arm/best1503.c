@@ -16,6 +16,7 @@
 #include "hw/qdev-clock.h"
 #include "system/address-spaces.h"
 #include "exec/cpu-common.h"
+#include "target/arm/cpu.h"
 #include "qemu/module.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
@@ -1843,6 +1844,40 @@ static bool gpu_ram_read(uint32_t address, void *data, unsigned bytes)
                            MEMTXATTRS_UNSPECIFIED, data, bytes) == MEMTX_OK;
 }
 
+/* Opt-in synchronization diagnostics. Addresses are supplied by the developer
+ * after identifying the exact firmware; no firmware-specific state is assumed
+ * or modified by the hardware model. Never dereference guest pointers on host.
+ */
+static void gpu_trace_sync(Best1503State *s, const char *operation,
+                           hwaddr offset, uint64_t value)
+{
+    const char *words = g_getenv("BES_GPU_TRACE_SYNC_WORDS");
+    if (!words || strlen(words) > 256) {
+        return;
+    }
+    CPUARMState *env = &s->armv7m.cpu->env;
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "BES GPU sync: op=%s t=%" PRId64 " offset=%03" HWADDR_PRIx
+                  " value=%08" PRIx64 " pc=%08x lr=%08x r0=%08x r1=%08x r4=%08x"
+                  " busy=%u status=%08x mask=%08x pending=%u\n",
+                  operation, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), offset, value,
+                  env->regs[15], env->regs[14], env->regs[0], env->regs[1], env->regs[4],
+                  s->gpu_busy, s->gpu_status, s->gpu_probe_mask, s->gpu_pending_id);
+    g_auto(GStrv) addresses = g_strsplit(words, ",", 9);
+    for (unsigned i = 0; addresses[i] && i < 8; i++) {
+        char *end = NULL;
+        uint64_t address = g_ascii_strtoull(addresses[i], &end, 16);
+        uint8_t data[4];
+        if (end == addresses[i] || *end || address > UINT32_MAX || (address & 3) ||
+            !gpu_ram_read(address, data, sizeof(data))) {
+            continue;
+        }
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "BES GPU sync word: address=%08x value=%08x\n",
+                      (uint32_t)address, ldl_le_p(data));
+    }
+}
+
 static void gpu_complete(void *opaque)
 {
     Best1503State *s = opaque;
@@ -1863,6 +1898,7 @@ static void gpu_complete(void *opaque)
     s->gpu_busy = false;
     s->gpu_status |= s->gpu_pending_event;
     s->gpu_pending_event = 0;
+    gpu_trace_sync(s, "complete", 0x10, s->gpu_status);
     gpu_update_irq(s);
     qemu_log_mask(LOG_GUEST_ERROR,
                   "BES experimental GPU completion: status=0x%08x (%s)\n",
@@ -1927,6 +1963,7 @@ static MemTxResult gpu_probe_read(void *opaque, hwaddr offset, uint64_t *value,
     case 0x28: case 0x40: case 0xe8: *value = 0; break;
     default: return MEMTX_ERROR;
     }
+    gpu_trace_sync(s, "read", offset, *value);
     qemu_log_mask(LOG_GUEST_ERROR,
                   "BES GPU probe read: offset=0x%03" HWADDR_PRIx " value=0x%08" PRIx64 "\n",
                   offset, *value);
@@ -1937,6 +1974,7 @@ static MemTxResult gpu_probe_write(void *opaque, hwaddr offset, uint64_t value,
                                    unsigned size, MemTxAttrs attrs)
 {
     Best1503State *s = opaque;
+    gpu_trace_sync(s, "write", offset, value);
     if (offset == 0) {
         s->gpu_probe_control = value;
         if (value & (1 << 12)) {
@@ -5159,6 +5197,33 @@ static char *best1503_get_motion_orientation(Object *obj, Error **errp)
     return g_strdup_printf("roll=%.17g;pitch=%.17g", h->roll_degrees, h->pitch_degrees);
 }
 
+static char *best1503_get_motion_raw(Object *obj, Error **errp)
+{
+    return bes_motion_raw_describe(&((Best1503State *)obj)->sensors);
+}
+
+static void best1503_set_motion_raw(Object *obj, const char *value, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    if (s->sensors.imu.kind == BES_IMU_NONE) {
+        error_setg(errp, "motion-raw requires a modeled IMU");
+        return;
+    }
+    if (!bes_motion_raw_set(&s->sensors, value)) {
+        error_setg(errp, "motion-raw must be auto or ax=N;ay=N;az=N;gx=N;gy=N;gz=N "
+                   "(six decimal signed 16-bit chip-native counts; version must not overflow)");
+        return;
+    }
+    if (s->sensor_timer) {
+        timer_mod(s->sensor_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
+}
+
+static char *best1503_get_sensor_observation(Object *obj, Error **errp)
+{
+    return bes_sensor_observation(&((Best1503State *)obj)->sensors);
+}
+
 static void best1503_set_motion_orientation(Object *obj, const char *value, Error **errp)
 {
     Best1503State *s = (Best1503State *)obj;
@@ -5397,6 +5462,13 @@ static void best1503_class_init(ObjectClass *oc, const void *data)
                                   best1503_set_health_fixture);
     object_class_property_add_str(oc, "motion-orientation", best1503_get_motion_orientation,
                                   best1503_set_motion_orientation);
+    object_class_property_add_str(oc, "motion-raw", best1503_get_motion_raw,
+                                  best1503_set_motion_raw);
+    object_class_property_set_description(oc, "motion-raw",
+        "Six chip-native signed 16-bit counts, or auto to resume pose/gait generation");
+    object_class_property_add_str(oc, "sensor-observation", best1503_get_sensor_observation, NULL);
+    object_class_property_set_description(oc, "sensor-observation",
+        "IMU generation and complete sensor-bus read counters; not CPU/DMA consumption");
     object_class_property_set_description(oc, "motion-orientation",
         "Held body pose: auto or roll=R;pitch=P (degrees -180..180); raw IMU input only");
     object_class_property_add_str(oc, "sensor-board", best1503_get_sensor_board,

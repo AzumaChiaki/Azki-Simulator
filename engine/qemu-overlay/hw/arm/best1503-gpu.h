@@ -7,6 +7,7 @@
 #ifndef BEST1503_GPU_H
 #define BEST1503_GPU_H
 #include <math.h>
+#include "best1503-gpu-tiling.h"
 
 #define BES_GPU_REGS 0x1000
 #define BES_GPU_TARGETS 4
@@ -478,14 +479,19 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
      * Public vg_lite_draw emits A02 paint and no imageMode bits; A25 and
      * the source registers can still describe an earlier image draw. */
     bool dst_in_mode = r[0xa00] == 0x10000402;
+    /* Original Q188 vg_lite_blit combines NORMAL image mode (0x1000),
+     * rectangle control (0x81), NONE blend (0), and optional bit 28.
+     * NONE replaces covered pixels, including fully transparent texels. */
+    bool none_mode = r[0xa00] == 0x10001081 || r[0xa00] == 0x1081;
     bool multiply_mode = r[0xa00] == 0x10002181 || r[0xa00] == 0x10002102;
-    bool path = r[0xa00] != 0x2181 && r[0xa00] != 0x10001181 &&
+    bool path = !none_mode && r[0xa00] != 0x2181 && r[0xa00] != 0x10001181 &&
                 r[0xa00] != 0x10002181;
     bool image = r[0xa00] != 0x10000102 && !dst_in_mode;
     bool color_mode = r[0xa00] == 0x10001102 || r[0xa00] == 0x10001181;
-    /* Public VG_LITE_PATTERN_PAD clamps texture samples to the image edge. */
-    bool pad_source = (r[0xa25] & 0x1000) != 0;
-    uint32_t source_format = r[0xa25] & ~0x1000u;
+    /* Pattern addressing and pixel format are separate IMAGE_CONFIG fields. */
+    unsigned source_tile = (r[0xa25] >> 12) & 3;
+    bool pad_source = source_tile == 1;
+    uint32_t source_format = r[0xa25] & ~0x3000u;
     bool indexed = source_format == 0x01000900 || source_format == 0x01020900;
     bool packed_source = source_format == 0x41020100 || source_format == 0x41000100;
     bool rgb565_source = source_format == 0x01000105 ||
@@ -505,7 +511,7 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
     bool premultiplied_source = packed_source ||
         (bgra8888_source && (r[0xa00] & 0x10000000));
     if ((r[0xa00] != 0x2181 && r[0xa00] != 0x2102 &&
-         r[0xa00] != 0x10000102 && !color_mode && !multiply_mode && !dst_in_mode) ||
+         r[0xa00] != 0x10000102 && !color_mode && !multiply_mode && !dst_in_mode && !none_mode) ||
         (dst_in_mode && r[0xa10] != 0x103) ||
         (!path && r[0xa34]) || r[0xad1]) {
         return gpu_sw_fail(w, "unsupported draw/blend/global-alpha mode");
@@ -577,6 +583,14 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
         }
     }
     BesGpuColor constant = gpu_sw_color_abgr(r[0xa02]);
+    if (g_getenv("BES_GPU_TRACE_SAMPLER")) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+            "BES GPU draw state: mode=%08x source=%08x target=%08x image=%u path=%u "
+            "source_size=%ux%u target_size=%ux%u bounds=%u,%u,%u,%u clip=%08x/%08x\n",
+            r[0xa00], r[0xa25], r[0xa10], image, path, sw, sh,
+            t->width, t->height, bounds.left, bounds.top, bounds.right, bounds.bottom,
+            r[0xa39], r[0xa3a]);
+    }
     for (unsigned y = bounds.top; y < bounds.bottom; y++) {
         for (unsigned x = bounds.left; x < bounds.right; x++) {
             unsigned cov = coverage[(y - bounds.top) * coverage_width + x - bounds.left];
@@ -614,12 +628,22 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                 if (!isfinite(u) || !isfinite(v)) {
                     continue;
                 }
+                /* Reduce repeating coordinates before bounded integer casts;
+                 * map each interpolation tap independently at tile seams. */
+                u = gpu_sw_tile_coordinate(u, sw, source_tile);
+                v = gpu_sw_tile_coordinate(v, sh, source_tile);
                 if (pad_source) {
                     u = CLAMP(u, 0, sw - 1);
                     v = CLAMP(v, 0, sh - 1);
                 }
-                if (u < -1 || v < -1 || u >= sw || v >= sh) {
-                    continue;
+                if (source_tile == 0 && (u < -1 || v < -1 || u >= sw || v >= sh)) {
+                    if (!none_mode) {
+                        continue;
+                    }
+                    /* A transparent COLOR-border sample must still replace
+                     * the destination for NONE. Keep the integer conversion
+                     * bounded even for a large finite affine transform. */
+                    u = v = -2;
                 }
                 int ix = (int)u, iy = (int)v;
                 if (u < ix) { ix--; }
@@ -635,8 +659,9 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                 double colors[3] = {0};
                 for (unsigned dy = 0; dy < 2; dy++) {
                     for (unsigned dx = 0; dx < 2; dx++) {
-                        int xx = ix + dx, yy = iy + dy;
-                        if (xx >= 0 && yy >= 0 && (unsigned)xx < sw && (unsigned)yy < sh) {
+                        int xx = ix + (int)dx, yy = iy + (int)dy;
+                        if (gpu_sw_tile_index(&xx, sw, source_tile) &&
+                            gpu_sw_tile_index(&yy, sh, source_tile)) {
                             uint8_t *sample_pixel = source + yy * stride + xx * source_bpp;
                             unsigned texel = sample_pixel[0];
                             double weight = (dx ? fx : 1-fx) * (dy ? fy : 1-fy);
@@ -686,16 +711,17 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                     a = (a * (unsigned)(sample + 0.5) + 127) / 255;
                 }
             }
-            if (!a) {
+            if (!a && !none_mode) {
                 continue;
             }
             uint8_t *pixel = t->pixels + y * t->stride + x * t->bpp;
             BesGpuColor old = gpu_sw_target_load(t, pixel);
+            unsigned keep = none_mode ? 255 - (cov * 255 + 8) / 16 : 255 - a;
             BesGpuColor blended = {
-                (sr * a + old.r * (255-a) + 127) / 255,
-                (sg * a + old.g * (255-a) + 127) / 255,
-                (sb * a + old.b * (255-a) + 127) / 255,
-                a + (old.a * (255-a) + 127) / 255,
+                (sr * a + old.r * keep + 127) / 255,
+                (sg * a + old.g * keep + 127) / 255,
+                (sb * a + old.b * keep + 127) / 255,
+                a + (old.a * keep + 127) / 255,
             };
             gpu_sw_target_store(t, pixel, blended);
             w->pixels++;

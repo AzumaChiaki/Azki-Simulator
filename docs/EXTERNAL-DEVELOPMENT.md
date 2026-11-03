@@ -42,8 +42,9 @@ held only in RAM are not made persistent by disk snapshot support.
 External integrations may import `azki_simulator.bridge.read_frame_raw(root,
 expected=(212, 520), previous_sequence=None)` from this app's Runtime. It returns
 `(sequence, width, height, pixels)`, where `pixels` is the guest's tightly packed,
-row-major **little-endian RGB565** data (`width * height * 2` bytes). This avoids
-Python RGB888 conversion and PNG compression on the interactive display path.
+row-major **little-endian RGB565** data (`width * height * 2` bytes). RGB565
+sources pass through unchanged; native RGB888 sources are quantized to this
+existing SDK format. This avoids PNG compression on the interactive display path.
 It does not request a new guest render or increase the firmware's frame rate.
 
 An unsigned 32-bit `previous_sequence` may return `None` for an unchanged frame.
@@ -53,8 +54,13 @@ headers before returning `None`. A new frame also requires a complete pixel copy
 between matching headers. Scope sequence caches to the **session identity**;
 after a restart, the same instance UUID can publish reused sequence numbers.
 
-`read_frame(root, expected)` continues to return RGB888 snapshots with the same
-quantization as before, and existing PNG screenshot consumers remain compatible.
+`read_frame(root, expected)` returns RGB888 snapshots. It preserves all eight
+bits of native RGB888 sources, while RGB565 sources retain the same left-aligned
+channel values as before. Existing PNG screenshot consumers remain compatible.
+The `Q66FRAME` version-1 header advertises pixel format `1` for packed little-endian
+RGB565 (`stride = width * 2`) or `2` for packed R,G,B bytes (`stride = width * 3`).
+Session snapshots require the exact declared byte length for either format;
+the core's internal LCD mmap may instead retain its fixed 1024×1024 capacity.
 Run `python3 -m unittest discover -s tests -p test_frame_raw.py -v` for the format,
 ownership, link, length and concurrent-update regression tests.
 
@@ -215,7 +221,7 @@ axis conversion and sensor publication; Lua `sensor_accel` units must be checked
 against that firmware rather than inferred from the host input unit.
 
 Holding a pose pauses the synthetic walk/handling progression and retains the
-existing small sensor noise. Reset resumes automatic motion. This is a sequence
+existing small sensor noise. Releasing the pose with null resumes automatic motion. This is a sequence
 of held poses, not an inertial rotation solver: it does not synthesize the angular
 velocity of transitions. It is suited to acceleration/gravity-driven UI tests.
 The Q65/P65 sensor-CPU machines are not covered by this shared IMU model.
@@ -224,3 +230,72 @@ Run `python3 -B -m unittest discover -s tests -p test_orientation.py -v` for
 parameter-to-board round trips, unsupported/old core behavior, invalid atomic
 writes, uncertain-write no-retry behavior, and the production C sample generator
 with both IMUs, six body axes, an oblique vector, board mount and auto reset.
+
+## Live chip-native motion input and observation
+
+On an attached N66/O66/N67/P67/Q66 LSM6DSO or ICM-42607 model, the private
+session accepts the following bounded `live-set` arguments:
+
+```json
+{"motionRaw":{"mode":"raw","accel":[0,0,16384],"gyro":[100,-100,0]}}
+```
+
+Each vector has exactly three signed 16-bit integer **chip output counts**.
+These are not g or degrees/second. They replace values after board mounting
+and chip full-scale conversion; they do not enable an ODR or FIFO the guest
+has disabled. Raw mode overrides the stored pose and pauses synthetic gait.
+Use `{"motionRaw":{"mode":"auto"}}` to release it and resume the stored
+pose/gait. The control is live only, has no new UI row or boot persistence,
+and requires a successful capability read from the attached sensor model.
+P65/Q65/O62M are not attached to this shared motion ABI.
+
+Optional `sensorObservation` in `live-get` has `scope:"sensor-bus"` and
+`guestObserved:false`. It separates input selection version, generated sample
+version and complete register/FIFO bus reads for accel and gyro. A register
+read counts only when all six component bytes come from one generated sample;
+an LSM FIFO record needs all seven bytes, and an ICM record all sixteen bytes.
+Partial, overwritten or disabled samples cannot fabricate a complete record.
+These counts do not prove that the CPU read a controller RX FIFO, a DMA
+transfer finished or a firmware algorithm used the value. Version identifies
+raw/auto selection only, not every automatic waveform change. Sensor chip
+reset clears pending observations; board reset also clears these bus counters.
+The host selection/version survives an in-process board reset.
+
+The P65 raw ADC ABI is separate: `pmu-adc-set` takes eight unsigned 16-bit
+`values` and requires the exact core SHA, `azki-p65` capability declaration
+and successful enabled `pmu-adc-state` probe. Only the existing conversion
+channels 2, 3, 5 and 6 are modeled; accepting eight input slots does not add
+the other four channels or a physical battery/temperature calibration.
+ADC read counters are recorded at ISPI RX dequeue and keep the conversion's
+saved version, including an old queued response after a new host input.
+Peripheral reset clears queued metadata but retains the host vector, version
+and lifetime ADC counters. Turning the fixture off/on invalidates latched
+sample provenance until a new conversion; already queued samples remain valid.
+The isolated Q65 candidate uses this same provenance correction, while its
+accepted application bundle is preserved separately.
+
+Input acknowledgements always retain `guestObserved:false`. If readback fails
+after an accepted write, `stateUnavailable:true` preserves that acceptance.
+Missing or malformed write acknowledgements report an unknown outcome and
+must not trigger an automatic retry. See `tests/test_live_bindings.py`,
+`tests/test_motion_raw.py`, `tests/test_p65_adc.py` and
+`tests/test_q65_adc_toggle.py` for standalone contracts. They do not launch
+firmware or establish display/algorithm/lifecycle acceptance.
+
+## Isolated development application data
+
+A development bundle ID with the prefix `com.azki.AzkiSimulator.development.`
+can use `AZKI_SIMULATOR_DEVELOPMENT_DATA_ROOT` to select an existing, absolute,
+owned 0700 directory. Every path component must be a real directory, not a
+symlink. Invalid explicit roots stop startup. Production bundles ignore this
+variable and keep their normal data locations.
+
+With a validated explicit development root, both launch-time session cleanup
+and automatic storage maintenance are skipped: both legacy actions scan global
+temporary sessions. Static helper policies also reject global session cleanup,
+storage report/maintenance, and instance deletion in this mode. Preparation and
+instance reset do not receive global temporary-prefix grants. If an instance
+has `storage/pending.json`, they stop before Python recovery can roll it back;
+the pending state remains untouched. This restricted development mode does not
+automatically recover historical sessions. A normal finish still uses the exact
+session selected by the host's owned launch receipt.

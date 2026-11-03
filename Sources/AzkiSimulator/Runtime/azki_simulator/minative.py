@@ -270,7 +270,13 @@ def _require_sha(actual, expected, description):
         raise MError("identity_mismatch", description + " SHA-256 mismatch")
 
 
+def canonical_model(model):
+    """Resolve the catalog's historical short model ID without changing firmware identity."""
+    return "miwear.watch.q66" if model == "q66" else model
+
+
 def _geometry(model):
+    model = canonical_model(model)
     if model.startswith("miwear.watch.n66"):
         return 192, 490
     if model.startswith(("miwear.watch.n67", "miwear.watch.p67")):
@@ -300,10 +306,11 @@ BATTERY_GAUGES = {"hp4560": ("miwear.watch.n66", "miwear.watch.n67", "miwear.wat
 
 def board_hardware(model):
     """Devices of one hardware preset, or None when the model is out of scope."""
+    model = canonical_model(model)
     if type(model) is not str or not model:
         return None
     for gauge, prefixes in BATTERY_GAUGES.items():
-        if model == "q66" or model.startswith(prefixes):
+        if model.startswith(prefixes):
             channel = next((c for p, c in BATTERY_ADC_CHANNELS.items() if model.startswith(p)),
                            BATTERY_ADC_CHANNEL)
             sensors = health_sensors(model) or {}
@@ -362,6 +369,7 @@ HEALTH_SENSORS = {
 
 def health_sensors(model):
     """Modeled health sensors of one preset, or None."""
+    model = canonical_model(model)
     if type(model) is not str:
         return None
     for prefix, sensors in HEALTH_SENSORS.items():
@@ -477,6 +485,7 @@ BATTERY_INPUTS = {
 
 def battery_inputs(model):
     """Verified battery inputs of one preset, or None."""
+    model = canonical_model(model)
     if type(model) is not str:
         return None
     for prefix, inputs in BATTERY_INPUTS.items():
@@ -713,6 +722,38 @@ def _dependency_links(paths, *, pin=_pin):
     return [_dependency_link_identity(path, pin=pin) for path in sorted(values)]
 
 
+def board_runtime_capabilities(model, capabilities, manifest=None):
+    """Keep isolated-watch ADC opt-in tied to its exact core and machine ABI."""
+    if model not in ("miwear.watch.p65", "miwear.watch.q65"):
+        return capabilities
+    allowed = {"nandPersistence", "norPersistence", "virtualPeer"}
+    declared = (manifest or {}).get("pmuAdcRaw", {})
+    normalized = capabilities.get("pmuAdcRaw", {})
+    machine = {"miwear.watch.p65": "azki-p65", "miwear.watch.q65": "azki-q65"}[model]
+    if (type(declared) is dict
+            and type(declared.get("machines")) is list
+            and machine in declared["machines"]
+            and normalized.get("qemuSHA256") is not None
+            and declared.get("qemuSHA256") == normalized["qemuSHA256"]):
+        allowed.add("pmuAdcRaw")
+    return {key: value for key, value in capabilities.items() if key in allowed}
+
+
+def _validate_prepared_factory(model, board, factory_pin):
+    if model == "miwear.watch.p65":
+        if (board.get("machine") != "azki-p65" or board.get("factory_bytes") != 256 * 1024
+                or board.get("geometry", {}).get("factory-offset") != 0xcc0000
+                or board.get("nor_geometry", {}).get("factoryOffset") != 0xcc0000):
+            raise MError("identity_mismatch", "P65 requires the verified 0xcc0000/256 KiB factory layout; old layouts are not migrated")
+        if factory_pin is not None:
+            raise MError("invalid_prepared", "P65 factory payload format is unverified; local setup uses an AP boot copy")
+    elif board.get("local_setup_bypass") is True:
+        if factory_pin is None or factory_pin["bytes"] != 128 * 1024:
+            raise MError("preparation_required", "Local desktop startup requires a pinned 128 KiB generated factory image")
+    elif factory_pin is not None:
+        raise MError("invalid_prepared", "This board does not select a local desktop factory overlay")
+
+
 def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(), bridge_paths=(),
                     dependency_links=(), bootstrap=None, engine_root=None, instance_storage=None, engine_info=None):
     """Read only. Caller supplies already prepared storage/board evidence.
@@ -755,14 +796,8 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
         raise MError("identity_incomplete", "Explicit interpreter/dependency and bridge identity paths are required")
     profile = rows[profile_id]
     expected_chip = "best1502p" if profile["model"] in ("miwear.watch.p65", "miwear.watch.q65") else "best1503"
-    if expected_chip == "best1502p":
-        # P65 implements the pinned ADC ABI; Q65 has independent storage but
-        # must continue to reject band ADC/live hardware inputs.
-        allowed = ("nandPersistence", "norPersistence", "virtualPeer")
-        if profile["model"] == "miwear.watch.p65":
-            allowed += ("pmuAdcRaw",)
-        runtime_capabilities = {key: value for key, value in runtime_capabilities.items()
-                                if key in allowed}
+    runtime_capabilities = board_runtime_capabilities(profile["model"], runtime_capabilities,
+        engine["manifest"] if engine_root is not None else None)
     declarations[str(_path(profile["ap_path"]))] = (profile["ap"]["sha256"], "catalog")
     if profile.get("ota_path"):
         declarations[str(_path(profile["ota_path"]))] = (profile.get("ota_sha256"), "catalog")
@@ -814,11 +849,7 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
         if str(expected_resource) != resource["path"]:
             raise MError("identity_mismatch", "Prepared resource is not the runner's selected path")
         prepared_pins = {key: pin(value) for key, value in sorted(prepared.items()) if value is not None}
-        if board.get("local_setup_bypass") is True:
-            if not prepared.get("factory") or prepared_pins["factory"]["bytes"] != 128 * 1024:
-                raise MError("preparation_required", "Local desktop startup requires a pinned 128 KiB generated factory image")
-        elif prepared.get("factory"):
-            raise MError("invalid_prepared", "This board does not select a local desktop factory overlay")
+        _validate_prepared_factory(profile["model"], board, prepared_pins.get("factory"))
         if storage == "romfs":
             if resource["bytes"] != members[0].get("size") or any(prepared.get(k) for k in ("seed", "seedProof")):
                 raise MError("identity_mismatch", "ROMFS size/seed does not match selected profile")
@@ -1284,7 +1315,8 @@ class MinativeAdapter:
                     if type(layout) is not dict:
                         raise MError("identity_mismatch", "Runner NOR profile is absent from the pinned capability")
                     model = expected["profile"]["model"]
-                    factory_bytes = 8192 if model.startswith(("miwear.watch.n66", "miwear.watch.o66", "miwear.watch.n67")) else 131072
+                    factory_bytes = (262144 if model == "miwear.watch.p65" else
+                        8192 if model.startswith(("miwear.watch.n66", "miwear.watch.o66", "miwear.watch.n67")) else 131072)
                     wanted_nor = {"schema": 1, "profileID": self.plan["profileID"],
                         "apSHA256": layout["apSHA256"], "apBytes": layout["apBytes"],
                         "apOffset": layout["apOffset"], "flashBytes": layout["flashBytes"],
@@ -1466,9 +1498,8 @@ class MinativeAdapter:
                 raise MError("not_running", "Runner frame is not ready")
             control = self._read_control()
             width, height = self.plan["width"], self.plan["height"]
-            exact = FRAME_HEADER.size + width * height * 2
-            # The multi-device core allocates one fixed-capacity buffer (2 MiB +
-            # header) for every geometry; only the leading exact frame is read.
+            # RGB565 cores retain a fixed-capacity buffer; RGB888 Q65 publishes
+            # a compact buffer. Only the declared packed pixels are exported.
             try:
                 fd, info = _open_file(control["framebuffer"], MAX_FRAME_FILE, private=True)
             except FileNotFoundError as error:
@@ -1481,12 +1512,15 @@ class MinativeAdapter:
                 # Before its first frame the core publishes a zeroed header.
                 if magic == b"Q66FRAME" and sequence == 0:
                     raise MError("frame_unavailable", "No frame has been published yet")
-                if magic != b"Q66FRAME" or version != 1 or (w, h) != (width, height) or stride != width * 2 or fmt != 1:
+                pixel_bytes = {1: 2, 2: 3}.get(fmt)
+                if (magic != b"Q66FRAME" or version != 1 or pixel_bytes is None or
+                        (w, h) != (width, height) or stride != width * pixel_bytes):
                     raise MError("invalid_frame", "Frame geometry/format differs from selected profile")
                 if sequence == 0 or sequence % 2:
                     raise MError("frame_unavailable", "Shared frame is being updated")
-                if info.st_size < exact:
-                    raise MError("invalid_frame", "Shared frame is shorter than its exact geometry")
+                exact = FRAME_HEADER.size + stride * height
+                if info.st_size not in (exact, FRAME_HEADER.size + 1024 * 1024 * pixel_bytes):
+                    raise MError("invalid_frame", "Shared frame has invalid exact or fixed capacity")
                 if header == previous_header:
                     if os.pread(fd, 32, 0) != header:
                         raise MError("frame_unavailable", "Shared frame changed during header check")

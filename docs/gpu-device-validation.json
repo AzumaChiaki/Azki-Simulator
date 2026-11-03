@@ -1,0 +1,1615 @@
+{
+  "schema": 1,
+  "core_sha256": "b944a821c4748bea7ee9fc2eeadb55c6065bbb7a349f0d8afed29af71ab2e0d6",
+  "counts": {
+    "original_ui_observed": 38,
+    "prohibited": 1
+  },
+  "acceptance_limits": [
+    "Unchanged AP on partial modeled hardware; synthetic reset/setup fixtures remain explicitly recorded.",
+    "GPU draw/pixel counters establish software rendering work, not every requested effect.",
+    "Duplicate frame-file samples are not animation or dynamic-background verification.",
+    "Peak child-tree RSS does not establish leak-free memory stability.",
+    "IRQ completion/status reads do not prove full original guest ISR coverage.",
+    "No startup-batch gestures, reentry, sensor controls or deliberate sleep/wake cycles."
+  ],
+  "not_certified_by_this_matrix": [
+    "all_gpu_features",
+    "per-profile_dynamic_effects",
+    "reentry",
+    "sleep_wake",
+    "long_duration_memory_stability",
+    "sensor_binding_consumption",
+    "complete_device_emulation"
+  ],
+  "profiles": [
+    {
+      "profile_id": "miwear.watch.n66cn@3.1.17@38d1681ec71b",
+      "family": "n66",
+      "ap_sha256": "9c4129a2bb62be559b31dce883715264862854504f44b47f6cf27f1e66888498",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.01,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 63,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Gray sculpted large 8 watchface, 08:00 and charging 100%; readable system display.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 11,
+        "rendered_nonzero_pixel_commands": 9,
+        "draws": 38,
+        "pixels": 538987,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 11,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 11
+      },
+      "peak_child_rss_bytes": 929513472,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 126,
+        "rgb_sha256": "5aece5644694ae8355ca6057b837a368a46f5ba1abf672ebc1aa45a744a8b600",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.n66cn@3.1.32@489f20502ae2",
+      "family": "n66",
+      "ap_sha256": "9c02dab4020b2cc9666ee7d34cf27d311b76aadcec519a38361bbcbd94c53264",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.011,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 63,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Gray sculpted large 8 watchface, 08:00 and charging 100%; readable system display.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 11,
+        "rendered_nonzero_pixel_commands": 9,
+        "draws": 38,
+        "pixels": 538987,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 11,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 11
+      },
+      "peak_child_rss_bytes": 930824192,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 126,
+        "rgb_sha256": "5aece5644694ae8355ca6057b837a368a46f5ba1abf672ebc1aa45a744a8b600",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.n66nfc@3.1.17@38d1681ec71b",
+      "family": "n66",
+      "ap_sha256": "9c4129a2bb62be559b31dce883715264862854504f44b47f6cf27f1e66888498",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.002,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 63,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Gray sculpted large 8 watchface, 08:00 and charging 100%; readable system display.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 11,
+        "rendered_nonzero_pixel_commands": 9,
+        "draws": 38,
+        "pixels": 538987,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 11,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 11
+      },
+      "peak_child_rss_bytes": 930283520,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 126,
+        "rgb_sha256": "5aece5644694ae8355ca6057b837a368a46f5ba1abf672ebc1aa45a744a8b600",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.n66nfc@3.1.32@489f20502ae2",
+      "family": "n66",
+      "ap_sha256": "9c02dab4020b2cc9666ee7d34cf27d311b76aadcec519a38361bbcbd94c53264",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.039,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 63,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Gray sculpted large 8 watchface, 08:00 and charging 100%; readable system display.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 11,
+        "rendered_nonzero_pixel_commands": 9,
+        "draws": 38,
+        "pixels": 538987,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 11,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 11
+      },
+      "peak_child_rss_bytes": 929693696,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 126,
+        "rgb_sha256": "5aece5644694ae8355ca6057b837a368a46f5ba1abf672ebc1aa45a744a8b600",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.n66tc@3.1.17@38d1681ec71b",
+      "family": "n66",
+      "ap_sha256": "9c4129a2bb62be559b31dce883715264862854504f44b47f6cf27f1e66888498",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.024,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 63,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Gray sculpted large 8 watchface, 08:00 and charging 100%; readable system display.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 11,
+        "rendered_nonzero_pixel_commands": 9,
+        "draws": 38,
+        "pixels": 538987,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 11,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 11
+      },
+      "peak_child_rss_bytes": 930562048,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 126,
+        "rgb_sha256": "5aece5644694ae8355ca6057b837a368a46f5ba1abf672ebc1aa45a744a8b600",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.n66tc@3.1.32@489f20502ae2",
+      "family": "n66",
+      "ap_sha256": "9c02dab4020b2cc9666ee7d34cf27d311b76aadcec519a38361bbcbd94c53264",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.001,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 63,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Gray sculpted large 8 watchface, 08:00 and charging 100%; readable system display.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 11,
+        "rendered_nonzero_pixel_commands": 9,
+        "draws": 38,
+        "pixels": 538987,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 11,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 11
+      },
+      "peak_child_rss_bytes": 930381824,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 126,
+        "rgb_sha256": "5aece5644694ae8355ca6057b837a368a46f5ba1abf672ebc1aa45a744a8b600",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.n67cn@3.1.171@01591845f76e",
+      "family": "n67",
+      "ap_sha256": "7b04219dd18da07f4e81be7fb42ceb0feffdb306fca9b70be2a7879d1f1e8315",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.05,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 26,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Full-height pastel gradient 08:00 watchface, 12/31 Friday morning and battery icon.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 81,
+      "firmware_log_error_categories": [
+        "magnetometer",
+        "optical-health-sensor",
+        "other-driver",
+        "storage"
+      ],
+      "gpu": {
+        "submitted_commands": 88,
+        "rendered_nonzero_pixel_commands": 87,
+        "draws": 214,
+        "pixels": 3348015,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 88,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 88
+      },
+      "peak_child_rss_bytes": 938426368,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 52,
+        "rgb_sha256": "ec1bc4a24f104f6fe79844cc6c9a0784e49d111d8ff14f5a07ad93ceccaf7ba6",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.n67cn@3.1.175@a8274e4cb29c",
+      "family": "n67",
+      "ap_sha256": "4f43b325addd6d9e6e7c7e2a4d00ffe3f23d5fb1560d8fe503544002ac1f516b",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.04,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 26,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Full-height pastel gradient 08:00 watchface, 12/31 Friday morning and battery icon.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 81,
+      "firmware_log_error_categories": [
+        "magnetometer",
+        "optical-health-sensor",
+        "other-driver",
+        "storage"
+      ],
+      "gpu": {
+        "submitted_commands": 91,
+        "rendered_nonzero_pixel_commands": 90,
+        "draws": 214,
+        "pixels": 3348015,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 91,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 91
+      },
+      "peak_child_rss_bytes": 942112768,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 52,
+        "rgb_sha256": "ec1bc4a24f104f6fe79844cc6c9a0784e49d111d8ff14f5a07ad93ceccaf7ba6",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.n67cn@3.1.187@6d33afe20089",
+      "family": "n67",
+      "ap_sha256": "acb9b0e867140f09c90747c0ada98f340e2edb540eb69b999c4b78adbc102595",
+      "status": "prohibited",
+      "runtime_seconds": null,
+      "core_exit_code": null,
+      "runner_exit_code": null,
+      "original_ap_unchanged": null,
+      "firmware_modified": null,
+      "firmware_ui_visually_observed": null,
+      "display_frames": null,
+      "gpu_nonzero_pixels_observed": null,
+      "setup_fixture": null,
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "reason": "Prior execution restriction remains in force; no dynamic test attempted."
+    },
+    {
+      "profile_id": "miwear.watch.o66cn@3.1.16@435fd32b5a23",
+      "family": "o66",
+      "ap_sha256": "8df4bebc9fb2cc977ce3c945ba32f2c280660fed82b4f09bda80b3e9d0231bdf",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.006,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1193476096,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66cn@3.1.23@1a1bc068db45",
+      "family": "o66",
+      "ap_sha256": "ea455686bd4dcf55eab93ac03382734b20a959db1ec73448f8f6c8bd06773c50",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.022,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1193312256,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66cn@3.1.26@d4e61778eee0",
+      "family": "o66",
+      "ap_sha256": "185fc5737fa203ff3f109a282feca89a09c12d84bccd44fd7b61d74853f7fa49",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.005,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1165459456,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66cn@3.1.28@03ac3e2b8325",
+      "family": "o66",
+      "ap_sha256": "fb726472416e99ba11d1c20ce8f0d4f0831a6e9a673d63bb5918e2c3921d8845",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.038,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1162526720,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66lj@3.1.16@435fd32b5a23",
+      "family": "o66",
+      "ap_sha256": "8df4bebc9fb2cc977ce3c945ba32f2c280660fed82b4f09bda80b3e9d0231bdf",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.039,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1197817856,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66lj@3.1.23@1a1bc068db45",
+      "family": "o66",
+      "ap_sha256": "ea455686bd4dcf55eab93ac03382734b20a959db1ec73448f8f6c8bd06773c50",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.03,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1198014464,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66lj@3.1.26@d4e61778eee0",
+      "family": "o66",
+      "ap_sha256": "185fc5737fa203ff3f109a282feca89a09c12d84bccd44fd7b61d74853f7fa49",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.045,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1153171456,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66nfc@3.1.16@435fd32b5a23",
+      "family": "o66",
+      "ap_sha256": "8df4bebc9fb2cc977ce3c945ba32f2c280660fed82b4f09bda80b3e9d0231bdf",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.054,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1154531328,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66nfc@3.1.23@1a1bc068db45",
+      "family": "o66",
+      "ap_sha256": "ea455686bd4dcf55eab93ac03382734b20a959db1ec73448f8f6c8bd06773c50",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.048,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1199423488,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66nfc@3.1.26@d4e61778eee0",
+      "family": "o66",
+      "ap_sha256": "185fc5737fa203ff3f109a282feca89a09c12d84bccd44fd7b61d74853f7fa49",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.026,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1199702016,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66nfc@3.1.28@03ac3e2b8325",
+      "family": "o66",
+      "ap_sha256": "fb726472416e99ba11d1c20ce8f0d4f0831a6e9a673d63bb5918e2c3921d8845",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.044,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1162264576,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66tc@3.1.11@90daf23812bf",
+      "family": "o66",
+      "ap_sha256": "af5484d349e8f5c010612fb6cc0abfb5e249334cc9cf8f05f3a388e902ecef7a",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.032,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1197113344,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66tc@3.1.16@435fd32b5a23",
+      "family": "o66",
+      "ap_sha256": "8df4bebc9fb2cc977ce3c945ba32f2c280660fed82b4f09bda80b3e9d0231bdf",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.042,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1147912192,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66tc@3.1.23@1a1bc068db45",
+      "family": "o66",
+      "ap_sha256": "ea455686bd4dcf55eab93ac03382734b20a959db1ec73448f8f6c8bd06773c50",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.02,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1196441600,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66tc@3.1.26@d4e61778eee0",
+      "family": "o66",
+      "ap_sha256": "185fc5737fa203ff3f109a282feca89a09c12d84bccd44fd7b61d74853f7fa49",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.016,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1197670400,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.o66tc@3.1.28@03ac3e2b8325",
+      "family": "o66",
+      "ap_sha256": "fb726472416e99ba11d1c20ce8f0d4f0831a6e9a673d63bb5918e2c3921d8845",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.008,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 62,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "08:00 watchface with multicolor curved temperature scale, steps, activity arc, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": false,
+        "data_setup_fixture": true
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 25,
+        "rendered_nonzero_pixel_commands": 24,
+        "draws": 134,
+        "pixels": 348913,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 25,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 25
+      },
+      "peak_child_rss_bytes": 1197817856,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 124,
+        "rgb_sha256": "a56eaa55db3b01a36cf3f66e3634c54b302af00a8fb02a886af95a22360c76f3",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.p67cn@3.101.021@5b17ada0842d",
+      "family": "p67",
+      "ap_sha256": "e3a9b4320fcdf333954e9e2dfa885791c66d326c50592c1f022612bb62312159",
+      "status": "original_ui_observed",
+      "runtime_seconds": 90.019,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 28,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Original firmware watchface at 90 seconds with large sculpted gray 08:01 numerals over orange gradient.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": true,
+        "data_setup_fixture": false
+      },
+      "firmware_log_error_count": 29,
+      "firmware_log_error_categories": [
+        "GNSS",
+        "NFC",
+        "other-driver",
+        "storage"
+      ],
+      "gpu": {
+        "submitted_commands": 32,
+        "rendered_nonzero_pixel_commands": 32,
+        "draws": 120,
+        "pixels": 1912026,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 32,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 32
+      },
+      "peak_child_rss_bytes": 818692096,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 56,
+        "rgb_sha256": "e33331b20ddae4db4c7cba79e18c80d505a0a72d32628f7e8630cb68405e82fa",
+        "raw_unmodified": true
+      },
+      "short_observation": {
+        "seconds": 30,
+        "scene": "boot_logo_only"
+      }
+    },
+    {
+      "profile_id": "miwear.watch.p67cn@3.101.028@6534235d895f",
+      "family": "p67",
+      "ap_sha256": "bd222f3da1aadc6e510870c24039c2b1802cdc3f65fc8027e276163801eb8cf2",
+      "status": "original_ui_observed",
+      "runtime_seconds": 90.022,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 28,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Original firmware watchface at 90 seconds with large sculpted gray 08:01 numerals over orange gradient.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": true,
+        "data_setup_fixture": false
+      },
+      "firmware_log_error_count": 29,
+      "firmware_log_error_categories": [
+        "GNSS",
+        "NFC",
+        "other-driver",
+        "storage"
+      ],
+      "gpu": {
+        "submitted_commands": 32,
+        "rendered_nonzero_pixel_commands": 32,
+        "draws": 120,
+        "pixels": 1912026,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 32,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 32
+      },
+      "peak_child_rss_bytes": 818184192,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 56,
+        "rgb_sha256": "e33331b20ddae4db4c7cba79e18c80d505a0a72d32628f7e8630cb68405e82fa",
+        "raw_unmodified": true
+      },
+      "short_observation": {
+        "seconds": 30,
+        "scene": "boot_logo_only"
+      }
+    },
+    {
+      "profile_id": "miwear.watch.p67cn@3.101.036@17a1ea48d581",
+      "family": "p67",
+      "ap_sha256": "662d67f5e247e31e194d3161024890ba93b9d29d70b290fadb9aac8ce8ec3c81",
+      "status": "original_ui_observed",
+      "runtime_seconds": 90.022,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 27,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Original firmware watchface at 90 seconds with large sculpted gray 08:01 numerals over orange gradient.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": true,
+        "data_setup_fixture": false
+      },
+      "firmware_log_error_count": 29,
+      "firmware_log_error_categories": [
+        "GNSS",
+        "NFC",
+        "other-driver",
+        "storage"
+      ],
+      "gpu": {
+        "submitted_commands": 20,
+        "rendered_nonzero_pixel_commands": 20,
+        "draws": 94,
+        "pixels": 1873959,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 20,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 20
+      },
+      "peak_child_rss_bytes": 818298880,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 54,
+        "rgb_sha256": "e33331b20ddae4db4c7cba79e18c80d505a0a72d32628f7e8630cb68405e82fa",
+        "raw_unmodified": true
+      },
+      "short_observation": {
+        "seconds": 30,
+        "scene": "boot_logo_only"
+      }
+    },
+    {
+      "profile_id": "miwear.watch.p67cn@3.101.042@616d0faba20c",
+      "family": "p67",
+      "ap_sha256": "ccd6e1cd55de8782c98f26ce6d29c0b4157e2aca7f419d7e2164b1ccba6a71b3",
+      "status": "original_ui_observed",
+      "runtime_seconds": 90.021,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 27,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Original firmware watchface at 90 seconds with large sculpted gray 08:01 numerals over orange gradient.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": true,
+        "data_setup_fixture": false
+      },
+      "firmware_log_error_count": 26,
+      "firmware_log_error_categories": [
+        "NFC",
+        "other-driver",
+        "storage"
+      ],
+      "gpu": {
+        "submitted_commands": 20,
+        "rendered_nonzero_pixel_commands": 20,
+        "draws": 94,
+        "pixels": 1873959,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 20,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 20
+      },
+      "peak_child_rss_bytes": 815431680,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 54,
+        "rgb_sha256": "e33331b20ddae4db4c7cba79e18c80d505a0a72d32628f7e8630cb68405e82fa",
+        "raw_unmodified": true
+      },
+      "short_observation": {
+        "seconds": 30,
+        "scene": "boot_logo_only"
+      }
+    },
+    {
+      "profile_id": "miwear.watch.p67cn@3.101.043@a4ce85647786",
+      "family": "p67",
+      "ap_sha256": "519307675665e4866d722a8119a98589c397b614ac3294cb87bfc86de45756ec",
+      "status": "original_ui_observed",
+      "runtime_seconds": 90.047,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 27,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Original firmware watchface at 90 seconds with large sculpted gray 08:01 numerals over orange gradient.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": true,
+        "data_setup_fixture": false
+      },
+      "firmware_log_error_count": 26,
+      "firmware_log_error_categories": [
+        "NFC",
+        "other-driver",
+        "storage"
+      ],
+      "gpu": {
+        "submitted_commands": 20,
+        "rendered_nonzero_pixel_commands": 20,
+        "draws": 94,
+        "pixels": 1873959,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 20,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 20
+      },
+      "peak_child_rss_bytes": 849526784,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 54,
+        "rgb_sha256": "e33331b20ddae4db4c7cba79e18c80d505a0a72d32628f7e8630cb68405e82fa",
+        "raw_unmodified": true
+      },
+      "short_observation": {
+        "seconds": 30,
+        "scene": "boot_logo_only"
+      }
+    },
+    {
+      "profile_id": "miwear.watch.p67tc@3.101.021@5b17ada0842d",
+      "family": "p67",
+      "ap_sha256": "e3a9b4320fcdf333954e9e2dfa885791c66d326c50592c1f022612bb62312159",
+      "status": "original_ui_observed",
+      "runtime_seconds": 90.039,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 28,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Original firmware watchface at 90 seconds with large sculpted gray 08:01 numerals over orange gradient.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": true,
+        "data_setup_fixture": false
+      },
+      "firmware_log_error_count": 29,
+      "firmware_log_error_categories": [
+        "GNSS",
+        "NFC",
+        "other-driver",
+        "storage"
+      ],
+      "gpu": {
+        "submitted_commands": 32,
+        "rendered_nonzero_pixel_commands": 32,
+        "draws": 120,
+        "pixels": 1912026,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 32,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 32
+      },
+      "peak_child_rss_bytes": 838123520,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 56,
+        "rgb_sha256": "e33331b20ddae4db4c7cba79e18c80d505a0a72d32628f7e8630cb68405e82fa",
+        "raw_unmodified": true
+      },
+      "short_observation": {
+        "seconds": 30,
+        "scene": "boot_logo_only"
+      }
+    },
+    {
+      "profile_id": "miwear.watch.p67tc@3.101.028@a1d6e3e08a1c",
+      "family": "p67",
+      "ap_sha256": "bd222f3da1aadc6e510870c24039c2b1802cdc3f65fc8027e276163801eb8cf2",
+      "status": "original_ui_observed",
+      "runtime_seconds": 90.005,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 28,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Original firmware watchface at 90 seconds with large sculpted gray 08:01 numerals over orange gradient.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": true,
+        "data_setup_fixture": false
+      },
+      "firmware_log_error_count": 29,
+      "firmware_log_error_categories": [
+        "GNSS",
+        "NFC",
+        "other-driver",
+        "storage"
+      ],
+      "gpu": {
+        "submitted_commands": 32,
+        "rendered_nonzero_pixel_commands": 32,
+        "draws": 120,
+        "pixels": 1912026,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 32,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 32
+      },
+      "peak_child_rss_bytes": 840204288,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 56,
+        "rgb_sha256": "e33331b20ddae4db4c7cba79e18c80d505a0a72d32628f7e8630cb68405e82fa",
+        "raw_unmodified": true
+      },
+      "short_observation": {
+        "seconds": 30,
+        "scene": "boot_logo_only"
+      }
+    },
+    {
+      "profile_id": "miwear.watch.p67tc@3.101.036@17a1ea48d581",
+      "family": "p67",
+      "ap_sha256": "662d67f5e247e31e194d3161024890ba93b9d29d70b290fadb9aac8ce8ec3c81",
+      "status": "original_ui_observed",
+      "runtime_seconds": 90.054,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 27,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Original firmware watchface at 90 seconds with large sculpted gray 08:01 numerals over orange gradient.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": true,
+        "data_setup_fixture": false
+      },
+      "firmware_log_error_count": 29,
+      "firmware_log_error_categories": [
+        "GNSS",
+        "NFC",
+        "other-driver",
+        "storage"
+      ],
+      "gpu": {
+        "submitted_commands": 20,
+        "rendered_nonzero_pixel_commands": 20,
+        "draws": 94,
+        "pixels": 1873959,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 20,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 20
+      },
+      "peak_child_rss_bytes": 851312640,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 54,
+        "rgb_sha256": "e33331b20ddae4db4c7cba79e18c80d505a0a72d32628f7e8630cb68405e82fa",
+        "raw_unmodified": true
+      },
+      "short_observation": {
+        "seconds": 30,
+        "scene": "boot_logo_only"
+      }
+    },
+    {
+      "profile_id": "miwear.watch.p67tc@3.101.043@a4ce85647786",
+      "family": "p67",
+      "ap_sha256": "519307675665e4866d722a8119a98589c397b614ac3294cb87bfc86de45756ec",
+      "status": "original_ui_observed",
+      "runtime_seconds": 90.044,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 27,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Original firmware watchface at 90 seconds with large sculpted gray 08:01 numerals over orange gradient.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": true,
+        "data_setup_fixture": false
+      },
+      "firmware_log_error_count": 26,
+      "firmware_log_error_categories": [
+        "NFC",
+        "other-driver",
+        "storage"
+      ],
+      "gpu": {
+        "submitted_commands": 20,
+        "rendered_nonzero_pixel_commands": 20,
+        "draws": 94,
+        "pixels": 1873959,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 20,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 20
+      },
+      "peak_child_rss_bytes": 848576512,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 54,
+        "rgb_sha256": "e33331b20ddae4db4c7cba79e18c80d505a0a72d32628f7e8630cb68405e82fa",
+        "raw_unmodified": true
+      },
+      "short_observation": {
+        "seconds": 30,
+        "scene": "boot_logo_only"
+      }
+    },
+    {
+      "profile_id": "miwear.watch.q66glt@4.200.078@754da125b286",
+      "family": "q66",
+      "ap_sha256": "bf36cc88905271e7f596b1de9b8c314e6a9737d5e36f8d67f60535f003ee229c",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.05,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 41,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Blue gradient watchface with readable 08:00, battery, weekday/date, calories and sleep ring; English labels on global version and Chinese labels on other inspected versions.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": true,
+        "data_setup_fixture": false
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 39,
+        "rendered_nonzero_pixel_commands": 37,
+        "draws": 173,
+        "pixels": 838643,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 39,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 78
+      },
+      "peak_child_rss_bytes": 812630016,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 82,
+        "rgb_sha256": "c4b1204384266136ffce5f9f8ab48ec04d28885cc73ed933c9ae030f5991752f",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.q66tc@4.100.155@f1c824fef81d",
+      "family": "q66",
+      "ap_sha256": "ea0bdf1920cb30223d616432af00565ca67622e6468328f5eab155f8cdc2fb9f",
+      "status": "original_ui_observed",
+      "runtime_seconds": 90.052,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 287,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Original Chinese application list with activity, sport, and workout-history icons; longer candidate run reused.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": true,
+        "data_setup_fixture": false
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 734,
+        "rendered_nonzero_pixel_commands": 732,
+        "draws": 4376,
+        "pixels": 65792468,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 734,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 1468
+      },
+      "peak_child_rss_bytes": 808714240,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 574,
+        "rgb_sha256": "8c7be2ec2489e4005d986dd7ec6f28740f67044bf36b9cc29d8595795439fcfa",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "miwear.watch.q66u@4.100.108@6ef691453a86",
+      "family": "q66",
+      "ap_sha256": "9315ca353f624cec25dfcfc98a95ba959e2d7b24573bf1d6adf16ea10341bd99",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.051,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 48,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Blue gradient watchface with readable 08:00, battery, weekday/date, calories and sleep ring; English labels on global version and Chinese labels on other inspected versions.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": true,
+        "data_setup_fixture": false
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 29,
+        "rendered_nonzero_pixel_commands": 27,
+        "draws": 139,
+        "pixels": 484980,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 29,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 58
+      },
+      "peak_child_rss_bytes": 805945344,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 96,
+        "rgb_sha256": "435ac77cde69ae08f4c2a1f773a94b5d3e12045af653c4f1c41cca0330343128",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "q66@4.100.071",
+      "family": "q66",
+      "ap_sha256": "0b78f4d6c22104b98d259b1bd3bf2e07b89695eab23a0e72addcfe1ce5795f5c",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.036,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 46,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Blue gradient watchface with readable 08:00, battery, weekday/date, calories and sleep ring; English labels on global version and Chinese labels on other inspected versions.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": true,
+        "data_setup_fixture": false
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 29,
+        "rendered_nonzero_pixel_commands": 27,
+        "draws": 140,
+        "pixels": 468095,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 29,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 58
+      },
+      "peak_child_rss_bytes": 804372480,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 92,
+        "rgb_sha256": "435ac77cde69ae08f4c2a1f773a94b5d3e12045af653c4f1c41cca0330343128",
+        "raw_unmodified": true
+      }
+    },
+    {
+      "profile_id": "q66@4.100.177",
+      "family": "q66",
+      "ap_sha256": "ff74c6f467529963b6afd40669437d8ec39a02e48c10d0893739847b3ba3dc2b",
+      "status": "original_ui_observed",
+      "runtime_seconds": 30.03,
+      "core_exit_code": 0,
+      "runner_exit_code": 2,
+      "original_ap_unchanged": true,
+      "firmware_modified": false,
+      "firmware_ui_visually_observed": true,
+      "display_frames": 41,
+      "gpu_nonzero_pixels_observed": true,
+      "visual_description": "Final retained frame shows the blue watchface with 08:00, Chinese labels, date and battery.",
+      "setup_fixture": {
+        "local_setup_fixture": true,
+        "factory_setup_fixture": true,
+        "data_setup_fixture": false
+      },
+      "firmware_log_error_count": 0,
+      "firmware_log_error_categories": [],
+      "gpu": {
+        "submitted_commands": 39,
+        "rendered_nonzero_pixel_commands": 37,
+        "draws": 173,
+        "pixels": 839956,
+        "render_rejected_or_cancelled": 0,
+        "completion_events": 39,
+        "no_pixel_completion_events": 0,
+        "status_read_acknowledgements": 78
+      },
+      "peak_child_rss_bytes": 754597888,
+      "final_frame": {
+        "scene": "watchface",
+        "sequence": 82,
+        "rgb_sha256": "435ac77cde69ae08f4c2a1f773a94b5d3e12045af653c4f1c41cca0330343128",
+        "raw_unmodified": true
+      }
+    }
+  ]
+}

@@ -2,11 +2,11 @@ import SwiftUI
 
 /// Every data input of the instance in one table: the wearer (on the wrist,
 /// pulse, cadence, walking) and the board (battery, charger, temperature).
-/// While the device runs, "应用" changes what the emulated hardware senses at
-/// once (live-set) and keeps the value for the next boot; when it is stopped,
-/// the value is saved for the next boot. Rows appear only for inputs that
-/// really drive this preset's firmware; the firmware itself computes what it
-/// shows from the raw sensor and battery data.
+/// While the device runs, "应用" requests a supported hardware input and keeps
+/// the value for the next boot. Hardware acceptance does not confirm guest
+/// consumption. Without live support, "保存" changes only the next-boot value.
+/// Rows follow the preset's declared capabilities; the firmware computes its
+/// own measurements from the raw sensor and battery data.
 @MainActor struct SimulatorDeviceDataView: View {
     let runtime: StandaloneRuntimeModel
     let session: SimulatorSessionModel
@@ -71,7 +71,7 @@ import SwiftUI
     private var showsCharger: Bool { batteryInputs?.charger == true || live?.supports("charger") == true }
     private var showsTemperature: Bool { live?.supports("temperature") == true }
     private var hasRows: Bool { showsWear || showsSteps || showsLevel || showsCharger || showsTemperature }
-    private var running: Bool { session.isRunning && live != nil }
+    private var running: Bool { session.isRunning && live != nil && liveUnavailable == nil }
 
     private var table: some View {
         Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
@@ -162,7 +162,7 @@ import SwiftUI
 
     private var footer: String {
         var lines = [session.isRunning
-            ? "设备运行中：“应用”立即改变模拟硬件的输入，并保存为下次开机的值；“保存”只作用于下次开机。"
+            ? "设备运行中：“应用”更新已支持的模拟硬件输入；固件是否采用请以设备画面为准。“保存”只作用于下次开机。"
             : "设备未运行：修改保存为下次开机的值；运行后可在此立即修改。"]
         lines.append("步数、心率、电量都由固件自己的算法从模拟的传感器和电池数据算出：心率可能相差 1–3 次/分，未佩戴时固件提示佩戴；运行中改电量只改变电池电压，固件电量计逐步追随。")
         if showsSteps { lines.append("开机后步行在固件计步服务就绪（约 75 秒）后开始，起步的几步用于识别步行。") }
@@ -205,8 +205,14 @@ import SwiftUI
     }
 
     private func applyButton(_ title: String, id: String, enabled: Bool, _ run: @escaping () async -> Void) -> some View {
-        Button(title) { Task { busy = true; await run(); busy = false } }
-            .disabled(!self.enabled || busy || !enabled)
+        let support = ["worn": "heartRate", "heart-rate": "heartRate", "cadence": "steps", "walk": "steps",
+                       "battery-level": "batteryLevel", "charger": "charger", "temperature": "temperature"][id]
+        let supportsLive = support.map { live?.supports($0) == true } ?? false
+        return Button(title == "应用" && !(session.isRunning && supportsLive) ? "保存" : title) {
+            Task { busy = true; await run(); busy = false }
+        }
+            .disabled(!self.enabled || busy || !enabled
+                      || (supportsLive && session.isRunning && liveUnavailable != nil))
             .accessibilityIdentifier("simulator.data.\(id)")
     }
 
@@ -286,24 +292,33 @@ import SwiftUI
     /// Live change first (only while running), then the next-boot value.
     private func apply(live change: [String: SimulatorJSON]?,
                        boot: ((inout InstanceFirmwareSettings) -> Void)?) async {
-        var done: [String] = []
+        var progress = SimulatorLiveApplyProgress()
         do {
             if let change, session.isRunning, live != nil {
-                receive(try await session.liveCommand(SimulatorLiveCommands.set, arguments: change))
-                done.append("已立即生效")
+                guard liveUnavailable == nil else { throw SimulatorError.remote("实时状态已过期，请等待刷新后再提交") }
+                let receipt = try SimulatorLiveWriteReceipt(await session.liveCommand(SimulatorLiveCommands.set, arguments: change))
+                progress.hardwareAccepted = true
+                if let snapshot = receipt.snapshot { receive(snapshot) }
+                else {
+                    progress.stateUnavailable = true
+                    liveUnavailable = "模拟硬件已接受输入，但暂时无法回读；当前值可能已过期，请等待刷新。"
+                }
             }
             if let boot, runtime.instanceID != nil {
                 var next = try await currentSettings()
                 boot(&next)
                 adopt(try await runtime.saveFirmwareSettings(next))
-                done.append("已保存为下次开机的值")
+                progress.nextBootSaved = true
             }
-            message = done.isEmpty ? nil : done.joined(separator: "，")
+            message = progress.message()
             messageIsError = false
         } catch {
             let text = error.localizedDescription
-            message = text.contains("[live_outcome_unknown]")
-                ? "写入可能已生效但未得到确认，请看设备画面或等待刷新，不要重复提交。" : text
+            if text.contains("[live_outcome_unknown]") {
+                liveUnavailable = "写入可能已生效但未得到确认，请等待刷新，不要重复提交。"
+            }
+            message = progress.message(failure: text.contains("[live_outcome_unknown]")
+                ? "写入可能已生效但未得到确认，请看设备画面或等待刷新，不要重复提交。" : text)
             messageIsError = true
         }
     }
@@ -346,8 +361,7 @@ import SwiftUI
         catch { message = error.localizedDescription; messageIsError = true; settings = InstanceFirmwareSettings() }
     }
 
-    private func receive(_ reply: SimulatorJSON) {
-        guard let next = SimulatorLiveState(reply) else { return }
+    private func receive(_ next: SimulatorLiveState) {
         let first = live == nil
         live = next; liveUnavailable = nil
         guard first else { return }
@@ -364,13 +378,15 @@ import SwiftUI
         guard session.isRunning else { return }
         while !Task.isCancelled, session.isRunning {
             if !busy {
-                do { receive(try await session.liveCommand(SimulatorLiveCommands.get)) }
+                do {
+                    let reply = try await session.liveCommand(SimulatorLiveCommands.get)
+                    guard !Task.isCancelled else { return }
+                    guard let snapshot = SimulatorLiveState(reply) else { throw SimulatorError.remote("实时输入回读格式无效") }
+                    receive(snapshot)
+                }
                 catch {
-                    if live == nil {
-                        let text = error.localizedDescription
-                        liveUnavailable = text.contains("[unsupported") || text.contains("不受支持")
-                            ? "当前运行的核心不提供实时输入，修改将在下次开机生效。" : "暂时读不到实时输入：\(text)"
-                    }
+                    guard !Task.isCancelled else { return }
+                    liveUnavailable = SimulatorLiveFreshness.failureMessage(error.localizedDescription, hasSnapshot: live != nil)
                 }
             }
             let walking = (live?.stepsRemaining ?? 0) > 0

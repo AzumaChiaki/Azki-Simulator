@@ -139,7 +139,8 @@
   },
   "pmuAdcRaw": {
     "schema": 1,
-    "runnerProtocol": 1
+    "runnerProtocol": 1,
+    "machines": ["best1503", "azki-q65", "azki-p65"]
   },
   "virtualPeer": {
     "schema": 1,

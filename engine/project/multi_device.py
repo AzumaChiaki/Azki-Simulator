@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import struct
@@ -11,6 +12,23 @@ import sys
 from device_catalog import ROOT, digest, load_catalog, prepare_storage, select, zip_member_records
 
 BACKEND = ROOT/'backend'
+
+
+def extract_p65_audio(package, records, directory):
+    """Preserve the original BES CP image for the P65 NOR audio partition."""
+    from firmware_resources import checked_member
+    selected = [record for record in records
+                if record['name'] in ('vela_audio.bin', 'vela_audio_img.bin')]
+    if len(selected) != 1 or not 0x128 <= selected[0]['size'] <= 3 * 1024**2:
+        raise ValueError('P65 requires one BES audio image within its 3 MiB NOR partition')
+    data = checked_member(package, selected[0])
+    if data[:4] != bytes.fromhex('1cec57be'):
+        raise ValueError('P65 audio is a raw BES CP image, not NAND ROMFS')
+    target = Path(directory) / selected[0]['name']
+    # The run owns this fresh file; an existing file is not silently replaced.
+    with os.fdopen(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as stream:
+        stream.write(data)
+    return target
 
 
 def partition_records(data):
@@ -80,7 +98,7 @@ def board_profile(profile, resource_bytes, storage_kind='romfs'):
         if len(ap_data) != ap['size']:
             raise ValueError('P65 AP byte count differs from selected metadata')
         geometry = {'ap-offset': 0xc0000, 'reset-sp': ap['reset_sp'],
-                    'flash-bytes': 0x1000000, 'factory-offset': 0xfe0000,
+                    'flash-bytes': 0x1000000, 'factory-offset': 0xcc0000,
                     'nv-offset': 0xcc0000, 'nand-data-offset': 220 * 1024**2,
                     'nand-data-bytes': 292 * 1024**2, 'ram-bytes': 0x1a0000,
                     # Channel 3 remains the P65 firmware's room-temperature
@@ -88,11 +106,11 @@ def board_profile(profile, resource_bytes, storage_kind='romfs'):
                     'pmu-adc-ntc': 1 << 3, 'pmu-adc-ntc-room': 12090}
         board = {'profile_id': profile['id'], 'chip': 'best1502p', 'machine': 'azki-p65',
                  'ap_sha256': ap['sha256'], 'local_setup_bypass': True,
-                 'geometry': geometry, 'factory_bytes': 128 * 1024,
+                 'geometry': geometry, 'factory_bytes': 256 * 1024,
                  'nor_geometry': {'profileID': profile['id'], 'apSHA256': ap['sha256'],
                                   'apBytes': ap['size'], 'apOffset': 0xc0000,
                                   'flashBytes': 0x1000000, 'offset': 0xcc0000,
-                                  'bytes': 0x340000, 'factoryOffset': 0xfe0000},
+                                  'bytes': 0x340000, 'factoryOffset': 0xcc0000},
                  'evidence': {'source': 'P65 BEST1502P AP-derived geometry',
                               'apOffset': '0xc0000', 'factoryData': '0xcc0000/0x40000'}}
         from backend.src.instance_data import validate_nor_geometry
@@ -180,7 +198,7 @@ def board_profile(profile, resource_bytes, storage_kind='romfs'):
         # get_bat_temp (.32 0x0c166a34) converts PMU ADC 3; battery is ADC 2.
         board['geometry']['pmu-adc-ntc']=1<<3
         board['evidence']['touch']='N66 .17/.32 esd_check 0x0c1586ec accepts exact D048 byte 0x20/0xa0'
-    if profile['model'].startswith(('miwear.watch.o66', 'miwear.watch.q66')):
+    if profile['model'] == 'q66' or profile['model'].startswith(('miwear.watch.o66', 'miwear.watch.q66')):
         # Charger on I2C0 at 0x07: hp4560x_checkid (O66 .28 0x0c39caf8)
         # accepts only identity 0xe0 at register 0x0a, else probes SC7061.
         board['geometry'].update({'charger-i2c':0x0007,'charger-id':0xe0})
@@ -329,20 +347,9 @@ def main():
                        record.get('name') in ('vela_sensor_img.bin', 'vela_sensor.bin')
                        for record in ota_records):
             ota_records = zip_member_records(profile['ota_path'])
-        # P65 OTAs name the audio/sensor sub-images without the _img suffix used
-        # by other models (Q65 ships vela_audio_img.bin); some builds ship
-        # vela_audio.bin. Only a ROMFS audio image is consumable by the
-        # machine's audio-image option; P65's raw BES audio partition
-        # (vela_audio.bin, magic 0x1cec57be) is not ROMFS and the reference
-        # runner never passes it for P65, so it is skipped. The sensor image
-        # is a raw BES image (magic 0xbe57ec1c) and always maps.
-        args.audio_image = None
-        audio_records = [r for r in ota_records if r['name'] == 'vela_audio_img.bin']
-        if len(audio_records) == 1 and 0 < audio_records[0]['size'] <= 5 * 1024**2:
-            image_path = logdir / audio_records[0]['name']
-            image_path.write_bytes(checked_member(package, audio_records[0], verify_sha=False))
-            image_path.chmod(0o600)
-            args.audio_image = image_path
+        # P65 audio is the original BES CP image in the NOR0 audio
+        # partition, not Q65's NAND ROMFS. Keep all original image bytes.
+        args.audio_image = extract_p65_audio(package, ota_records, logdir)
         sensor_records = [r for r in ota_records
                           if r['name'] in ('vela_sensor_img.bin', 'vela_sensor.bin')]
         if len(sensor_records) != 1 or not 0 < sensor_records[0]['size'] <= 4 * 1024**2:

@@ -78,7 +78,7 @@ actor SimulatorSessionConnection {
 
     fileprivate nonisolated static func readFrame(directoryFD: Int32, manifest: SimulatorSessionManifest,
                                                   after sequence: UInt32?) throws -> SimulatorFrame? {
-        let expectedBytes = SimulatorFrameHeader.byteCount + manifest.width * manifest.height * 2
+        let expectedBytes = SimulatorFrameHeader.byteCount + manifest.width * manifest.height * 3
         let fd = try Self.openRegularFile(directoryFD: directoryFD, name: manifest.framebuffer,
                                          limit: expectedBytes, allowMissingFrame: true)
         // ENOENT is normal before the first frame and across stop/republication.
@@ -91,10 +91,16 @@ actor SimulatorSessionConnection {
         guard fstat(fd, &fileInfo) == 0, fileInfo.st_size == header.byteCount else {
             throw SimulatorError.invalidFrame("画面文件长度不匹配")
         }
-        guard header.width == manifest.width, header.height == manifest.height, header.stride == manifest.width * 2 else {
+        guard header.width == manifest.width, header.height == manifest.height,
+              header.stride == manifest.width * header.pixelFormat.bytesPerPixel else {
             throw SimulatorError.invalidFrame("尺寸与会话不一致")
         }
-        if sequence == header.sequence { return nil }
+        if sequence == header.sequence {
+            guard try Self.readExactly(fd, count: SimulatorFrameHeader.byteCount, offset: 0) == first else {
+                throw SimulatorError.frameBeingWritten
+            }
+            return nil
+        }
         let bytes = try Self.readExactly(fd, count: header.byteCount, offset: 0)
         let last = try Self.readExactly(fd, count: SimulatorFrameHeader.byteCount, offset: 0)
         guard first == last, bytes.prefix(SimulatorFrameHeader.byteCount) == first else {
@@ -211,37 +217,49 @@ actor SimulatorSessionConnection {
         var request = try JSONEncoder().encode(SimulatorBridgeRequest(id: manifest.id, command: command, arguments: arguments))
         guard request.count < 65_536 else { throw SimulatorError.transport("请求超出限制") }
         request.append(10)
-        try request.withUnsafeBytes { bytes in
-            var sent = 0
-            while sent < bytes.count {
-                try Self.waitForSocket(socketFD, events: Int16(POLLOUT), deadline: deadline)
-                let count = Darwin.send(socketFD, bytes.baseAddress!.advanced(by: sent), bytes.count - sent, 0)
-                if count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) { continue }
-                guard count > 0 else { throw SimulatorError.transport("请求发送失败") }
-                sent += count
-            }
-        }
-        var response = Data()
-        var buffer = [UInt8](repeating: 0, count: 4_096)
-        // The same absolute deadline includes connect, send and every receive,
-        // even if a peer trickles a byte immediately before a timeout.
-        while response.count <= 1_048_576, ProcessInfo.processInfo.systemUptime < deadline {
-            try Self.waitForSocket(socketFD, events: Int16(POLLIN), deadline: deadline)
-            let count = Darwin.recv(socketFD, &buffer, buffer.count, 0)
-            if count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) { continue }
-            guard count > 0 else { throw SimulatorError.transport("响应中断") }
-            response.append(contentsOf: buffer.prefix(count))
-            if let newline = response.firstIndex(of: 10) {
-                guard newline <= 1_048_576 else { break }
-                let reply = try JSONDecoder().decode(SimulatorBridgeResponse.self, from: response.prefix(upTo: newline))
-                if !reply.ok, ["timeout", "guest_timeout"].contains(reply.error?.code ?? "") {
-                    throw SimulatorConnectionTimeout()
+        return try Self.exchangeRequest(request, command: command, socketFD: socketFD, deadline: deadline)
+    }
+
+    private nonisolated static func exchangeRequest(_ request: Data, command: String,
+                                                    socketFD: Int32, deadline: TimeInterval) throws -> SimulatorJSON {
+        var submitted = false
+        var receivedReply = false
+        do {
+            try request.withUnsafeBytes { bytes in
+                var sent = 0
+                while sent < bytes.count {
+                    try Self.waitForSocket(socketFD, events: Int16(POLLOUT), deadline: deadline)
+                    let count = Darwin.send(socketFD, bytes.baseAddress!.advanced(by: sent), bytes.count - sent, 0)
+                    if count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) { continue }
+                    guard count > 0 else { throw SimulatorError.transport("请求发送失败") }
+                    sent += count
                 }
-                return try reply.checkedResult()
+                submitted = true
             }
+            var response = Data()
+            var buffer = [UInt8](repeating: 0, count: 4_096)
+            // The absolute deadline still includes connect, send and receive.
+            while response.count <= 1_048_576, ProcessInfo.processInfo.systemUptime < deadline {
+                try Self.waitForSocket(socketFD, events: Int16(POLLIN), deadline: deadline)
+                let count = Darwin.recv(socketFD, &buffer, buffer.count, 0)
+                if count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) { continue }
+                guard count > 0 else { throw SimulatorError.transport("响应中断") }
+                response.append(contentsOf: buffer.prefix(count))
+                if let newline = response.firstIndex(of: 10) {
+                    guard newline <= 1_048_576 else { break }
+                    let reply = try JSONDecoder().decode(SimulatorBridgeResponse.self, from: response.prefix(upTo: newline))
+                    if !reply.ok, ["timeout", "guest_timeout"].contains(reply.error?.code ?? "") {
+                        throw SimulatorConnectionTimeout()
+                    }
+                    receivedReply = true
+                    return try reply.checkedResult()
+                }
+            }
+            if ProcessInfo.processInfo.systemUptime >= deadline { throw SimulatorConnectionTimeout() }
+            throw SimulatorError.transport("响应超出大小限制")
+        } catch {
+            throw SimulatorLiveDelivery.error(error, command: command, submitted: submitted, receivedReply: receivedReply)
         }
-        if ProcessInfo.processInfo.systemUptime >= deadline { throw SimulatorConnectionTimeout() }
-        throw SimulatorError.transport("响应超出大小限制")
     }
 
     private nonisolated static func waitForSocket(_ fd: Int32, events: Int16, deadline: TimeInterval) throws {

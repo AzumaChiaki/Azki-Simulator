@@ -208,7 +208,11 @@ def prepare_profile(engine_root, library_root, profile_id, session_root, *, rese
             bridge_paths.append(cli)
         dependencies = [engine["root"] / path for path in engine["files"]]
         dependencies += [engine["root"] / "manifest.json", catalog.bundle_root / "catalog.json", identity_file]
-        dependencies += [prepared / path for path in engine["files"] if path.startswith("lib/")]
+        # Relocated QEMU resolves @loader_path/qemu-libs from its private copy.
+        # Pin those manifest-listed copies, as well as the legacy lib layout,
+        # so the native guest grants each real loader input by exact identity.
+        dependencies += [prepared / path for path in engine["files"]
+                         if path.startswith(("lib/", "project/backend/build/qemu-libs/"))]
         plan = inspect_backend(project, engine["root"] / engine["manifest"]["entrypoints"]["python"], profile_id,
                                prepared=prepared_assets, dependency_paths=dependencies, bridge_paths=bridge_paths,
                                bootstrap=engine["root"] / engine["manifest"]["entrypoints"]["bootstrap"],

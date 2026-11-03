@@ -122,6 +122,83 @@ static int cmsdk_dualtimermod_divisor(CMSDKAPBDualTimerModule *m)
     }
 }
 
+static bool cmsdk_dualtimermod_bes_underflow(CMSDKAPBDualTimerModule *m,
+                                           uint32_t control)
+{
+    unsigned index = m - m->parent->timermod;
+
+    return (m->parent->bes_oneshot_underflow_mask & (1u << index)) &&
+           (control & R_CONTROL_ONESHOT_MASK);
+}
+
+static uint64_t cmsdk_dualtimermod_raw_count(CMSDKAPBDualTimerModule *m)
+{
+    CMSDKAPBDualTimer *s = m->parent;
+    unsigned index = m - s->timermod;
+
+    if (cmsdk_dualtimermod_bes_underflow(m, m->control) &&
+        s->bes_count_valid[index]) {
+        uint64_t count = s->bes_count_value[index];
+        __uint128_t period = ((__uint128_t)s->bes_count_period_ns[index] << 32) |
+                            s->bes_count_period_frac[index];
+        int64_t elapsed = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                          s->bes_count_time[index];
+
+        if ((m->control & R_CONTROL_ENABLE_MASK) && period && elapsed > 0) {
+            __uint128_t ticks = ((__uint128_t)elapsed << 32) / period;
+
+            count = ticks >= count ? 0 : count - (uint64_t)ticks;
+        }
+        return count;
+    }
+    return ptimer_get_count(m->timer);
+}
+
+static uint64_t cmsdk_dualtimermod_decode_count(CMSDKAPBDualTimerModule *m,
+                                              uint64_t raw, uint32_t control)
+{
+    return cmsdk_dualtimermod_bes_underflow(m, control) && raw ? raw - 1 : raw;
+}
+
+static void cmsdk_dualtimermod_latch_period(CMSDKAPBDualTimerModule *m,
+                                          unsigned divisor)
+{
+    CMSDKAPBDualTimer *s = m->parent;
+    unsigned index = m - s->timermod;
+    __uint128_t period = (__uint128_t)clock_get(s->timclk) * divisor;
+
+    s->bes_count_period_ns[index] = period >> 32;
+    s->bes_count_period_frac[index] = period;
+}
+
+static void cmsdk_dualtimermod_set_raw_count(CMSDKAPBDualTimerModule *m,
+                                           uint64_t raw)
+{
+    CMSDKAPBDualTimer *s = m->parent;
+    unsigned index = m - s->timermod;
+
+    ptimer_set_count(m->timer, raw);
+    s->bes_count_time[index] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->bes_count_value[index] = raw;
+    s->bes_count_valid[index] = true;
+    cmsdk_dualtimermod_latch_period(m, cmsdk_dualtimermod_divisor(m));
+}
+
+static void cmsdk_dualtimermod_set_period(CMSDKAPBDualTimerModule *m,
+                                        unsigned divisor)
+{
+    bool bes = cmsdk_dualtimermod_bes_underflow(m, m->control);
+    uint64_t raw = bes ? cmsdk_dualtimermod_raw_count(m) : 0;
+
+    ptimer_set_period_from_clock(m->timer, m->parent->timclk, divisor);
+    if (bes) {
+        /* Preserve the encoded remaining ticks, including the zero phase.
+         * Do not add another tick when changing the clock or prescaler. */
+        cmsdk_dualtimermod_set_raw_count(m, raw);
+        cmsdk_dualtimermod_latch_period(m, divisor);
+    }
+}
+
 static void cmsdk_dualtimermod_write_control(CMSDKAPBDualTimerModule *m,
                                              uint32_t newctrl)
 {
@@ -136,7 +213,13 @@ static void cmsdk_dualtimermod_write_control(CMSDKAPBDualTimerModule *m,
 
     if (changed & ~newctrl & R_CONTROL_ENABLE_MASK) {
         /* ENABLE cleared, stop timer before any further changes */
+        bool bes = cmsdk_dualtimermod_bes_underflow(m, m->control);
+        uint64_t raw = bes ? cmsdk_dualtimermod_raw_count(m) : 0;
+
         ptimer_stop(m->timer);
+        if (bes) {
+            cmsdk_dualtimermod_set_raw_count(m, raw);
+        }
     }
 
     if (changed & R_CONTROL_PRESCALE_MASK) {
@@ -162,7 +245,7 @@ static void cmsdk_dualtimermod_write_control(CMSDKAPBDualTimerModule *m,
         default:
             g_assert_not_reached();
         }
-        ptimer_set_period_from_clock(m->timer, m->parent->timclk, divisor);
+        cmsdk_dualtimermod_set_period(m, divisor);
     }
 
     if (changed & R_CONTROL_MODE_MASK) {
@@ -185,13 +268,21 @@ static void cmsdk_dualtimermod_write_control(CMSDKAPBDualTimerModule *m,
         ptimer_set_limit(m->timer, load, 0);
     }
 
-    if (changed & R_CONTROL_SIZE_MASK) {
+    if ((changed & R_CONTROL_SIZE_MASK) ||
+        ((changed & R_CONTROL_ONESHOT_MASK) &&
+         (cmsdk_dualtimermod_bes_underflow(m, m->control) ||
+          cmsdk_dualtimermod_bes_underflow(m, newctrl)))) {
         /* Timer switched between 16 and 32 bit count */
         uint32_t value, load;
+        uint64_t raw = cmsdk_dualtimermod_raw_count(m);
+        bool completed = cmsdk_dualtimermod_bes_underflow(m, m->control) &&
+                         raw == 0;
 
-        value = ptimer_get_count(m->timer);
+        value = cmsdk_dualtimermod_decode_count(m, raw, m->control);
         load = ptimer_get_limit(m->timer);
-        if (newctrl & R_CONTROL_SIZE_MASK) {
+        if (!(changed & R_CONTROL_SIZE_MASK)) {
+            /* Only the one-shot encoding changed; retain the counter width. */
+        } else if (newctrl & R_CONTROL_SIZE_MASK) {
             /* 16 -> 32, top half of VALUE is in struct field */
             value = deposit32(m->value, 0, 16, value);
         } else {
@@ -216,11 +307,31 @@ static void cmsdk_dualtimermod_write_control(CMSDKAPBDualTimerModule *m,
                 load = 0xffff;
             }
         }
-        ptimer_set_count(m->timer, value);
+        if (cmsdk_dualtimermod_bes_underflow(m, newctrl)) {
+            /* A completed one-shot stays completed until LOAD rearms it.
+             * In particular, changing SIZE must not manufacture a tick. */
+            cmsdk_dualtimermod_set_raw_count(m,
+                                            completed ? 0 : (uint64_t)value + 1);
+        } else {
+            cmsdk_dualtimermod_set_raw_count(m, value);
+        }
         ptimer_set_limit(m->timer, load, 0);
     }
 
-    if (newctrl & R_CONTROL_ENABLE_MASK) {
+    if ((changed & newctrl & R_CONTROL_ENABLE_MASK) &&
+        cmsdk_dualtimermod_bes_underflow(m, newctrl)) {
+        /* Resume from the paused remaining count, not from its old epoch. */
+        cmsdk_dualtimermod_set_raw_count(m, cmsdk_dualtimermod_raw_count(m));
+    }
+
+    m->control = newctrl;
+    if (cmsdk_dualtimermod_bes_underflow(m, newctrl)) {
+        cmsdk_dualtimermod_latch_period(m, cmsdk_dualtimermod_divisor(m));
+    }
+
+    if ((newctrl & R_CONTROL_ENABLE_MASK) &&
+        !(cmsdk_dualtimermod_bes_underflow(m, newctrl) &&
+          cmsdk_dualtimermod_raw_count(m) == 0)) {
         /*
          * ENABLE is set; start the timer after all other changes.
          * We start it even if the ENABLE bit didn't actually change,
@@ -229,8 +340,6 @@ static void cmsdk_dualtimermod_write_control(CMSDKAPBDualTimerModule *m,
          */
         ptimer_run(m->timer, !!(newctrl & R_CONTROL_ONESHOT_MASK));
     }
-
-    m->control = newctrl;
 
     ptimer_transaction_commit(m->timer);
 }
@@ -285,7 +394,8 @@ static uint64_t cmsdk_apb_dualtimer_read(void *opaque, hwaddr offset,
             }
             break;
         case A_TIMER1VALUE:
-            r = ptimer_get_count(m->timer);
+            r = cmsdk_dualtimermod_decode_count(m,
+                    cmsdk_dualtimermod_raw_count(m), m->control);
             if (!(m->control & R_CONTROL_SIZE_MASK)) {
                 r = deposit32(m->value, 0, 16, r);
             }
@@ -355,7 +465,17 @@ static void cmsdk_apb_dualtimer_write(void *opaque, hwaddr offset,
                 value &= 0xffff;
             }
             ptimer_transaction_begin(m->timer);
-            if (!(m->control & R_CONTROL_MODE_MASK)) {
+            if (cmsdk_dualtimermod_bes_underflow(m, m->control)) {
+                if (m->control & R_CONTROL_MODE_MASK) {
+                    ptimer_set_limit(m->timer, value, 0);
+                }
+                /* Keep LOAD/limit unmodified.  0xffffffff needs a 33-bit
+                 * internal count, and LOAD=0 expires after one tick. */
+                cmsdk_dualtimermod_set_raw_count(m, value + 1);
+                if (m->control & R_CONTROL_ENABLE_MASK) {
+                    ptimer_run(m->timer, 1);
+                }
+            } else if (!(m->control & R_CONTROL_MODE_MASK)) {
                 /*
                  * In free-running mode this won't set the limit but will
                  * still change the current count value.
@@ -416,6 +536,7 @@ static void cmsdk_dualtimermod_tick(void *opaque)
 {
     CMSDKAPBDualTimerModule *m = opaque;
 
+    m->parent->bes_count_valid[m - m->parent->timermod] = false;
     m->intstatus = 1;
     cmsdk_apb_dualtimer_update(m->parent);
 }
@@ -426,6 +547,7 @@ static void cmsdk_dualtimermod_reset(CMSDKAPBDualTimerModule *m)
     m->intstatus = 0;
     m->load = 0;
     m->value = 0xffffffff;
+    m->parent->bes_count_valid[m - m->parent->timermod] = false;
     ptimer_transaction_begin(m->timer);
     ptimer_stop(m->timer);
     /*
@@ -461,8 +583,7 @@ static void cmsdk_apb_dualtimer_clk_update(void *opaque, ClockEvent event)
     for (i = 0; i < ARRAY_SIZE(s->timermod); i++) {
         CMSDKAPBDualTimerModule *m = &s->timermod[i];
         ptimer_transaction_begin(m->timer);
-        ptimer_set_period_from_clock(m->timer, m->parent->timclk,
-                                     cmsdk_dualtimermod_divisor(m));
+        cmsdk_dualtimermod_set_period(m, cmsdk_dualtimermod_divisor(m));
         ptimer_transaction_commit(m->timer);
     }
 }
@@ -486,6 +607,20 @@ static void cmsdk_apb_dualtimer_init(Object *obj)
                                    ClockUpdate);
 }
 
+static uint8_t cmsdk_dualtimermod_policy(CMSDKAPBDualTimerModule *m)
+{
+    unsigned index = m - m->parent->timermod;
+    uint8_t policy = PTIMER_POLICY_WRAP_AFTER_ONE_PERIOD |
+                     PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT |
+                     PTIMER_POLICY_NO_IMMEDIATE_RELOAD |
+                     PTIMER_POLICY_NO_COUNTER_ROUND_DOWN;
+
+    if (m->parent->bes_oneshot_underflow_mask & (1u << index)) {
+        policy |= PTIMER_POLICY_ONESHOT_ROUND_UP;
+    }
+    return policy;
+}
+
 static void cmsdk_apb_dualtimer_realize(DeviceState *dev, Error **errp)
 {
     CMSDKAPBDualTimer *s = CMSDK_APB_DUALTIMER(dev);
@@ -495,16 +630,17 @@ static void cmsdk_apb_dualtimer_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "CMSDK APB dualtimer: TIMCLK clock must be connected");
         return;
     }
+    if (s->bes_oneshot_underflow_mask & ~3u) {
+        error_setg(errp, "CMSDK APB dualtimer: invalid BES channel mask");
+        return;
+    }
 
     for (i = 0; i < ARRAY_SIZE(s->timermod); i++) {
         CMSDKAPBDualTimerModule *m = &s->timermod[i];
 
         m->parent = s;
         m->timer = ptimer_init(cmsdk_dualtimermod_tick, m,
-                               PTIMER_POLICY_WRAP_AFTER_ONE_PERIOD |
-                               PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT |
-                               PTIMER_POLICY_NO_IMMEDIATE_RELOAD |
-                               PTIMER_POLICY_NO_COUNTER_ROUND_DOWN);
+                               cmsdk_dualtimermod_policy(m));
     }
 }
 
@@ -522,10 +658,27 @@ static const VMStateDescription cmsdk_dualtimermod_vmstate = {
     }
 };
 
+static int cmsdk_apb_dualtimer_post_load(void *opaque, int version_id)
+{
+    CMSDKAPBDualTimer *s = opaque;
+
+    /* Old streams contain unbiased ptimer counts.  Never silently interpret
+     * one as the BES remaining-count format.  Version 3 also checks masks. */
+    if (version_id < 3 && s->bes_oneshot_underflow_mask) {
+        return -EINVAL;
+    }
+    if (version_id < 3) {
+        memset(s->bes_count_valid, 0, sizeof(s->bes_count_valid));
+    }
+    cmsdk_apb_dualtimer_update(s);
+    return 0;
+}
+
 static const VMStateDescription cmsdk_apb_dualtimer_vmstate = {
     .name = "cmsdk-apb-dualtimer",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 2,
+    .post_load = cmsdk_apb_dualtimer_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(timclk, CMSDKAPBDualTimer),
         VMSTATE_STRUCT_ARRAY(timermod, CMSDKAPBDualTimer,
@@ -534,8 +687,25 @@ static const VMStateDescription cmsdk_apb_dualtimer_vmstate = {
                              CMSDKAPBDualTimerModule),
         VMSTATE_UINT32(timeritcr, CMSDKAPBDualTimer),
         VMSTATE_UINT32(timeritop, CMSDKAPBDualTimer),
+        VMSTATE_UINT32_EQUAL_V(bes_oneshot_underflow_mask, CMSDKAPBDualTimer,
+                              3, "BES one-shot channel mask differs"),
+        VMSTATE_INT64_ARRAY_V(bes_count_time, CMSDKAPBDualTimer,
+                             CMSDK_APB_DUALTIMER_NUM_MODULES, 3),
+        VMSTATE_UINT64_ARRAY_V(bes_count_value, CMSDKAPBDualTimer,
+                              CMSDK_APB_DUALTIMER_NUM_MODULES, 3),
+        VMSTATE_UINT64_ARRAY_V(bes_count_period_ns, CMSDKAPBDualTimer,
+                              CMSDK_APB_DUALTIMER_NUM_MODULES, 3),
+        VMSTATE_UINT32_ARRAY_V(bes_count_period_frac, CMSDKAPBDualTimer,
+                              CMSDK_APB_DUALTIMER_NUM_MODULES, 3),
+        VMSTATE_BOOL_ARRAY_V(bes_count_valid, CMSDKAPBDualTimer,
+                            CMSDK_APB_DUALTIMER_NUM_MODULES, 3),
         VMSTATE_END_OF_LIST()
     }
+};
+
+static const Property cmsdk_apb_dualtimer_properties[] = {
+    DEFINE_PROP_UINT32("bes-oneshot-underflow-mask", CMSDKAPBDualTimer,
+                       bes_oneshot_underflow_mask, 0),
 };
 
 static void cmsdk_apb_dualtimer_class_init(ObjectClass *klass, const void *data)
@@ -544,6 +714,7 @@ static void cmsdk_apb_dualtimer_class_init(ObjectClass *klass, const void *data)
 
     dc->realize = cmsdk_apb_dualtimer_realize;
     dc->vmsd = &cmsdk_apb_dualtimer_vmstate;
+    device_class_set_props(dc, cmsdk_apb_dualtimer_properties);
     device_class_set_legacy_reset(dc, cmsdk_apb_dualtimer_reset);
 }
 

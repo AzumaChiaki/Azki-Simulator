@@ -26,7 +26,7 @@ struct SimulatorNativeCanvas: NSViewRepresentable {
     }
 }
 
-/// Draws the shared RGB565-decoded frame through AppKit. No browser, subprocess
+/// Draws the shared RGB565/RGB888-decoded frame through AppKit. No browser, subprocess
 /// window, UIKit bridge or executable is part of the rendering surface.
 @MainActor final class SimulatorCanvasNSView: NSView {
     var onInput: ((SimulatorInputEvent) -> Void)?

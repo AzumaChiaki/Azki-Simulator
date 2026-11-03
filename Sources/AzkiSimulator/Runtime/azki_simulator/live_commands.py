@@ -36,7 +36,7 @@ LC_NTC_MV = (
 LC_NTC_PREFIXES = ("miwear.watch.n67", "miwear.watch.p67")
 ADC_SLOPE, ADC_OFFSET = 0.051538, -23.3
 
-SET_KEYS = {"addSteps", "cadence", "heartRate", "worn", "charger", "batteryLevel", "batteryRaw", "temperatureC", "orientation"}
+SET_KEYS = {"addSteps", "cadence", "heartRate", "worn", "charger", "batteryLevel", "batteryRaw", "temperatureC", "orientation", "motionRaw"}
 NOTES = {
     "clock": "运行中修改 RTC 固件不会采用（它只在开机时读取时间），请在固件设置中修改并重启实例。",
     "settings": "系统属性、语言、时区和时间格式只在开机时读取，修改后需重启实例。",
@@ -85,17 +85,19 @@ def _exchange(adapter, request, *, write):
     try:
         result = _decode(payload)
     except (ValueError, TypeError) as error:
-        if write and request["command"] == "motion.orientation.set":
-            raise MError("live_outcome_unknown", "姿态写入回执无效，可能已生效，不要自动重复提交") from error
+        if write:
+            raise MError("live_outcome_unknown", "实时输入回执无效，可能已生效，不要自动重复提交") from error
         raise
     if type(result) is not dict or set(result) not in ({"return"}, {"error"}):
-        if write and request["command"] == "motion.orientation.set":
-            raise MError("live_outcome_unknown", "姿态写入回执无效，可能已生效，不要自动重复提交")
+        if write:
+            raise MError("live_outcome_unknown", "实时输入回执无效，可能已生效，不要自动重复提交")
         raise MError("live_protocol", "Runner returned an invalid live response")
     if "error" in result:
-        message = str(result["error"])[:300]
-        if message.startswith("orientation_outcome_unknown:"):
-            raise MError("live_outcome_unknown", "姿态输入可能已生效但未确认，不要自动重复提交")
+        if type(result["error"]) is not str:
+            raise MError("live_outcome_unknown" if write else "live_protocol", "Runner returned an invalid error acknowledgement")
+        message = result["error"][:300]
+        if message.startswith(("orientation_outcome_unknown:", "input_outcome_unknown:")):
+            raise MError("live_outcome_unknown", "实时输入可能已生效但未确认，不要自动重复提交")
         if message.startswith("unsupported_hardware_input"):
             raise MError("unsupported_hardware", "此会话没有接入该硬件输入")
         raise MError("invalid_live", message)
@@ -104,13 +106,29 @@ def _exchange(adapter, request, *, write):
 
 def _report(adapter, snapshot):
     required = {"health", "charger", "adc", "batteryChannel", "ntcChannels"}
-    if type(snapshot) is not dict or not required <= set(snapshot) <= required | {"orientation"}:
+    if type(snapshot) is not dict or not required <= set(snapshot) <= required | {"orientation", "motionRaw", "sensorObservation"}:
         raise MError("live_protocol", "Runner live snapshot has an invalid schema")
     model = _model(adapter)
     sensors = health_sensors(model) or {}
     battery = battery_inputs(model) or {}
     health, adc = snapshot["health"], snapshot["adc"]
     channel, ntc = snapshot["batteryChannel"], snapshot["ntcChannels"]
+    if health is not None:
+        bounds = {"walkSteps": (0, 10000000), "walked": (0, 10000000),
+                  "cadence": (40, 200), "heartRate": (0, 255)}
+        if (type(health) is not dict or set(health) != set(bounds) | {"worn"} or
+                type(health["worn"]) is not bool or any(
+                    type(health[k]) is not int or not low <= health[k] <= high for k, (low, high) in bounds.items())):
+            raise MError("live_protocol", "Runner returned invalid health state")
+    if adc is not None and (type(adc) is not list or len(adc) != 8 or any(
+            type(v) is not int or not 0 <= v <= 65535 for v in adc)):
+        raise MError("live_protocol", "Runner ADC snapshot must contain eight raw words")
+    if channel is not None and (type(channel) is not int or not 0 <= channel < 8):
+        raise MError("live_protocol", "Runner battery channel is invalid")
+    if type(ntc) is not int or not 0 <= ntc <= 255:
+        raise MError("live_protocol", "Runner thermistor channel mask is invalid")
+    if snapshot["charger"] is not None and snapshot["charger"] not in ("unplugged", "charging", "full"):
+        raise MError("live_protocol", "Runner charger state is invalid")
     battery_raw = adc[channel] if type(adc) is list and type(channel) is int else None
     ntc_list = [index for index in range(8) if type(ntc) is int and ntc >> index & 1]
     lc_ntc = type(model) is str and model.startswith(LC_NTC_PREFIXES) and type(adc) is list and bool(ntc_list)
@@ -125,6 +143,15 @@ def _report(adapter, snapshot):
                 raise MError("live_protocol", "Auto orientation must not claim a held pose")
         else:
             validate_orientation(angles)
+    motion_raw = snapshot.get("motionRaw")
+    if motion_raw is not None:
+        try:
+            validate_motion_raw(motion_raw)
+        except MError as error:
+            raise MError("live_protocol", "Runner returned invalid motion raw state") from error
+    observation = snapshot.get("sensorObservation")
+    if observation is not None:
+        validate_sensor_observation(observation)
     supported = {
         "steps": bool(health is not None and sensors.get("steps")),
         "heartRate": bool(health is not None and sensors.get("heartRate")),
@@ -134,6 +161,7 @@ def _report(adapter, snapshot):
         "temperature": lc_ntc,
         "clock": False,
         "orientation": bool(orientation is not None and sensors.get("motion")),
+        "motionRaw": bool(motion_raw is not None and sensors.get("motion")),
     }
     notes = dict(NOTES)
     if not supported["temperature"]:
@@ -153,8 +181,31 @@ def _report(adapter, snapshot):
         "clock": None,
         "orientation": ({k: orientation[k] for k in ("rollDegrees", "pitchDegrees")}
                         if supported["orientation"] and orientation["mode"] == "held" else None),
+        "motionRaw": motion_raw if supported["motionRaw"] else None,
     }
-    return {"supported": supported, "notes": notes, "state": state}
+    result = {"supported": supported, "notes": notes, "state": state}
+    if observation is not None:
+        result["sensorObservation"] = observation
+    return result
+
+
+def validate_sensor_observation(state):
+    if (type(state) is not dict or set(state) != {
+            "schema", "scope", "guestObserved", "inputVersion", "mode", "imu", "accel", "gyro"} or
+            type(state["schema"]) is not int or state["schema"] != 1 or state["scope"] != "sensor-bus" or
+            state["guestObserved"] is not False or type(state["inputVersion"]) is not int or
+            not 0 <= state["inputVersion"] <= 2**64 - 1 or state["mode"] not in ("raw", "auto") or
+            state["imu"] not in ("lsm6dso", "icm42607", "none")):
+        raise MError("live_protocol", "Runner sensor observation schema is invalid")
+    for kind in ("accel", "gyro"):
+        sample = state[kind]
+        if (type(sample) is not dict or set(sample) != {"sampleValid", "generatedVersion", "registerReads",
+                "registerVersion", "fifoReads", "fifoVersion"} or type(sample["sampleValid"]) is not bool):
+            raise MError("live_protocol", "Runner sensor observation sample is invalid")
+        for key in ("generatedVersion", "registerReads", "registerVersion", "fifoReads", "fifoVersion"):
+            maximum = 2**64 - 1 if key.endswith("Reads") else state["inputVersion"]
+            if type(sample[key]) is not int or not 0 <= sample[key] <= maximum:
+                raise MError("live_protocol", "Runner sensor observation counter is invalid")
 
 
 def validate_orientation(value):
@@ -163,6 +214,36 @@ def validate_orientation(value):
             any(type(v) not in (int, float) or not -180 <= v <= 180 or not math.isfinite(v)
                 for v in value.values())):
         raise MError("invalid_live", "orientation requires finite rollDegrees and pitchDegrees within -180…180, or null")
+
+
+def validate_motion_raw(value):
+    """Explicit auto release, or six signed16 native IMU output counts."""
+    if type(value) is dict and value == {"mode": "auto"}:
+        return
+    if (type(value) is not dict or set(value) != {"mode", "accel", "gyro"} or value["mode"] != "raw" or
+            any(type(value[k]) is not list or len(value[k]) != 3 or any(
+                type(v) is not int or not -32768 <= v <= 32767 for v in value[k]) for k in ("accel", "gyro"))):
+        raise MError("invalid_live", "motionRaw requires mode auto, or mode raw with three signed16 accel and gyro counts")
+
+
+def _live_receipt(adapter, result, *, motion_raw=False):
+    """Preserve QOM acknowledgement even when its subsequent state is unusable."""
+    invalid = MError("live_outcome_unknown", "实时输入回执无效，可能已生效，不要自动重复提交")
+    if type(result) is not dict or result.get("accepted") is not True or result.get("guestObserved") is not False:
+        raise invalid
+    if set(result) == {"accepted", "guestObserved", "stateUnavailable"} and result["stateUnavailable"] is True:
+        return result
+    if set(result) != {"accepted", "guestObserved", "state"}:
+        raise invalid
+    try:
+        if motion_raw:
+            validate_motion_raw(result["state"])
+            state = result["state"]
+        else:
+            state = _report(adapter, result["state"])
+    except (MError, ValueError, KeyError, TypeError):
+        return {"accepted": True, "guestObserved": False, "stateUnavailable": True}
+    return {"accepted": True, "guestObserved": False, "state": state}
 
 
 def _orientation_receipt(result):
@@ -203,18 +284,22 @@ def live_set(adapter, arguments):
     (key, value), = arguments.items()
     if key == "orientation":
         validate_orientation(value)
+    if key == "motionRaw":
+        validate_motion_raw(value)
     report = live_get(adapter, {})
     supported = report["supported"]
     need = {"addSteps": "steps", "cadence": "steps", "heartRate": "heartRate", "worn": "heartRate",
             "charger": "charger",
             "batteryLevel": "batteryLevel", "batteryRaw": "batteryRaw", "temperatureC": "temperature",
-            "orientation": "orientation"}[key]
+            "orientation": "orientation", "motionRaw": "motionRaw"}[key]
     if not supported[need]:
         raise MError("unsupported_hardware", "此会话不支持实时修改该项")
     if key in ("addSteps", "cadence", "heartRate", "batteryLevel", "batteryRaw") and type(value) is not int:
         raise MError("invalid_live", key + " must be an integer")
     if key == "orientation":
         request = {"command": "motion.orientation.set", "value": value}
+    elif key == "motionRaw":
+        request = {"command": "motion.raw.set", "value": value}
     elif key == "addSteps":
         if not 1 <= value <= 100000:
             raise MError("invalid_live", "addSteps must be within 1…100000")
@@ -237,6 +322,7 @@ def live_set(adapter, arguments):
         request = {"command": "charger.set", "value": value}
     else:
         snapshot = _exchange(adapter, {"command": "live.get"}, write=False)
+        _report(adapter, snapshot)
         if key == "batteryLevel":
             if not 0 <= value <= 100:
                 raise MError("invalid_live", "batteryLevel must be within 0…100")
@@ -258,6 +344,4 @@ def live_set(adapter, arguments):
         # an acknowledged write without state). A second live-get could fail
         # after success and falsely make the caller believe the write failed.
         return _orientation_receipt(result)
-    if request["command"] in ("charger.set", "pmu.adcChannels.set"):
-        return _report(adapter, result)
-    return live_get(adapter, {})
+    return _live_receipt(adapter, result, motion_raw=key == "motionRaw")

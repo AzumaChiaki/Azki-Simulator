@@ -508,6 +508,14 @@ final class StandaloneRuntimeModel {
     /// Once per app launch: remove session roots an earlier run left behind.
     /// An engine without the action keeps working; failures are only logged.
     func cleanupStaleSessions() async {
+        // This action scans global temporary sessions, outside the selected
+        // library. An explicitly isolated development launch must leave other
+        // tasks' sessions alone. Automatic storage maintenance has the same
+        // global cleaner and is independently skipped below.
+        if SimulatorDataLocations.isolatedDevelopment {
+            NSLog("[AzkiReset] sessions-cleanup skipped: validated isolated development data root; global temporary sessions preserved")
+            return
+        }
         struct Receipt: Decodable { let removed: [String]?; let kept: [String]? }
         do {
             let receipt = try JSONDecoder().decode(Receipt.self, from: await firmwareService.run(["sessions-cleanup"]))
@@ -521,6 +529,12 @@ final class StandaloneRuntimeModel {
     /// template, then remove stopped sessions. It never prunes a committed
     /// snapshot; that remains an explicit user action in Storage settings.
     func autoStorageMaintenance() async {
+        // --auto also invokes the global temporary-session cleaner. It is not
+        // limited to this library, even when the library contains no instances.
+        if SimulatorDataLocations.isolatedDevelopment {
+            NSLog("[AzkiStorage] auto skipped: validated isolated development data root; global temporary sessions preserved")
+            return
+        }
         struct Receipt: Decodable {
             struct Issue: Decodable { let error: String? }
             let freedBytes: Int64?

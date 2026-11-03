@@ -49,12 +49,11 @@ def _descriptor(identity, ap, model, _historical_reason):
         'family': family, 'unsupportedReason': None,
         'protocol': 'miwear-psk1-q66' if family in ('q65', 'q66') else 'miwear-psk1-literal16',
         'verifyMode': 1, 'requiresSMPBond': True,
-        'factoryFormat': 'legacy-fixed-8k' if legacy else 'n67-config-journal' if family == 'n67' else 'littlefs-8192x16',
-        # P65 carries the same 128 KiB littlefs factory partition as Q65/Q66
-        # (p65-oobe evidence: the guest does not mount it as /misc but boots
-        # fine with a valid image present; the reference runner always wrote one).
-        'factoryPropertyFile': 'app_nv.prop' if family == 'p67' else 'factory.prop' if family in ('p65', 'q65', 'q66') else None,
-        'factoryBytes': 8192 if legacy or family == 'n67' else 128 * 1024,
+        'factoryFormat': 'p65-raw-unverified' if family == 'p65' else 'legacy-fixed-8k' if legacy else 'n67-config-journal' if family == 'n67' else 'littlefs-8192x16',
+        # P65's 256 KiB factory_data has a confirmed NOR extent, but its
+        # payload format has no evidence of Q65/Q66 LittleFS compatibility.
+        'factoryPropertyFile': 'app_nv.prop' if family == 'p67' else 'factory.prop' if family in ('q65', 'q66') else None,
+        'factoryBytes': 256 * 1024 if family == 'p65' else 8192 if legacy or family == 'n67' else 128 * 1024,
         'configBytes': 16384 if family == 'n67' else 0,
         'pskEncoding': 'ascii-hex32' if family in ('q65', 'q66') else 'hex-of-ascii16',
         'pskProperty': 'ro.factory.psk' if family in ('q65', 'q66') else 'ro.factory.key' if family in ('n67', 'p67') else 'factory.param.key',
@@ -291,6 +290,8 @@ def factory_image(state, *, skip_oobe=True):
     N67 identity is in config_image, not its separate tail factory partition.
     """
     descriptor = _fresh(state)
+    if descriptor['family'] == 'p65':
+        raise ValueError('P65 factory seed format is unverified; no synthetic payload may be written')
     identity = state['identity']
     if descriptor['factoryFormat'] == 'n67-config-journal':
         return b'\xff' * descriptor['factoryBytes']

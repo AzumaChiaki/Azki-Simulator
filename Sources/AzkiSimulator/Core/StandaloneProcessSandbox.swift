@@ -268,8 +268,24 @@ nonisolated enum StandaloneProcessSandbox {
         return rules.prefix(2).joined(separator: "\n") + "\n" + rules.dropFirst(2).sorted().joined(separator: "\n") + "\n"
     }
 
+    static func requireNoIsolatedPendingSession(_ instance: URL) throws {
+        let storage = instance.appendingPathComponent("storage", isDirectory: true)
+        let fd = Darwin.open(storage.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC)
+        if fd < 0, errno == ENOENT { return }
+        guard fd >= 0 else { throw SimulatorError.unsafeFile("无法安全检查隔离实例的待处理会话") }
+        defer { Darwin.close(fd) }
+        var info = stat()
+        let status = fstatat(fd, "pending.json", &info, AT_SYMLINK_NOFOLLOW)
+        if status != 0, errno == ENOENT { return }
+        // The Python recovery path can roll back a pending transaction after a
+        // denied session read. Stop before it runs; do not treat denial as proof
+        // that a historical session is stopped or belongs to this task.
+        throw SimulatorError.unsafeFile("隔离开发实例存在待处理会话；已保留原状，不能自动恢复或回滚")
+    }
+
     static func makeInspection(runtime: StandaloneBundledRuntime, arguments: [String], library: URL,
-                               temporary: URL) throws -> StandaloneSandboxLaunch {
+                               temporary: URL,
+                               isolatedDevelopment: Bool = SimulatorDataLocations.isolatedDevelopment) throws -> StandaloneSandboxLaunch {
         try Task.checkCancellation()
         _ = try StandaloneSandboxFiles.directory(temporary, privateOnly: true)
         try StandaloneSandboxFiles.ensureLibrary(library)
@@ -278,6 +294,9 @@ nonisolated enum StandaloneProcessSandbox {
         var writes = [temporary]
         var extraRules: [String] = []
         guard let command = arguments.first else { throw SimulatorError.transport("缺少静态命令") }
+        if isolatedDevelopment && ["sessions-cleanup", "storage-report", "storage-maintain", "instance-delete"].contains(command) {
+            throw SimulatorError.unsafeFile("隔离开发模式不允许扫描或清理全局临时会话")
+        }
         switch command {
         case "library-catalog":
             guard arguments.count == 1 else { throw SimulatorError.transport("目录命令参数无效") }
@@ -324,9 +343,14 @@ nonisolated enum StandaloneProcessSandbox {
                       id.uuidString.lowercased() == arguments[6] else { throw SimulatorError.transport("实例身份无效") }
                 let instance = library.appendingPathComponent("instances/" + arguments[6], isDirectory: true)
                 try StandaloneSandboxFiles.ensureLibrary(instance)
+                if isolatedDevelopment { try requireNoIsolatedPendingSession(instance) }
                 writes.append(instance)
+                // Instance preparation probes clonefile support and creates
+                // shared erased disk templates here. Grant the same bounded
+                // cache subtree used by storage-maintain, not library writes.
+                writes.append(library.appendingPathComponent(".storage", isDirectory: true))
                 // Settles an interrupted earlier run of this instance itself.
-                extraRules = preparedSessionRules
+                if !isolatedDevelopment { extraRules = preparedSessionRules }
             }
             if arguments.count == 11 {
                 guard arguments[7] == "--virtual-serial", arguments[9] == "--virtual-address" else {
@@ -384,9 +408,10 @@ nonisolated enum StandaloneProcessSandbox {
             }
             let instance = library.appendingPathComponent("instances/" + arguments[2], isDirectory: true)
             try StandaloneSandboxFiles.ensureLibrary(instance)
+            if isolatedDevelopment { try requireNoIsolatedPendingSession(instance) }
             writes.append(instance)
             // A stopped run's session can then be committed instead of rolled back.
-            extraRules = preparedSessionRules
+            if !isolatedDevelopment { extraRules = preparedSessionRules }
         case "sessions-cleanup":
             // Removes stale session roots this app created in /private/tmp. SBPL
             // `subpath` cannot express a name prefix, so the grant is a fixed regex

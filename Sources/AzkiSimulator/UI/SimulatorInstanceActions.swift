@@ -156,13 +156,13 @@ import SwiftUI
                     Button("表冠", systemImage: "button.programmable") {
                         instance.runtime.runtimeSession.sendDeviceButton("crown")
                     }
-                    .help("按下表冠（旋转表盘/打开应用抽屉）")
+                    .help("短按表冠")
                     .disabled(!SimulatorInstanceActions.watchButtonsAvailable(instance))
                     .accessibilityIdentifier("simulator.watch.crown")
                     Button("下键", systemImage: "hand.tap") {
                         instance.runtime.runtimeSession.sendDeviceButton("lower")
                     }
-                    .help("按下下键（返回/息屏）")
+                    .help("短按下键（功能由手表设置决定）")
                     .disabled(!SimulatorInstanceActions.watchButtonsAvailable(instance))
                     .accessibilityIdentifier("simulator.watch.lower.single")
                 }

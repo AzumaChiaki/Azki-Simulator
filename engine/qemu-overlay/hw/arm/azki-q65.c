@@ -33,6 +33,10 @@
 #include "ui/input.h"
 #include "chardev/char-fe.h"
 #include "azki-q65-gpu.h"
+#include "azki-q65-display.h"
+#include "best1503-adc.h"
+#include "azki-q65-imu.h"
+#include "qemu/thread.h"
 #include "bes-nand-store.h"
 #include "bes-nor-store.h"
 
@@ -57,11 +61,9 @@ typedef struct {
     QEMUTimer *frame_timer;
     qemu_irq irq;
     QemuConsole *console;
-    uint8_t pixels[LCD_WIDTH * LCD_HEIGHT * 2];
-    /* Host display cache.  The shared file remains RGB565 for the control
-     * viewer, while Cocoa consumes this converted surface.  Keeping the
-     * conversion here avoids repeating 222k RGB565 conversions whenever
-     * QEMU invalidates or repaints the console. */
+    uint8_t pixels[LCD_WIDTH * LCD_HEIGHT * 3];
+    /* Both shared frames and the Cocoa cache retain the panel's RGB888
+     * precision. Expand only when the guest actually submits RGB565. */
     uint32_t *argb_pixels;
     unsigned argb_width, argb_height;
     uint32_t argb_frame_count;
@@ -148,6 +150,13 @@ typedef struct {
 
 typedef struct {
     MemoryRegion mmio;
+    ptimer_state *timer;
+    uint32_t control, intstatus, resetstatus, lock, itcr, itop;
+    bool irq_output, reset_output;
+} BesSensorWatchdog;
+
+typedef struct {
+    MemoryRegion mmio;
     uint32_t regs[0x200 / 4];
     bool aon;
     hwaddr base;
@@ -204,6 +213,10 @@ typedef struct {
     uint8_t page[4];
     uint32_t rx[8];
     unsigned head, count;
+    int8_t adc_channel[8];
+    uint64_t adc_version[8];
+    uint64_t adc_sample_version[BES_ADC_CHANNELS];
+    bool adc_sample_valid[BES_ADC_CHANNELS];
     unsigned logged_reads;
     unsigned logged_adc;
     uint16_t adc_pending;
@@ -216,7 +229,10 @@ typedef struct {
     MemoryRegion mmio;
     uint32_t regs[0x8c / 4];
     Best1503State *machine;
+    hwaddr base;
+    bool unconnected_only;
     uint8_t rx[8], packet[517];
+    Q65ImuByte imu_rx[8];
     unsigned rx_head, rx_count, packet_len;
     uint16_t sensor[0x882 / 2], read_address;
     bool sensor_written[0x882 / 2];
@@ -254,7 +270,7 @@ struct Best1503State {
     MemoryRegion sensor_space_flash, sensor_space_flash_nc;
     MemoryRegion sensor_space_flash_exec, sensor_space_flash_nc_exec;
     MemoryRegion sensor_space_ram, sensor_space_cmu;
-    MemoryRegion sensor_ram, sensor_rom;
+    MemoryRegion sensor_ram;
     bool sensor_ready, sensor_held, sensor_needs_reset;
     unsigned sensor_reset_generation;
     MemoryRegion flash, flash_exec, flash_nc, flash_nc_exec;
@@ -267,6 +283,12 @@ struct Best1503State {
     MemoryRegion cache_alias_sram[2];
     MemoryRegion iomux, psc;
     MemoryRegion gpio_summary;
+    MemoryRegion sensor_gpio_summary;
+    qemu_irq sensor_gpio_irq;
+    Q65Imu imu;
+    QemuMutex imu_lock;
+    QEMUTimer *imu_timer;
+    unsigned imu_trace_count;
     MemoryRegion gpu_probe_mmio;
     BesSensorCmu sensor_cmu;
     BesSensorMailbox sensor_mailbox;
@@ -288,6 +310,8 @@ struct Best1503State {
     MemoryRegion uart_ext[6];
     PL080State dma[2];
     BesDma2d dma_2d[2];
+    PL080State sensor_dma;
+    BesDma2d sensor_dma_2d;
     BesNor nor[3];
     MemoryRegion nand_cache, nand_cache_alias[3];
     char *resource_image;
@@ -299,13 +323,16 @@ struct Best1503State {
     Notifier nor_exit;
     BesIspi ispi;
     BesSpiConfig spi0;
+    BesSpiConfig sensor_spi[2];
     BesPsram psram_ctrl;
     Clock *cpuclk;
     Clock *slowclk, *fastclk;
     CMSDKAPBDualTimer timer[4];
     CMSDKAPBDualTimer sensor_timer[2];
     CMSDKAPBWatchdog watchdog[2];
+    BesSensorWatchdog sensor_watchdog;
     BesI2c i2c[6];
+    BesI2c sensor_i2c[4];
     BesTouch touch;
     BesCrown crown;
     BesBtConfig bt_config[5];
@@ -323,6 +350,8 @@ struct Best1503State {
     bool gh3x2x_fixture;
     bool spi0_unconnected;
     bool power_adc_fixture;
+    QemuMutex adc_lock;
+    BesAdcInput adc_input;
     bool gh_reg0724_set;
     uint32_t gh_reg0724;
     bool bt_peer;
@@ -369,6 +398,12 @@ static void bt_peer_wake(void *opaque)
     if (bt_peer_powered(s) && (cmu->regs[0xa0 / 4] & 8)) {
         cmu->regs[0xa0 / 4] &= ~8u;
         cmu->regs[0xa4 / 4] = cmu->regs[0xa0 / 4];
+        if (g_getenv("BES_BT_TRACE_WAKE")) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "BES BT wake trace ack time=%" PRId64 " value=%08x\n",
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                          cmu->regs[0xa0 / 4]);
+        }
         qemu_log_mask(LOG_GUEST_ERROR,
                       "BES experimental BT peer acknowledged wake (no ROM/HCI)\n");
     } else {
@@ -379,6 +414,35 @@ static void bt_peer_wake(void *opaque)
                       s->cmu[1].regs[0xcc / 4],
                       s->bt_config[1].regs[0xa0 / 4],
                       cmu->regs[0xa0 / 4]);
+    }
+}
+
+/* MTTCG can let the AP poll this register past the peer timer's deadline
+ * before the host main loop dispatches its callback. Complete an already
+ * due device event at the observation point; retain the modeled 100 us
+ * delay and the same power/request checks. This does not acknowledge early
+ * or force the firmware's timeout branch to succeed. */
+static void bt_peer_complete_due_wake(Best1503State *s)
+{
+    if (timer_pending(s->bt_wake_timer) &&
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >=
+            timer_expire_time_ns(s->bt_wake_timer)) {
+        timer_del(s->bt_wake_timer);
+        bt_peer_wake(s);
+    }
+}
+
+static void bt_peer_request_changed(Best1503State *s, bool set)
+{
+    if (!set) {
+        /* CLR cancels this request. A later SET gets its own full delay. */
+        timer_del(s->bt_wake_timer);
+        return;
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "BES MCU-to-BT wake request pending\n");
+    if (s->bt_peer && !timer_pending(s->bt_wake_timer)) {
+        timer_mod(s->bt_wake_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
     }
 }
 
@@ -886,6 +950,9 @@ static MemTxResult cmu_read(void *opaque, hwaddr offset, uint64_t *value,
         }
         return MEMTX_OK;
     }
+    if (!cmu->aon && (reg == 0xa0 || reg == 0xa4)) {
+        bt_peer_complete_due_wake(cmu->machine);
+    }
     uint32_t result = !cmu->aon && (reg == 0x128 || reg == 0x12c) ?
         sensor_mailbox_read(cmu->machine, 0) : cmu->regs[reg / 4];
     if (!cmu->aon && (reg == 0xa0 || reg == 0xa4) &&
@@ -904,6 +971,14 @@ static MemTxResult cmu_read(void *opaque, hwaddr offset, uint64_t *value,
     }
     *value = (result >> ((offset & 3) * 8)) &
              (UINT32_MAX >> (32 - size * 8));
+    if (!cmu->aon && (reg == 0xa0 || reg == 0xa4) &&
+        g_getenv("BES_BT_TRACE_WAKE")) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "BES BT wake trace read time=%" PRId64
+                      " offset=%03" HWADDR_PRIx " size=%u value=%08x\n",
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), offset, size,
+                      (uint32_t)*value);
+    }
     return MEMTX_OK;
 }
 
@@ -920,6 +995,9 @@ static MemTxResult cmu_write(void *opaque, hwaddr offset, uint64_t value,
                       cmu->base + offset);
         return MEMTX_ERROR;
     }
+    /* Observe an elapsed event before changing its power, clock or request
+     * prerequisites. Host callback lateness must not reverse that ordering. */
+    bt_peer_complete_due_wake(cmu->machine);
     if (reg >= sem_base && reg < sem_base + 16) {
         if (bits & 1) {
             cmu->regs[reg / 4] = 0;
@@ -945,6 +1023,13 @@ static MemTxResult cmu_write(void *opaque, hwaddr offset, uint64_t value,
             cmu->regs[0xa0 / 4] | writable :
             cmu->regs[0xa0 / 4] & ~writable;
         cmu->regs[0xa4 / 4] = cmu->regs[0xa0 / 4];
+        if (g_getenv("BES_BT_TRACE_WAKE")) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "BES BT wake trace write time=%" PRId64
+                          " offset=%03" HWADDR_PRIx " bits=%08x value=%08x\n",
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), offset,
+                          bits, cmu->regs[0xa0 / 4]);
+        }
         if (reg == 0xa4 && (bits & 1)) {
             cmu->machine->bt_tx_done = false;
         }
@@ -955,14 +1040,8 @@ static MemTxResult cmu_write(void *opaque, hwaddr offset, uint64_t value,
             timer_mod(cmu->machine->bt_tx_timer,
                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
         }
-        if (reg == 0xa0 && (bits & 8)) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "BES MCU-to-BT wake request pending\n");
-            if (cmu->machine->bt_peer &&
-                !timer_pending(cmu->machine->bt_wake_timer)) {
-                timer_mod(cmu->machine->bt_wake_timer,
-                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
-            }
+        if (bits & 8) {
+            bt_peer_request_changed(cmu->machine, reg == 0xa0);
         }
         return MEMTX_OK;
     }
@@ -1047,6 +1126,8 @@ static bool sensor_cmu_reg_supported(hwaddr offset)
     case 0x60: case 0x64: /* SYS_CLK_ENABLE / SYS_CLK_DISABLE */
     case 0x68:            /* sensor boot/clock divider configuration */
     case 0x70:            /* UART_CLK, sensor 0x060770e8/0x0607711c */
+    case 0x74:            /* I2C clock selection: 06073d1a/22 clears bit 1,
+                          * 06073d34/36 sets it; retain full RMW state. */
     case 0x8c:            /* WAKEUP_CLK_CFG, sensor 0x060774c4 */
     case 0x98: case 0x9c: /* SENS2MCU_IRQ_SET / SENS2MCU_IRQ_CLR */
     case 0xa8:            /* SYS_DIV, sensor 0x060773d8 */
@@ -1186,9 +1267,14 @@ static MemTxResult sensor_cmu_write(void *opaque, hwaddr offset,
     } else {
         cmu->regs[offset / 4] = bits;
     }
-    qemu_log_mask(LOG_GUEST_ERROR,
-                  "BES sensor CMU +0x%02" HWADDR_PRIx " write=0x%08x readback=0x%08x\n",
-                  offset, bits, cmu->regs[offset / 4]);
+    /* Successful clock changes are frequent during sensor idle. Keep this
+     * diagnostic opt-in: logging each write as a guest error can produce
+     * millions of lines while the AP display is asleep. */
+    if (g_getenv("BES_SENSOR_TRACE_CMU")) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "BES sensor CMU +0x%02" HWADDR_PRIx " write=0x%08x readback=0x%08x\n",
+                      offset, bits, cmu->regs[offset / 4]);
+    }
     return MEMTX_OK;
 }
 
@@ -1928,24 +2014,42 @@ static bool gh_transfer(BesSpiConfig *spi, uint32_t value)
     return true;
 }
 
+static Q65ImuByte sensor_imu_transfer(BesSpiConfig *spi, uint8_t value);
+static void sensor_imu_observe(BesSpiConfig *spi, Q65ImuByte value);
+
 static bool spi0_unconnected_transfer(BesSpiConfig *spi, uint32_t value)
 {
-    if (!spi->machine->spi0_unconnected || (spi->regs[0] & ~0xc0U) != 0x70100 ||
-        spi->regs[1] != 2 || spi->regs[0x24 / 4] || spi->regs[0x88 / 4] ||
-        value > 255) {
+    if (!(spi->unconnected_only || spi->machine->spi0_unconnected) ||
+        (spi->regs[0] & ~0xc0U) != 0x70100 ||
+        (spi->unconnected_only ?
+         ((spi->regs[1] & ~0x780U) != 2 ||
+          ((spi->regs[1] >> 7) & 15) > 3) : spi->regs[1] != 2) ||
+        spi->regs[0x24 / 4] || spi->regs[0x88 / 4] ||
+        (!spi->unconnected_only && value > 255)) {
         return false;
     }
+    /* The Q65 sensor HAL encodes CS in CR1[10:7] (0606f232..252).
+     * Its polled receive path writes an all-ones word for dummy clocks
+     * (0606f052); the configured eight-bit shift register takes bits[7:0].
+     * The receive extension at +0x88 is not a chip-select register.
+     */
+    value &= 255;
+    Q65ImuByte response = sensor_imu_transfer(spi, value);
     /* An unconnected slave does not abort the host bus transaction.
      * Pull-high MISO is an explicit board-model choice.
      */
     if (spi->rx_count == ARRAY_SIZE(spi->rx)) {
         spi->rx_overrun = true;
     } else {
-        spi->rx[(spi->rx_head + spi->rx_count) % ARRAY_SIZE(spi->rx)] = 0xff;
+        unsigned tail = (spi->rx_head + spi->rx_count) % ARRAY_SIZE(spi->rx);
+        spi->rx[tail] = response.value;
+        spi->imu_rx[tail] = response;
         spi->rx_count++;
     }
     qemu_log_mask(LOG_GUEST_ERROR,
-                  "BES SPI0 unconnected transfer: tx=0x%02x rx=0xff\n", value);
+                  "BES SPI at 0x%08" HWADDR_PRIx
+                  " functional transfer: tx=0x%02x rx=0x%02x\n",
+                  spi->base, value, response.value);
     return true;
 }
 
@@ -1959,10 +2063,21 @@ static MemTxResult spi0_read(void *opaque, hwaddr offset, uint64_t *value,
         *value = 3 | (spi->rx_count ? 4 : 0) | (spi->rx_count == 8 ? 8 : 0);
         return MEMTX_OK;
     case 0x08:
-        if ((spi->machine->gh3x2x_fixture || spi->machine->spi0_unconnected) && spi->rx_count) {
+        if ((spi->unconnected_only || spi->machine->gh3x2x_fixture ||
+             spi->machine->spi0_unconnected) && spi->rx_count) {
             *value = spi->rx[spi->rx_head];
+            sensor_imu_observe(spi, spi->imu_rx[spi->rx_head]);
+            spi->imu_rx[spi->rx_head] = (Q65ImuByte){0};
             spi->rx_head = (spi->rx_head + 1) % 8;
             spi->rx_count--;
+            return MEMTX_OK;
+        }
+        if (spi->unconnected_only) {
+            /* Like QEMU PL022, reading an empty FIFO returns zero without
+             * creating data or changing RNE. Q65's HAL drains two words per
+             * RNE check (0606efc2..efcc), including an odd final byte.
+             */
+            *value = 0;
             return MEMTX_OK;
         }
         return MEMTX_ERROR;
@@ -1985,7 +2100,8 @@ static MemTxResult spi0_write(void *opaque, hwaddr offset, uint64_t value,
     BesSpiConfig *spi = opaque;
     switch (offset) {
     case 0x08:
-        if (spi0_unconnected_transfer(spi, value) || gh_transfer(spi, value)) {
+        if (spi0_unconnected_transfer(spi, value) ||
+            (!spi->unconnected_only && gh_transfer(spi, value))) {
             return MEMTX_OK;
         }
         break;
@@ -1993,8 +2109,10 @@ static MemTxResult spi0_write(void *opaque, hwaddr offset, uint64_t value,
     case 0x28: case 0x2c: case 0x88:
         spi->regs[offset / 4] = value;
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "BES SPI0 configuration: offset=0x%02" HWADDR_PRIx
-                      " value=0x%08" PRIx64 " (register configuration)\n", offset, value);
+                      "BES SPI at 0x%08" HWADDR_PRIx
+                      " configuration: offset=0x%02" HWADDR_PRIx
+                      " value=0x%08" PRIx64 " (register configuration)\n",
+                      spi->base, offset, value);
         return MEMTX_OK;
     case 0x14:
         if (!value) {
@@ -2011,8 +2129,10 @@ static MemTxResult spi0_write(void *opaque, hwaddr offset, uint64_t value,
         return MEMTX_OK;
     }
     qemu_log_mask(LOG_GUEST_ERROR,
-                  "BES SPI0 transfer unavailable: offset=0x%02" HWADDR_PRIx
-                  " value=0x%08" PRIx64 " (no matching slave/IRQ backend)\n", offset, value);
+                  "BES SPI at 0x%08" HWADDR_PRIx
+                  " transfer unavailable: offset=0x%02" HWADDR_PRIx
+                  " value=0x%08" PRIx64 " (no matching slave/IRQ backend)\n",
+                  spi->base, offset, value);
     return MEMTX_ERROR;
 }
 
@@ -2288,21 +2408,20 @@ static void ispi_adc_update(BesIspi *spi)
         return;
     }
     if (r[0x4f] & 0x20) {
-        /* Q65 /dev/batt_voltage opens channel 6 at 0x0cccba0e and
-         * /dev/temp_skin opens channel 3 at 0x0cccbac4. Channels 2 and 5
-         * retain the earlier fixture inputs. These are constant raw test
-         * inputs. The Q65 NTC table at 0x3c17b118 maps 600 mV to 25 C.
-         * The AP's default calibration maps 15968 to 800 mV and 20816
-         * to 1050 mV. Channel 6 uses 15968 for about 4.0 V after the
-         * board's 5.01 battery divider; channel 3 uses 12090 for 600 mV. */
+        /* Preserve Q65's modeled channels and conversion timing. Lock the
+         * complete conversion so one scan cannot mix host input versions.
+         * Values are raw words; guest calibration owns physical units. */
+        qemu_mutex_lock(&spi->machine->adc_lock);
         for (unsigned channel = 0; channel < 7; channel++) {
             if ((r[0x1d] & (1u << channel)) &&
                 ((1u << channel) & 0x6c)) {
-                r[0x56 + channel] = channel == 3 ? 12090 :
-                                   channel == 6 ? 15968 : 21000;
+                r[0x56 + channel] = bes_adc_sample(&spi->machine->adc_input,
+                    channel, &spi->adc_sample_version[channel]);
+                spi->adc_sample_valid[channel] = true;
                 sampled |= 1u << channel;
             }
         }
+        qemu_mutex_unlock(&spi->machine->adc_lock);
     }
     spi->adc_pending |= sampled | (sampled ? 0x100 : 0);
     if ((r[0x4f] & 0x20) && (r[0x18] & 0x1000)) {
@@ -2349,6 +2468,13 @@ static uint64_t ispi_read(void *opaque, hwaddr offset, unsigned size)
             return 0;
         }
         uint32_t value = spi->rx[spi->head];
+        int channel = spi->adc_channel[spi->head];
+        if (channel >= 0 && channel < BES_ADC_CHANNELS) {
+            qemu_mutex_lock(&spi->machine->adc_lock);
+            bes_adc_observe(&spi->machine->adc_input, channel,
+                            spi->adc_version[spi->head]);
+            qemu_mutex_unlock(&spi->machine->adc_lock);
+        }
         spi->head = (spi->head + 1) % 8;
         spi->count--;
         return value;
@@ -2371,6 +2497,8 @@ static void ispi_write(void *opaque, hwaddr offset, uint64_t value,
     unsigned reg = (cmd >> 16) & 255;
     uint16_t *cell = &spi->analog[cs][spi->page[cs]][reg];
     uint32_t response = 0;
+    int adc_channel = -1;
+    uint64_t adc_version = 0;
     bool pmu_adc = cs == 3 && !spi->page[cs];
     ispi_adc_update(spi);
     if (cmd & (1 << 24)) {
@@ -2384,6 +2512,10 @@ static void ispi_write(void *opaque, hwaddr offset, uint64_t value,
             } else if (reg == 0x51) {
                 data = spi->adc_pending & spi->analog[3][0][0x1f] &
                        spi->analog[3][0][0x20];
+            } else if (reg >= 0x56 && reg <= 0x5d &&
+                       spi->adc_sample_valid[reg - 0x56]) {
+                adc_channel = reg - 0x56;
+                adc_version = spi->adc_sample_version[adc_channel];
             }
         }
         if (pmu_adc) {
@@ -2435,7 +2567,10 @@ static void ispi_write(void *opaque, hwaddr offset, uint64_t value,
      * transfers also produce RX data when RXCR.EN is zero (Q66 uses this).
      */
     if (spi->count < 8) {
-        spi->rx[(spi->head + spi->count) % 8] = response;
+        unsigned slot = (spi->head + spi->count) % 8;
+        spi->rx[slot] = response;
+        spi->adc_channel[slot] = adc_channel;
+        spi->adc_version[slot] = adc_version;
         spi->count++;
     }
 }
@@ -3358,6 +3493,121 @@ static void panel_te_update_irq(Best1503State *s)
     qemu_set_irq(s->panel_te_irq, active);
 }
 
+/* Q65 sensor GPIO handler6072950 registers external NVIC31. Its PSC masks
+ * are b0/b4/b8 and summary table26138e14 is bc/c0/c4, separate from AP44.
+ */
+static void sensor_gpio_update_irq(Best1503State *s)
+{
+    if (!s->imu.enabled || !s->sensor_ready) { return; }
+    bool active = false;
+    for (unsigned bank = 0; bank < ARRAY_SIZE(s->gpio); bank++) {
+        BesGpio *g = &s->gpio[bank];
+        uint32_t mask = ldl_le_p((uint8_t *)memory_region_get_ram_ptr(&s->psc) +
+                                 0xb0 + bank * 4);
+        active |= !!(g->pending & g->regs[0x30 / 4] & ~g->regs[0x34 / 4] & mask);
+    }
+    qemu_set_irq(s->sensor_gpio_irq, active);
+}
+
+static void sensor_imu_schedule(Best1503State *s)
+{
+    if (!s->imu.enabled || !s->imu_timer || !s->sensor_ready) { return; }
+    qemu_mutex_lock(&s->imu_lock);
+    q65_imu_advance(&s->imu, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    bool high = q65_imu_irq(&s->imu);
+    int64_t deadline = q65_imu_deadline(&s->imu);
+    qemu_mutex_unlock(&s->imu_lock);
+    BesGpio *g = &s->gpio[2];
+    uint32_t bit = 1u << 7; /* board descriptor2612dce8: GPIO71 INT1 */
+    bool old = !!(g->input & bit);
+    g->input = (g->input & ~bit) | (high ? bit : 0);
+    if (!(g->regs[1] & bit)) {
+        bool edge = !!(g->regs[0x38 / 4] & bit);
+        bool polarity = !!(g->regs[0x3c / 4] & bit);
+        if (polarity == high && (!edge || old != high)) { g->pending |= bit; }
+        if (!edge && polarity != high) { g->pending &= ~bit; }
+    }
+    sensor_gpio_update_irq(s);
+    panel_te_update_irq(s);
+    if (deadline) { timer_mod(s->imu_timer, deadline); }
+    else { timer_del(s->imu_timer); }
+}
+
+static void sensor_imu_tick(void *opaque) { sensor_imu_schedule(opaque); }
+
+static void sensor_imu_pins(Best1503State *s)
+{
+    if (!s->imu.enabled) { return; }
+    uint32_t bit = 1u << 21;
+    bool selected = (s->gpio[0].regs[1] & bit) && !(s->gpio[0].regs[0] & bit);
+    qemu_mutex_lock(&s->imu_lock);
+    q65_imu_select(&s->imu, selected);
+    qemu_mutex_unlock(&s->imu_lock);
+    sensor_imu_schedule(s);
+}
+
+static Q65ImuByte sensor_imu_transfer(BesSpiConfig *spi, uint8_t value)
+{
+    Best1503State *s = spi->machine;
+    Q65ImuByte r = {0xff, 0, 0};
+    if (!s->imu.enabled || spi != &s->sensor_spi[1]) { return r; }
+    qemu_mutex_lock(&s->imu_lock);
+    q65_imu_advance(&s->imu, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    bool data = s->imu.selected && s->imu.command;
+    bool reading = s->imu.reading;
+    unsigned reg = s->imu.address;
+    r = q65_imu_transfer(&s->imu, value);
+    if (data && s->imu_trace_count++ < 160) {
+        qemu_log_mask(LOG_GUEST_ERROR, "BES Q65 LSM6DSO %s reg=0x%02x value=0x%02x\n",
+                      reading ? "read" : "write", reg, reading ? r.value : value);
+    }
+    qemu_mutex_unlock(&s->imu_lock);
+    sensor_imu_schedule(s);
+    return r;
+}
+
+static void sensor_imu_observe(BesSpiConfig *spi, Q65ImuByte value)
+{
+    Best1503State *s = spi->machine;
+    if (!value.observation || spi != &s->sensor_spi[1] || !s->imu.enabled) { return; }
+    qemu_mutex_lock(&s->imu_lock);
+    q65_imu_observe(&s->imu, value);
+    qemu_mutex_unlock(&s->imu_lock);
+}
+
+static MemTxResult sensor_gpio_summary_read(void *opaque, hwaddr offset,
+                                            uint64_t *value, unsigned size, MemTxAttrs attrs)
+{
+    Best1503State *s = opaque;
+    if (offset < 12) {
+        *value = ldl_le_p((uint8_t *)memory_region_get_ram_ptr(&s->psc) + 0xb0 + offset);
+    } else {
+        unsigned bank = (offset - 12) / 4;
+        uint32_t mask = ldl_le_p((uint8_t *)memory_region_get_ram_ptr(&s->psc) + 0xb0 + bank * 4);
+        *value = s->gpio[bank].pending & mask;
+    }
+    return MEMTX_OK;
+}
+
+static MemTxResult sensor_gpio_summary_write(void *opaque, hwaddr offset,
+                                             uint64_t value, unsigned size, MemTxAttrs attrs)
+{
+    Best1503State *s = opaque;
+    if (offset < 12) {
+        stl_le_p((uint8_t *)memory_region_get_ram_ptr(&s->psc) + 0xb0 + offset, value);
+        sensor_gpio_update_irq(s);
+    }
+    return MEMTX_OK;
+}
+
+static const MemoryRegionOps sensor_gpio_summary_ops = {
+    .read_with_attrs = sensor_gpio_summary_read,
+    .write_with_attrs = sensor_gpio_summary_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4, .valid.max_access_size = 4,
+    .valid.unaligned = false,
+};
+
 /* Q66 hal_gpio_get_irq_status copies three PSC GPIO summary words into
  * its ISR before GPIO EOI. Original 0c92e96c/e9b8 enable/disable these
  * masks, and the pointer table at2cc20fdc identifies the status words.
@@ -3370,6 +3620,11 @@ static MemTxResult gpio_summary_read(void *opaque, hwaddr offset, uint64_t *valu
         *value = ldl_le_p((uint8_t *)memory_region_get_ram_ptr(&s->psc) + 0x80 + offset);
     } else {
         *value = s->gpio[(offset - 12) / 4].pending;
+        if (s->imu.enabled) {
+            /* Each PSC destination sees only its own forwarded GPIOs. */
+            *value &= ldl_le_p((uint8_t *)memory_region_get_ram_ptr(&s->psc) +
+                                0x80 + offset - 12);
+        }
     }
     return MEMTX_OK;
 }
@@ -3558,6 +3813,7 @@ static MemTxResult gpio_write(void *opaque, hwaddr offset, uint64_t value,
                   g->base + offset, (uint32_t)value,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     gh_pins_update(g->machine);
+    sensor_imu_pins(g->machine);
     if (g->machine->touch.enabled) {
         if (!touch_powered(g->machine)) { touch_reset(g->machine); }
         else { touch_irq(g->machine); }
@@ -3579,7 +3835,7 @@ static const MemoryRegionOps gpio_ops = {
 
 /* Original Q66 configuration and optional bounded command-engine fixture.
  * The fixture supplies the original RM690C0_XINLI ID tuple and records writes;
- * Separate optional frame capture supports a bounded RGB565 GRA layer.
+ * Separate optional frame capture supports bounded RGB565/BGR888 GRA layers.
  * Vendor register effects and other layers are not modeled. The separate
  * TE fixture tracks only the original TE/awake/display-on command sequence.
  * REG_2A8 is a Q66 configuration word absent from the downloaded SDK header;
@@ -3627,12 +3883,12 @@ static void lcdc_update_irq(BesLcdc *l)
 
 /* Completed LCD snapshots for local viewers, independent of QEMU's optional
  * pixman/screendump support. The little-endian 32-byte header is followed by
- * packed RGB565LE pixels: R[15:11], G[10:5], B[4:0]. This matches the
- * two-byte /dev/fb0 screenshot path in smash.lua.
+ * packed RGB888 pixels, in R,G,B order (format 2). Q65's guest framebuffer
+ * is 24-bit; converting to RGB565 here caused visible gradient contouring.
  * Readers retry if the sequence is odd or changes. */
 #define LCD_SHARED_HEADER 32
-#define LCD_SHARED_SIZE (LCD_SHARED_HEADER + LCD_WIDTH * LCD_HEIGHT * 2)
-#define LCD_SHARED_RGB565LE 1
+#define LCD_SHARED_SIZE (LCD_SHARED_HEADER + LCD_WIDTH * LCD_HEIGHT * 3)
+#define LCD_SHARED_RGB888 2
 
 static void lcdc_shared_init(BesLcdc *l)
 {
@@ -3659,7 +3915,7 @@ static void lcdc_shared_init(BesLcdc *l)
     memset(l->shared_frame, 0, LCD_SHARED_SIZE);
     memcpy(l->shared_frame, "Q66FRAME", 8);
     stl_le_p(l->shared_frame + 8, 1);
-    stl_le_p(l->shared_frame + 28, LCD_SHARED_RGB565LE);
+    stl_le_p(l->shared_frame + 28, LCD_SHARED_RGB888);
 #else
     error_report("lcd-frame-file requires a POSIX host");
     exit(1);
@@ -3679,9 +3935,9 @@ static void lcdc_shared_publish(BesLcdc *l)
     smp_wmb();
     stl_le_p(frame + 16, l->frame_width);
     stl_le_p(frame + 20, l->frame_height);
-    stl_le_p(frame + 24, l->frame_width * 2);
+    stl_le_p(frame + 24, l->frame_width * 3);
     memcpy(frame + LCD_SHARED_HEADER, l->pixels,
-           l->frame_width * l->frame_height * 2);
+           l->frame_width * l->frame_height * 3);
     smp_wmb();
     qatomic_set(sequence, cpu_to_le32(next));
     l->shared_sequence = next;
@@ -3715,14 +3971,11 @@ static void lcdc_draw(void *opaque)
         for (unsigned y = 0; y < l->frame_height; y++) {
             uint32_t *dest = l->argb_pixels + y * l->frame_width;
             for (unsigned x = 0; x < l->frame_width; x++) {
-            unsigned off = (y * l->frame_width + x) * 2;
-            unsigned p = l->pixels[off] | l->pixels[off + 1] << 8;
-            /* Match smash.lua's RGB565 screenshot conversion exactly:
-             * left-align each field, with no channel swap or low-bit fill. */
-            unsigned r = ((p >> 11) & 31) << 3;
-            unsigned g = ((p >> 5) & 63) << 2;
-            unsigned b = (p & 31) << 3;
-            dest[x] = (r << 16) | (g << 8) | b;
+                unsigned off = (y * l->frame_width + x) * 3;
+                unsigned r = l->pixels[off];
+                unsigned g = l->pixels[off + 1];
+                unsigned b = l->pixels[off + 2];
+                dest[x] = (r << 16) | (g << 8) | b;
             }
         }
         l->argb_frame_count = l->frame_count;
@@ -3798,7 +4051,7 @@ static void lcdc_frame_complete(void *opaque)
     lcdc_draw(l);
     qemu_log_mask(LOG_GUEST_ERROR,
                   "BES experimental LCD frame captured: index=%u address=0x%08x "
-                  "width=%u height=%u pitch=%u (RGB565 snapshot)\n",
+                  "width=%u height=%u pitch=%u (RGB888 snapshot)\n",
                   l->frame_count, l->frame_address, l->frame_width,
                   l->frame_height, l->frame_pitch);
     /* Original handler checks TXC bit21 and GRA frame bit27. Only set after
@@ -3842,22 +4095,7 @@ static MemTxResult lcdc_frame_start(BesLcdc *l, uint32_t value)
     for (unsigned row = 0; row < height; row++) {
         uint8_t source[LCD_WIDTH * 3];
         cpu_physical_memory_read(address + row * pitch, source, width * bytes);
-        for (unsigned col = 0; col < width; col++) {
-            const uint8_t *p = source + col * bytes;
-            unsigned r, g, b;
-            if (bytes == 2) {
-                uint16_t pixel = lduw_le_p(p);
-                r = (pixel >> 11) << 3;
-                g = ((pixel >> 5) & 63) << 2;
-                b = (pixel & 31) << 3;
-            } else {
-                /* LCDC format 2 is packed BGR888. GRA_SWAPRB is bit4;
-                 * the Q65 AP enables it for its RGB888 framebuffer. */
-                r = p[2]; g = p[1]; b = p[0];
-            }
-            stw_le_p(l->pixels + (row * width + col) * 2,
-                     ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
-        }
+        q65_lcd_unpack_rgb(source, l->pixels + row * width * 3, width, bytes);
     }
     l->frame_address = address;
     l->frame_pitch = pitch;
@@ -4418,10 +4656,133 @@ static void dsi_reset(BesDsi *d)
     d->tx_overflow = false;
 }
 
+/* CMSDK's counter/lock/interrupt semantics, with sensor-domain outputs
+ * kept separate. QEMU's generic watchdog calls watchdog_perform_action()
+ * for reset, which would incorrectly reset the AP as well. Routing these
+ * two outputs needs further board evidence; latch and log them explicitly. */
+static void sensor_watchdog_outputs(BesSensorWatchdog *w)
+{
+    bool irq = w->itcr ? (w->itop & 2) :
+               (w->intstatus && (w->control & 1));
+    bool reset = w->itcr ? (w->itop & 1) :
+                 (w->resetstatus && (w->control & 2));
+    if (irq && !w->irq_output) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "BES sensor watchdog IRQ asserted; route unconnected\n");
+    }
+    if (reset && !w->reset_output) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "BES sensor watchdog reset asserted; domain route unconnected\n");
+    }
+    w->irq_output = irq;
+    w->reset_output = reset;
+}
+
+static void sensor_watchdog_tick(void *opaque)
+{
+    BesSensorWatchdog *w = opaque;
+    if (!w->intstatus) {
+        w->intstatus = 1;
+    } else {
+        w->resetstatus = 1;
+        ptimer_stop(w->timer);
+    }
+    sensor_watchdog_outputs(w);
+}
+
+static void sensor_watchdog_reset(BesSensorWatchdog *w)
+{
+    if (!w->timer) {
+        return;
+    }
+    w->control = w->intstatus = w->resetstatus = 0;
+    w->lock = w->itcr = w->itop = 0;
+    w->irq_output = w->reset_output = false;
+    ptimer_transaction_begin(w->timer);
+    ptimer_stop(w->timer);
+    ptimer_set_limit(w->timer, UINT32_MAX, 1);
+    ptimer_transaction_commit(w->timer);
+}
+
+static MemTxResult sensor_watchdog_read(void *opaque, hwaddr offset,
+                                       uint64_t *value, unsigned size,
+                                       MemTxAttrs attrs)
+{
+    BesSensorWatchdog *w = opaque;
+    switch (offset) {
+    case 0x000: *value = ptimer_get_limit(w->timer); break;
+    case 0x004: *value = ptimer_get_count(w->timer); break;
+    case 0x008: *value = w->control; break;
+    case 0x00c: *value = 0; break;
+    case 0x010: *value = w->intstatus; break;
+    case 0x014: *value = w->intstatus && (w->control & 1); break;
+    case 0xc00: *value = w->lock; break;
+    case 0xf00: *value = w->itcr; break;
+    case 0xf04: *value = 0; break;
+    default: return MEMTX_ERROR;
+    }
+    return MEMTX_OK;
+}
+
+static MemTxResult sensor_watchdog_write(void *opaque, hwaddr offset,
+                                        uint64_t value, unsigned size,
+                                        MemTxAttrs attrs)
+{
+    BesSensorWatchdog *w = opaque;
+    if (w->lock && offset != 0xc00) {
+        return MEMTX_OK;
+    }
+    switch (offset) {
+    case 0x000:
+        ptimer_transaction_begin(w->timer);
+        ptimer_set_limit(w->timer, (uint32_t)value, 1);
+        ptimer_transaction_commit(w->timer);
+        break;
+    case 0x008: {
+        uint32_t previous = w->control;
+        w->control = value & 3;
+        if ((previous ^ w->control) & 1) {
+            ptimer_transaction_begin(w->timer);
+            if (w->control & 1) {
+                ptimer_set_count(w->timer, ptimer_get_limit(w->timer));
+                ptimer_run(w->timer, 0);
+            } else {
+                ptimer_stop(w->timer);
+            }
+            ptimer_transaction_commit(w->timer);
+        }
+        break;
+    }
+    case 0x00c:
+        w->intstatus = 0;
+        ptimer_transaction_begin(w->timer);
+        ptimer_set_count(w->timer, ptimer_get_limit(w->timer));
+        ptimer_transaction_commit(w->timer);
+        break;
+    case 0xc00: w->lock = value != 0x1acce551; break;
+    case 0xf00: w->itcr = value & 1; break;
+    case 0xf04: w->itop = value & 3; break;
+    case 0x004: case 0x010: case 0x014: break; /* Read-only */
+    default: return MEMTX_ERROR;
+    }
+    sensor_watchdog_outputs(w);
+    return MEMTX_OK;
+}
+
+static const MemoryRegionOps sensor_watchdog_ops = {
+    .read_with_attrs = sensor_watchdog_read,
+    .write_with_attrs = sensor_watchdog_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .valid.unaligned = false,
+};
+
 static void best1503_peripheral_reset(void *opaque)
 {
     Best1503State *s = opaque;
     ++s->sensor_reset_generation;
+    sensor_watchdog_reset(&s->sensor_watchdog);
     s->sensor_held = true;
     s->sensor_needs_reset = true;
     dsi_reset(&s->dsi);
@@ -4446,7 +4807,7 @@ static void best1503_peripheral_reset(void *opaque)
     lcdc_frame_cancel(&s->lcdc);
     s->lcdc.frame_valid = false;
     s->lcdc.frame_count = 0;
-    /* Force the first post-reset transfer through RGB565 conversion even if
+    /* Force the first post-reset transfer through native pixel conversion even if
      * a previous run happened to end with the same frame counter. */
     s->lcdc.argb_frame_count = UINT32_MAX;
     if (s->lcdc.shared_frame) {
@@ -4497,6 +4858,10 @@ static void best1503_peripheral_reset(void *opaque)
     memset(s->ispi.analog, 0, sizeof(s->ispi.analog));
     memset(s->ispi.page, 0, sizeof(s->ispi.page));
     s->ispi.head = s->ispi.count = 0;
+    memset(s->ispi.adc_channel, -1, sizeof(s->ispi.adc_channel));
+    memset(s->ispi.adc_version, 0, sizeof(s->ispi.adc_version));
+    memset(s->ispi.adc_sample_version, 0, sizeof(s->ispi.adc_sample_version));
+    memset(s->ispi.adc_sample_valid, 0, sizeof(s->ispi.adc_sample_valid));
     s->ispi.logged_reads = 0;
     s->ispi.logged_adc = 0;
     s->ispi.adc_pending = 0;
@@ -4506,6 +4871,13 @@ static void best1503_peripheral_reset(void *opaque)
     memset(s->spi0.regs, 0, sizeof(s->spi0.regs));
     gh_reset(&s->spi0);
     s->spi0.selected = s->spi0.reset_high = false;
+    for (unsigned i = 0; i < ARRAY_SIZE(s->sensor_spi); i++) {
+        BesSpiConfig *spi = &s->sensor_spi[i];
+        memset(spi->regs, 0, sizeof(spi->regs));
+        memset(spi->imu_rx, 0, sizeof(spi->imu_rx));
+        spi->rx_head = spi->rx_count = 0;
+        spi->rx_overrun = false;
+    }
     s->ispi.analog[3][0][0] = 0xc0d0;
     BesPsram *p = &s->psram_ctrl;
     memset(p->mc, 0, sizeof(p->mc));
@@ -4531,6 +4903,13 @@ static void best1503_peripheral_reset(void *opaque)
         s->i2c[i].rx_head = s->i2c[i].rx_count = 0;
         i2c_update(&s->i2c[i]);
     }
+    for (unsigned i = 0; i < ARRAY_SIZE(s->sensor_i2c); i++) {
+        BesI2c *i2c = &s->sensor_i2c[i];
+        memset(i2c->regs, 0, sizeof(i2c->regs));
+        i2c->pending = i2c->abort_source = 0;
+        i2c->rx_head = i2c->rx_count = 0;
+        i2c_update(i2c);
+    }
     memset(memory_region_get_ram_ptr(&s->bt_patch), 0, 0x200);
     memset(memory_region_get_ram_ptr(&s->bt_cpudump), 0, 0x10000);
     for (unsigned i = 0; i < ARRAY_SIZE(s->bt_config); i++) {
@@ -4545,6 +4924,11 @@ static void best1503_peripheral_reset(void *opaque)
      * GPIO83, the other table entry, reads inverted IOMUX 0x40 bit31;
      * the zeroed IOMUX already represents that key being released. */
     s->gpio[1].input = 1u << 27;
+    qemu_mutex_lock(&s->imu_lock);
+    q65_imu_reset(&s->imu, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    q65_imu_select(&s->imu, false);
+    qemu_mutex_unlock(&s->imu_lock);
+    if (s->imu_timer) { timer_del(s->imu_timer); }
     panel_te_update_irq(s);
     if (s->touch.enabled) { touch_reset(s); }
     crown_reset(s);
@@ -4589,7 +4973,7 @@ static void sensor_map_image(Best1503State *s)
     }
     /* vela_sensor.bin build_info declares FLASH_BASE=0x26000000,
      * FLASH_NC_BASE=0x22000000 and FLASH_SIZE=0x400000. Its original
-     * trampoline at +0x10 jumps to the executable alias 0x06077541. */
+     * trampoline at +0x10 selects the image's executable reset entry. */
     map_ram(s, &s->sensor_flash, "bes.sensor-flash", 0x26000000, 4 * MiB);
     memset(memory_region_get_ram_ptr(&s->sensor_flash), 0xff, 4 * MiB);
     memcpy(memory_region_get_ram_ptr(&s->sensor_flash), contents, length);
@@ -4612,206 +4996,20 @@ static void sensor_map_image(Best1503State *s)
                           &s->sensor_cache, "bes.sensor-icache", 0x8c);
     memory_region_add_subregion(get_system_memory(), 0x07ffe000,
                                 &s->sensor_cache.mmio);
-    /* Original sensor veneers at 0x06000388/0x06000390 and 0x0610bf00/
-     * 0x0610bfb0 call this mask-ROM interrupt lock/unlock pair around CMU
-     * read/modify/write sequences. The AP implementation and ROM entry
-     * spacing identify the BASEPRI=0x80 ABI (14-byte lock, 8-byte unlock),
-     * preserving nesting. Unverified ROM entries stay undefined. */
-    static const uint8_t int_lock_rom[] = {
-        0x80, 0x23,             /* movs r3, #0x80 */
-        0xef, 0xf3, 0x11, 0x80, /* mrs r0, basepri */
-        0x83, 0xf3, 0x11, 0x88, /* msr basepri, r3 */
-        0xc0, 0xb2,             /* uxtb r0, r0 */
-        0x70, 0x47,             /* bx lr */
-    };
-    static const uint8_t int_unlock_rom[] = {
-        0xc0, 0xb2,             /* uxtb r0, r0 */
-        0x80, 0xf3, 0x11, 0x88, /* msr basepri, r0 */
-        0x70, 0x47,             /* bx lr */
-    };
-    memory_region_init_rom(&s->sensor_rom, NULL, "bes.sensor-rom",
-                           0x10000, &error_fatal);
-    uint8_t *rom = memory_region_get_ram_ptr(&s->sensor_rom);
-    memset(rom, 0xff, 0x10000);
-    /* Fully implemented libc ABIs proven by the original call sites.
-     * Byte loops preserve the destination return value and accept zero
-     * lengths, without assuming alignment or reading outside the input.
-     * Reproducible assembly: src/sensor-rom-libc.S. */
-    static const uint8_t memset_rom[] = {
-        0x03, 0x46, 0x1a, 0xb1, 0x03, 0xf8, 0x01, 0x1b,
-        0x01, 0x3a, 0xfb, 0xd1, 0x70, 0x47,
-    };
-    static const uint8_t memcpy_rom[] = {
-        0x03, 0x46, 0x2a, 0xb1, 0x11, 0xf8, 0x01, 0xcb,
-        0x03, 0xf8, 0x01, 0xcb, 0x01, 0x3a, 0xf9, 0xd1,
-        0x70, 0x47,
-    };
-    static const uint8_t strlen_rom[] = {
-        0x01, 0x46, 0x00, 0x20, 0x11, 0xf8, 0x01, 0x2b,
-        0x0a, 0xb1, 0x01, 0x30, 0xfa, 0xe7, 0x70, 0x47,
-    };
-    memcpy(rom + 0x0374, memset_rom, sizeof(memset_rom));
-    memcpy(rom + 0x0220, memcpy_rom, sizeof(memcpy_rom));
-    memcpy(rom + 0x0740, strlen_rom, sizeof(strlen_rom));
-    /* String replacement and append callers prove 3-argument memmove;
-     * argv copies prove strcpy, and newline searches prove strchr. */
-    static const uint8_t memmove_rom[] = {
-        0x88, 0x42, 0x0b, 0xd3, 0x09, 0xd0, 0x03, 0x46,
-        0x13, 0x44, 0x11, 0x44, 0x2a, 0xb1, 0x11, 0xf8,
-        0x01, 0xcd, 0x03, 0xf8, 0x01, 0xcd, 0x01, 0x3a,
-        0xf9, 0xd1, 0x70, 0x47, 0x03, 0x46, 0x2a, 0xb1,
-        0x11, 0xf8, 0x01, 0xcb, 0x03, 0xf8, 0x01, 0xcb,
-        0x01, 0x3a, 0xf9, 0xd1, 0x70, 0x47,
-    };
-    static const uint8_t strcpy_rom[] = {
-        0x03, 0x46, 0x11, 0xf8, 0x01, 0x2b, 0x03, 0xf8,
-        0x01, 0x2b, 0x00, 0x2a, 0xf9, 0xd1, 0x70, 0x47,
-    };
-    static const uint8_t strchr_rom[] = {
-        0xc9, 0xb2, 0x02, 0x78, 0x8a, 0x42, 0x03, 0xd0,
-        0x0a, 0xb1, 0x01, 0x30, 0xf9, 0xe7, 0x00, 0x20,
-        0x70, 0x47,
-    };
-    memcpy(rom + 0x0420, memmove_rom, sizeof(memmove_rom));
-    memcpy(rom + 0x0618, strcpy_rom, sizeof(strcpy_rom));
-    memcpy(rom + 0x0180, strchr_rom, sizeof(strchr_rom));
-    /* strcmp is used by the original key-dispatch code at 6005d1e..64;
-     * both inputs are NUL strings and r2 is unrelated caller state. */
-    static const uint8_t strcmp_rom[] = {
-        0x10, 0xf8, 0x01, 0x2b, 0x11, 0xf8, 0x01, 0x3b,
-        0x9a, 0x42, 0x01, 0xd1, 0x00, 0x2a, 0xf7, 0xd1,
-        0xd0, 0x1a, 0x70, 0x47,
-    };
-    memcpy(rom + 0x045c, strcmp_rom, sizeof(strcmp_rom));
-    memcpy(rom + 0x1ce4, int_lock_rom, sizeof(int_lock_rom));
-    memcpy(rom + 0x1cf2, int_unlock_rom, sizeof(int_unlock_rom));
-    /* hal_trace_printf: the sensor flash twin of AP SRAM 229378 keeps
-     * varargs, trace attributes, prefix/format and transport behavior. */
-    static const uint8_t trace_printf_rom[] = {
-        0xdf, 0xf8, 0x00, 0xf0,
-        0xe1, 0x1e, 0x00, 0x06, /* sensor flash 0x06001ee1 */
-    };
-    memcpy(rom + 0x1c68, trace_printf_rom, sizeof(trace_printf_rom));
-    /* The original sensor image includes both CMU and AON hardware
-     * semaphore APIs. Their register reads acquire, writes release, and
-     * the local routines preserve the invalid-ID checks. */
-    static const uint8_t memsc_lock_rom[] = {
-        0xdf, 0xf8, 0x00, 0xf0, 0x2d, 0x21, 0x00, 0x06,
-    };
-    static const uint8_t memsc_unlock_rom[] = {
-        /* Complete PC-independent sensor flash 600213e..600214f. */
-        0x03, 0x28, 0x9f, 0xbf, 0x4f, 0xf0, 0xa0, 0x43,
-        0x01, 0x22, 0x30, 0x30, 0x43, 0xf8, 0x20, 0x20,
-        0x70, 0x47,
-    };
-    static const uint8_t memsc_aon_lock_rom[] = {
-        0xdf, 0xf8, 0x00, 0xf0, 0x51, 0x21, 0x00, 0x06,
-    };
-    static const uint8_t memsc_aon_unlock_rom[] = {
-        0xdf, 0xf8, 0x00, 0xf0, 0x65, 0x21, 0x00, 0x06,
-    };
-    memcpy(rom + 0x1eb4, memsc_lock_rom, sizeof(memsc_lock_rom));
-    memcpy(rom + 0x1ec6, memsc_unlock_rom, sizeof(memsc_unlock_rom));
-    memcpy(rom + 0x1ed8, memsc_aon_lock_rom, sizeof(memsc_aon_lock_rom));
-    memcpy(rom + 0x1eec, memsc_aon_unlock_rom, sizeof(memsc_aon_unlock_rom));
-    /* Raw clocksource getters: the AP twins at 229bd0/229bdc and the
-     * SDK timer implementation read and negate the local down counters. */
-    static const uint8_t timer_get_rom[] = {
-        0xdf, 0xf8, 0x00, 0xf0,
-        0x81, 0x1f, 0x00, 0x06, /* sensor flash 0x06001f81 */
-    };
-    static const uint8_t fast_timer_get_rom[] = {
-        0xdf, 0xf8, 0x00, 0xf0,
-        0x8d, 0x1f, 0x00, 0x06, /* sensor flash 0x06001f8d */
-    };
-    memcpy(rom + 0x1d08, timer_get_rom, sizeof(timer_get_rom));
-    memcpy(rom + 0x1d14, fast_timer_get_rom, sizeof(fast_timer_get_rom));
-    /* The sensor's local timer implementation is the AP timer ABI twin.
-     * ROM 1d21 is the raw slow-tick delay (AP SRAM 229be8), and ROM 1d35
-     * is the calibrated microsecond delay (AP SRAM 229bfc). Enter the
-     * original flash functions with their independent timer addresses,
-     * full unsigned/wrap handling and firmware calibration state. */
-    static const uint8_t timer_delay_ticks_rom[] = {
-        0x5f, 0xf8, 0x00, 0xf0, /* ldr.w pc,[pc] */
-        0x99, 0x1f, 0x00, 0x06, /* sensor flash 0x06001f99 */
-    };
-    static const uint8_t timer_delay_us_rom[] = {
-        0x5f, 0xf8, 0x00, 0xf0,
-        0xad, 0x1f, 0x00, 0x06, /* sensor flash 0x06001fad */
-    };
-    memcpy(rom + 0x1d20, timer_delay_ticks_rom,
-           sizeof(timer_delay_ticks_rom));
-    memcpy(rom + 0x1d34, timer_delay_us_rom, sizeof(timer_delay_us_rom));
-    /* Preserve hal_sysfreq_req's user table, max selection and clock
-     * transition ordering by executing the sensor's complete local twin.
-     * AP 229ab0 and sensor 600201c have the same verified request ABI. */
-    static const uint8_t sysfreq_req_rom[] = {
-        0x5f, 0xf8, 0x00, 0xf0,
-        0x1d, 0x20, 0x00, 0x06, /* sensor flash 0x0600201d */
-    };
-    memcpy(rom + 0x1da4, sysfreq_req_rom, sizeof(sysfreq_req_rom));
-    /* Crystal and derived fast-tick frequencies come from the original
-     * domain state at 2030267c, initialized by the sensor image itself. */
-    static const uint8_t crystal_freq_rom[] = {
-        0xdf, 0xf8, 0x00, 0xf0, 0x79, 0x21, 0x00, 0x06,
-    };
-    static const uint8_t fast_tick_freq_rom[] = {
-        0xdf, 0xf8, 0x00, 0xf0, 0x85, 0x21, 0x00, 0x06,
-    };
-    memcpy(rom + 0x1f00, crystal_freq_rom, sizeof(crystal_freq_rom));
-    memcpy(rom + 0x1f0c, fast_tick_freq_rom, sizeof(fast_tick_freq_rom));
-    /* Reuse the sensor-domain fast timer initialization ABI twin.
-     * The original function sets PERIPH_CLK bit 5 and preserves BASEPRI.
-     * Its AP counterpart at 229814 sets a different domain's bit 10. */
-    static const uint8_t fast_timer_init_rom[] = {
-        0xdf, 0xf8, 0x00, 0xf0,
-        0xcd, 0x21, 0x00, 0x06, /* sensor flash 0x060021cd */
-    };
-    memcpy(rom + 0x1f54, fast_timer_init_rom,
-           sizeof(fast_timer_init_rom));
-    /* The original sensor image includes complete NOR counterparts of
-     * AP SRAM 2213f8 (set frequency) and 221428 (initialize). Use those
-     * routines so wait, command mode, independent +0x68 flash clock,
-     * JEDEC matching and sampling calibration retain their full behavior.
-     * The sensor's original config at 20302104 is 104/52 MHz, 0x7503f, 1.
-     * Reproducible veneers: src/sensor-rom-flash.S. */
-    static const uint8_t flash_set_freq_rom[] = {
-        0xdf, 0xf8, 0x00, 0xf0,
-        0xc9, 0x12, 0x00, 0x06, /* sensor flash 0x060012c9 */
-    };
-    static const uint8_t flash_init_rom[] = {
-        0xdf, 0xf8, 0x00, 0xf0,
-        0xe1, 0x12, 0x00, 0x06, /* sensor flash 0x060012e1 */
-    };
-    memcpy(rom + 0x1050, flash_set_freq_rom, sizeof(flash_set_freq_rom));
-    memcpy(rom + 0x1068, flash_init_rom, sizeof(flash_init_rom));
-    /* GD device-table write_status callback. The local implementation
-     * preserves INIT/QE/LB/BP handling, reads/modifies both status bytes
-     * and validates security-register masks (SDK gd25q32c_write_status). */
-    static const uint8_t flash_write_status_rom[] = {
-        0xdf, 0xf8, 0x00, 0xf0,
-        0xf9, 0x12, 0x00, 0x06, /* sensor flash 0x060012f9 */
-    };
-    memcpy(rom + 0x1080, flash_write_status_rom,
-           sizeof(flash_write_status_rom));
-    memory_region_add_subregion(get_system_memory(), 0x00500000,
-                                &s->sensor_rom);
     qemu_log_mask(LOG_GUEST_ERROR,
                   "BES sensor image loaded: size=%zu flash=0x26000000 RAM=0x20300000+0x88000\n",
                   length);
 }
 
-static void sensor_init_cpu(Best1503State *s)
+static void sensor_map_exec_alias(Best1503State *s)
 {
-    DeviceState *cpu;
-
-    if (!s->sensor_image) {
-        return;
-    }
-    /* RAMX aliases subtract 0x20000000 from the data address. The sensor's
-     * 0x20300000 RAM therefore executes at 0x00300000, which overlaps
-     * part of the AP's larger executable SRAM mapping. Keep that alias
-     * private to this CPU while both cores share the physical data RAM. */
+    /* Q65's sensor reset copies flash +03f8..2318 to 20300180 and
+     * +28fc..375c to 20302aa0. Its original veneers call that RAM at
+     * 0050xxxx, e.g. 06105940 -> 00501cfd reads the query copied to
+     * 20301cfc. Like the AP's 20000000 -> 00200000 mapping, this is a
+     * 1fe00000 offset. Execute the guest-populated RAM itself so relative
+     * branches, atomics, libc and later code updates retain their ABI.
+     * A separate synthetic ROM at 00500000 would hide this RAM. */
     memory_region_init(&s->sensor_space, OBJECT(s),
                        "bes.sensor-address-space", UINT64_MAX);
     memory_region_init_alias(&s->sensor_system, OBJECT(s),
@@ -4821,8 +5019,18 @@ static void sensor_init_cpu(Best1503State *s)
     memory_region_init_alias(&s->sensor_ram_exec, OBJECT(s),
                              "bes.sensor-ram.exec", &s->sensor_ram, 0,
                              memory_region_size(&s->sensor_ram));
-    memory_region_add_subregion_overlap(&s->sensor_space, 0x00300000,
+    memory_region_add_subregion_overlap(&s->sensor_space, 0x00500000,
                                         &s->sensor_ram_exec, 1);
+}
+
+static void sensor_init_cpu(Best1503State *s)
+{
+    DeviceState *cpu;
+
+    if (!s->sensor_image) {
+        return;
+    }
+    sensor_map_exec_alias(s);
     object_initialize_child(OBJECT(s), "sensor-cpu", &s->sensor_cpu, TYPE_ARMV7M);
     cpu = DEVICE(&s->sensor_cpu);
     qdev_prop_set_string(cpu, "cpu-type", ARM_CPU_TYPE_NAME("cortex-m33"));
@@ -4938,6 +5146,10 @@ static void best1503_init(MachineState *machine)
             map_alias(s, &s->nand_cache_alias[i], name, &s->nand_cache, aliases[i]);
         }
     }
+    if (s->imu.enabled && (!s->sensor_image || !*s->sensor_image)) {
+        error_report("sensor-imu=lsm6dso requires the original sensor-image");
+        exit(1);
+    }
     if ((s->spi0_unconnected && s->gh3x2x_fixture) ||
         (s->gpu_id_fixture && !s->gpu_probe) ||
         (s->gpu_no_render && !s->gpu_id_fixture) ||
@@ -4974,6 +5186,7 @@ static void best1503_init(MachineState *machine)
     s->panel_te_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, panel_te_edge, s);
     s->touch_irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, touch_irq_rearm, s);
     s->crown.irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, crown_irq_rearm, s);
+    s->imu_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sensor_imu_tick, s);
     s->lcdc.machine = s;
     if (s->touch.enabled) {
         if (!s->lcd_frame_capture) {
@@ -4985,6 +5198,7 @@ static void best1503_init(MachineState *machine)
         qemu_activate_mouse_event_handler(s->touch.mouse);
     }
     s->spi0.machine = s;
+    s->spi0.base = 0x40007000;
     gh_reset(&s->spi0);
     s->lcdc.spi_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, lcdc_spi_complete,
                                     &s->lcdc);
@@ -5162,6 +5376,12 @@ static void best1503_init(MachineState *machine)
         memory_region_add_subregion_overlap(get_system_memory(), 0x40085080,
                                            &s->gpio_summary, 1);
     }
+    if (s->imu.enabled) {
+        memory_region_init_io(&s->sensor_gpio_summary, OBJECT(s), &sensor_gpio_summary_ops,
+                              s, "bes.sensor-gpio-summary", 24);
+        memory_region_add_subregion_overlap(get_system_memory(), 0x400850b0,
+                                           &s->sensor_gpio_summary, 1);
+    }
     s->dsi.machine = s;
     dsi_reset(&s->dsi);
     memory_region_init_io(&s->dsi.mmio, OBJECT(s), &dsi_ops, &s->dsi,
@@ -5194,6 +5414,26 @@ static void best1503_init(MachineState *machine)
                           "bes.spi0-config", 0x8c);
     memory_region_add_subregion(get_system_memory(), 0x40007000,
                                 &s->spi0.mmio);
+    if (s->sensor_image) {
+        /* The timer array at 20302668 has TWO entries. The separate SPI
+         * array at 20302670 contains 50007000/50008000. Sensor function
+         * 0606eca8 configures CR0 and RX extension at +88; 0606eccc configures
+         * CR1/CPSR/DMACR. Observed SPI1 config is 70100/2/2/0, CS0.
+         * Reuse the explicit synchronous 8-bit open-bus FIFO fixture.
+         * MISO pull-high is a model choice, not a measured idle level.
+         * No AP slave is attached here; SPI IRQ/DMA remain unsupported. */
+        for (unsigned i = 0; i < ARRAY_SIZE(s->sensor_spi); i++) {
+            BesSpiConfig *spi = &s->sensor_spi[i];
+            g_autofree char *name = g_strdup_printf("bes.sensor-spi%u", i);
+            spi->machine = s;
+            spi->base = 0x50007000 + i * 0x1000;
+            spi->unconnected_only = true;
+            memory_region_init_io(&spi->mmio, OBJECT(s), &spi0_ops, spi,
+                                  name, 0x8c);
+            memory_region_add_subregion(get_system_memory(), spi->base,
+                                        &spi->mmio);
+        }
+    }
     for (unsigned i = 0; i < ARRAY_SIZE(s->nor); i++) {
         static const hwaddr bases[] = {0x40140000, 0x40500000, 0x50160000};
         g_autofree char *name = g_strdup_printf("bes.nor%u", i);
@@ -5229,6 +5469,9 @@ static void best1503_init(MachineState *machine)
                              &error_fatal);
     sysbus_realize(SYS_BUS_DEVICE(cpu), &error_fatal);
     sensor_init_cpu(s);
+    if (s->sensor_ready) {
+        s->sensor_gpio_irq = qdev_get_gpio_in(DEVICE(&s->sensor_cpu), 31);
+    }
     /* Original AP table 0x3c2207e0 and sensor table 0x2613fb44. */
     for (unsigned ch = 0; ch < 2; ch++) {
         s->sensor_mailbox.rx_irq[0][ch] = qdev_get_gpio_in(cpu, 79 + ch);
@@ -5261,6 +5504,28 @@ static void best1503_init(MachineState *machine)
                               &s->i2c[i], name, 0x1000);
         memory_region_add_subregion(get_system_memory(), bases[i],
                                     &s->i2c[i].mmio);
+    }
+    if (s->sensor_ready) {
+        /* Original sensor table at 2613895c has 16-byte records. The
+         * IRQ installer 060708fc reads signed byte +0a before irq_attach
+         * at 06070952. Use independent DesignWare controller state;
+         * unimplemented IMU/PPG/magnetometer targets receive real NACK
+         * abort status and IRQ, never invented device IDs or samples. */
+        static const hwaddr bases[] = {
+            0x50005000, 0x50006000, 0x5000e000, 0x5000f000
+        };
+        static const unsigned irqs[] = {10, 21, 42, 43};
+        for (unsigned i = 0; i < ARRAY_SIZE(s->sensor_i2c); i++) {
+            BesI2c *i2c = &s->sensor_i2c[i];
+            g_autofree char *name = g_strdup_printf("bes.sensor-i2c%u", i);
+            i2c->base = bases[i];
+            i2c->machine = s;
+            i2c->irq = qdev_get_gpio_in(DEVICE(&s->sensor_cpu), irqs[i]);
+            memory_region_init_io(&i2c->mmio, OBJECT(s), &i2c_ops, i2c,
+                                  name, 0x1000);
+            memory_region_add_subregion(get_system_memory(), bases[i],
+                                        &i2c->mmio);
+        }
     }
     /* BES UART's standard PL011 register bank, IRQs from best1503.h.
      * Oversampling/RX extension registers retain config only; host serial
@@ -5301,6 +5566,28 @@ static void best1503_init(MachineState *machine)
                                             0x40120200 + i * 0x10000,
                                             &s->dma_2d[i].mmio, 1);
     }
+    if (s->sensor_ready) {
+        /* Original sensor hal_dma_open at 06073324 initializes eight
+         * PL080 channel CONFIG registers at 50120110..501201f0, clears
+         * TC/ERR status at +08/+10, and enables global CONFIG at +30.
+         * It registers handler 06072b2d on sensor NVIC IRQ 2. This is a
+         * separate controller, with the sensor's actual memory view.
+         * Peripheral DMA request lines remain unconnected until their
+         * devices are modeled; software/memory transfers use PL080. */
+        object_initialize_child(OBJECT(s), "sensor-dma", &s->sensor_dma,
+                                TYPE_PL080);
+        object_property_set_link(OBJECT(&s->sensor_dma), "downstream",
+                                 OBJECT(&s->sensor_space), &error_fatal);
+        sysbus_realize(SYS_BUS_DEVICE(&s->sensor_dma), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->sensor_dma), 0, 0x50120000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->sensor_dma), 0,
+                            qdev_get_gpio_in(DEVICE(&s->sensor_cpu), 2));
+        s->sensor_dma_2d.controller = 2;
+        memory_region_init_io(&s->sensor_dma_2d.mmio, OBJECT(s), &dma_2d_ops,
+                              &s->sensor_dma_2d, "bes.sensor-dma-2d", 0x100);
+        memory_region_add_subregion_overlap(get_system_memory(), 0x50120200,
+                                            &s->sensor_dma_2d.mmio, 1);
+    }
     /* The resource NAND RX channel observed at runtime is DMA1 ch0 with
      * conf=0x1003: peripheral-flow mode and source request ID 1.  The
      * controller's selector table maps the NAND request to this PL080
@@ -5332,6 +5619,28 @@ static void best1503_init(MachineState *machine)
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->watchdog[i]), 0,
                             qdev_get_gpio_in(cpu, i ? 5 : 10));
     }
+    if (s->sensor_ready) {
+        /* Sensor hal_wdt uses the CMSDK register layout at 50001000,
+         * including the 1acce551 unlock at +c00. Its timeout conversion
+         * at 0606e2c0 is milliseconds * 16384 / 1000; 0606e310 converts
+         * VALUE back with *1000 >>14. Use the real slow-clock counter,
+         * lock, reload, interrupt status and two-stage expiry semantics.
+         * No watchdog NVIC registration was found in these original
+         * routines, so the unverified IRQ route remains unconnected. */
+        BesSensorWatchdog *w = &s->sensor_watchdog;
+        w->timer = ptimer_init(sensor_watchdog_tick, w,
+                              PTIMER_POLICY_WRAP_AFTER_ONE_PERIOD |
+                              PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT |
+                              PTIMER_POLICY_NO_IMMEDIATE_RELOAD |
+                              PTIMER_POLICY_NO_COUNTER_ROUND_DOWN);
+        ptimer_transaction_begin(w->timer);
+        ptimer_set_period_from_clock(w->timer, s->slowclk, 1);
+        ptimer_transaction_commit(w->timer);
+        sensor_watchdog_reset(w);
+        memory_region_init_io(&w->mmio, OBJECT(s), &sensor_watchdog_ops,
+                              w, "bes.sensor-watchdog", 0x1000);
+        memory_region_add_subregion(get_system_memory(), 0x50001000, &w->mmio);
+    }
     /* SDK's extra AON timer at 0x40089000 conflicts with original Q66
      * GPIO1. Its actual Q66 address is unknown; do not map that timer.
      */
@@ -5346,6 +5655,15 @@ static void best1503_init(MachineState *machine)
                                 TYPE_CMSDK_APB_DUALTIMER);
         qdev_connect_clock_in(DEVICE(&s->timer[i]), "TIMCLK",
                               i >= 3 ? s->slowclk : s->fastclk);
+        if (i == 3) {
+            /* Original Q65 AP HAL programs the AON deadline channel with
+             * LOAD=delta-1 and expects the zero count to last one slow tick.
+             * Its early-IRQ branch does not rearm a still-enabled one-shot.
+             * Limit the evidenced BES underflow contract to this channel;
+             * other machines/channels retain their existing CMSDK policy. */
+            qdev_prop_set_uint32(DEVICE(&s->timer[i]),
+                                "bes-oneshot-underflow-mask", 2);
+        }
         sysbus_realize(SYS_BUS_DEVICE(&s->timer[i]), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->timer[i]), 0, bases[i]);
         if (i == 2) {
@@ -5469,9 +5787,135 @@ static bool best1503_get_power_adc_fixture(Object *obj, Error **errp)
     return ((Best1503State *)obj)->power_adc_fixture;
 }
 
+static char *q65_get_imu_model(Object *obj, Error **errp)
+{
+    return g_strdup(((Best1503State *)obj)->imu.enabled ? "lsm6dso" : "none");
+}
+
+static void q65_set_imu_model(Object *obj, const char *value, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    if (s->imu_timer) {
+        error_setg(errp, "sensor-imu is a startup-only board option"); return;
+    }
+    if (strcmp(value, "none") && strcmp(value, "lsm6dso")) {
+        error_setg(errp, "sensor-imu must be none or lsm6dso"); return;
+    }
+    s->imu.enabled = !strcmp(value, "lsm6dso");
+}
+
+static void q65_set_imu_raw(Object *obj, const char *value, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    if (!s->imu.enabled) {
+        error_setg(errp, "imu-raw requires sensor-imu=lsm6dso"); return;
+    }
+    qemu_mutex_lock(&s->imu_lock);
+    /* Service already-due samples with the old vector before atomically
+     * accepting the new one. A late timer must not relabel past samples. */
+    q65_imu_advance(&s->imu, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    bool accepted = q65_imu_input_set(&s->imu, value);
+    qemu_mutex_unlock(&s->imu_lock);
+    sensor_imu_schedule(s);
+    if (!accepted) {
+        error_setg(errp, "imu-raw requires accel=x,y,z;gyro=x,y,z, six signed16-bit decimal counts");
+    }
+}
+
+static char *q65_get_imu_state(Object *obj, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    qemu_mutex_lock(&s->imu_lock);
+    Q65Imu *m = &s->imu;
+    char *result = g_strdup_printf(
+        "{\"model\":\"%s\",\"inputVersion\":%" PRIu64
+        ",\"accelRaw\":[%d,%d,%d],\"gyroRaw\":[%d,%d,%d]"
+        ",\"gyroSamples\":%" PRIu64 ",\"accelSamples\":%" PRIu64
+        ",\"fifoWords\":%u,\"fifoPops\":%" PRIu64
+        ",\"fifoReadCount\":%" PRIu64 ",\"outputWordReadCount\":%" PRIu64
+        ",\"lastReadVersion\":%" PRIu64 ",\"dropped\":%" PRIu64
+        ",\"unsupportedCount\":%" PRIu64
+        ",\"axisReadCount\":[%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "]"
+        ",\"axisReadVersion\":[%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "]"
+        ",\"axisReadRaw\":[%d,%d,%d,%d,%d,%d]"
+        ",\"ctrl1XL\":%u,\"ctrl2G\":%u,\"ctrl3C\":%u,\"fifoCtrl3\":%u,\"fifoCtrl4\":%u}",
+        m->enabled ? "lsm6dso" : "none", m->input_version,
+        m->input[0],m->input[1],m->input[2],m->input[3],m->input[4],m->input[5],
+        m->samples[0],m->samples[1],m->count,m->fifo_pops,m->fifo_read_count,
+        m->output_read_count,m->last_read_version,m->dropped,m->unsupported_count,
+        m->axis_read_count[0],m->axis_read_count[1],m->axis_read_count[2],
+        m->axis_read_count[3],m->axis_read_count[4],m->axis_read_count[5],
+        m->axis_read_version[0],m->axis_read_version[1],m->axis_read_version[2],
+        m->axis_read_version[3],m->axis_read_version[4],m->axis_read_version[5],
+        m->axis_read_raw[0],m->axis_read_raw[1],m->axis_read_raw[2],
+        m->axis_read_raw[3],m->axis_read_raw[4],m->axis_read_raw[5],
+        m->regs[0x10],m->regs[0x11],m->regs[0x12],m->regs[9],m->regs[0x0a]);
+    qemu_mutex_unlock(&s->imu_lock);
+    return result;
+}
+
 static void best1503_set_power_adc_fixture(Object *obj, bool value, Error **errp)
 {
-    ((Best1503State *)obj)->power_adc_fixture = value;
+    Best1503State *s = (Best1503State *)obj;
+    if (s->power_adc_fixture != value) {
+        /* Fixture-off register writes do not carry host-input provenance.
+         * Clear latched sample validity on a mode change; already queued RX
+         * responses retain their original value and saved version. */
+        memset(s->ispi.adc_sample_valid, 0, sizeof(s->ispi.adc_sample_valid));
+    }
+    s->power_adc_fixture = value;
+}
+
+/* The runner owns QMP and exposes only pmu.adcRaw.set/get. Do not surface
+ * caller-selected QOM paths, properties or arbitrary monitor commands. */
+static void best1503_set_adc_raw(Object *obj, const char *value, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    uint16_t next[BES_ADC_CHANNELS];
+    if (!s->power_adc_fixture) {
+        error_setg(errp, "pmu.adcRaw requires power-adc-fixture");
+        return;
+    }
+    if (!bes_adc_parse(value, next)) {
+        error_setg(errp, "pmu.adcRaw requires eight decimal values in 0..65535");
+        return;
+    }
+    qemu_mutex_lock(&s->adc_lock);
+    bool applied = bes_adc_replace(&s->adc_input, next);
+    qemu_mutex_unlock(&s->adc_lock);
+    if (!applied) {
+        error_setg(errp, "pmu.adcRaw version exhausted");
+    }
+}
+
+static char *best1503_get_adc_state(Object *obj, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    BesAdcInput snapshot;
+    qemu_mutex_lock(&s->adc_lock);
+    snapshot = s->adc_input;
+    qemu_mutex_unlock(&s->adc_lock);
+    /* Fixed eight-element arrays: bounded response, no host-controlled size.
+     * The version marks vector replacement, not a guest calibration epoch. */
+    GString *result = g_string_new(NULL);
+    g_string_append_printf(result,
+        "{\"schema\":1,\"fixtureEnabled\":%s,\"version\":%" PRIu64,
+        s->power_adc_fixture ? "true" : "false", snapshot.version);
+    g_string_append(result, ",\"values\":[");
+    for (unsigned i = 0; i < BES_ADC_CHANNELS; i++) {
+        g_string_append_printf(result, "%s%u", i ? "," : "", snapshot.values[i]);
+    }
+    g_string_append(result, "],\"readCount\":[");
+    for (unsigned i = 0; i < BES_ADC_CHANNELS; i++) {
+        g_string_append_printf(result, "%s%" PRIu64, i ? "," : "", snapshot.reads[i]);
+    }
+    g_string_append(result, "],\"lastReadVersion\":[");
+    for (unsigned i = 0; i < BES_ADC_CHANNELS; i++) {
+        g_string_append_printf(result, "%s%" PRIu64, i ? "," : "",
+                               snapshot.last_read_version[i]);
+    }
+    g_string_append(result, "]}");
+    return g_string_free(result, false);
 }
 
 static void best1503_set_touch(Object *obj, bool value, Error **errp)
@@ -5689,9 +6133,30 @@ Q65_BOOL_PROPERTY(data_writeback)
 Q65_BOOL_PROPERTY(nor_writeback)
 #undef Q65_BOOL_PROPERTY
 
+static void best1503_instance_init(Object *obj)
+{
+    Best1503State *s = (Best1503State *)obj;
+    qemu_mutex_init(&s->adc_lock);
+    bes_adc_init(&s->adc_input);
+    /* Keep the established Q65 raw fixture defaults, not physical units. */
+    s->adc_input.values[3] = 12090;
+    s->adc_input.values[6] = 15968;
+}
+
+static void q65_instance_init(Object *obj)
+{
+    Best1503State *s = (Best1503State *)obj;
+    best1503_instance_init(obj);
+    qemu_mutex_init(&s->imu_lock);
+    q65_imu_reset(&s->imu, 0);
+}
+
 static void best1503_finalize(Object *obj)
 {
     Best1503State *s = (Best1503State *)obj;
+    if (s->sensor_watchdog.timer) {
+        ptimer_free(s->sensor_watchdog.timer);
+    }
     if (s->nor_exit_registered) {
         qemu_remove_exit_notifier(&s->nor_exit);
     }
@@ -5709,6 +6174,9 @@ static void best1503_finalize(Object *obj)
     g_free(l->argb_pixels);
     l->argb_pixels = NULL;
     g_free(l->frame_file);
+    qemu_mutex_destroy(&s->adc_lock);
+    if (s->imu_timer) { timer_free(s->imu_timer); }
+    qemu_mutex_destroy(&s->imu_lock);
 }
 
 static void best1503_class_init(ObjectClass *oc, const void *data)
@@ -5725,7 +6193,7 @@ static void best1503_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "lcd-frame-file",
         best1503_get_lcd_frame_file, best1503_set_lcd_frame_file);
     object_class_property_set_description(oc, "lcd-frame-file",
-        "Shared completed RGB565 LCD snapshots for local viewers");
+        "Shared completed RGB888 LCD snapshots for local viewers");
     object_class_property_add_str(oc, "bt-hci-chardev", best1503_get_bt_hci_chardev,
                                   best1503_set_bt_hci_chardev);
     object_class_property_add_str(oc, "resource-image", best1503_get_resource_image,
@@ -5751,7 +6219,22 @@ static void best1503_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "power-adc-fixture",
         best1503_get_power_adc_fixture, best1503_set_power_adc_fixture);
     object_class_property_set_description(oc, "power-adc-fixture",
-        "Constant raw ADC test inputs; Q65 battery channel 6 and skin temperature channel 3");
+        "Bounded raw ADC test inputs; modeled Q65 channels 2, 3, 5 and 6");
+    object_class_property_add_str(oc, "pmu-adc-raw", NULL, best1503_set_adc_raw);
+    object_class_property_set_description(oc, "pmu-adc-raw",
+        "Atomic eight-channel raw ADC input vector; modeled channels sample on guest conversion");
+    object_class_property_add_str(oc, "pmu-adc-state", best1503_get_adc_state, NULL);
+    object_class_property_add_str(oc, "sensor-imu", q65_get_imu_model, q65_set_imu_model);
+    object_class_property_set_description(oc, "sensor-imu",
+        "Optional firmware-supported IMU model: none (default) or lsm6dso; not a physical BOM assertion");
+    object_class_property_add_str(oc, "imu-raw", NULL, q65_set_imu_raw);
+    object_class_property_set_description(oc, "imu-raw",
+        "Atomic six-axis signed16-bit raw input: accel=x,y,z;gyro=x,y,z");
+    object_class_property_add_str(oc, "imu-state", q65_get_imu_state, NULL);
+    object_class_property_set_description(oc, "imu-state",
+        "Raw input version, hardware sampling/FIFO state and actual guest RX dequeue counters");
+    object_class_property_set_description(oc, "pmu-adc-state",
+        "Raw vector version and actual guest ISPI FIFO read counters");
     object_class_property_set_description(oc, "touch", "CST9317 I2C5 reports and GPIO76 IRQ from absolute pointer input");
     object_class_property_add_bool(oc, "gpu-software-renderer",
         best1503_get_gpu_software_renderer, best1503_set_gpu_software_renderer);
@@ -5800,7 +6283,7 @@ static void best1503_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "lcd-frame-capture",
         best1503_get_lcd_frame_capture, best1503_set_lcd_frame_capture);
     object_class_property_set_description(oc, "lcd-frame-capture",
-        "Experimental bounded RGB565 GRA snapshot and IRQ67; requires panel-id-fixture");
+        "Experimental bounded RGB565/BGR888 GRA snapshot and IRQ67; requires panel-id-fixture");
     object_class_property_add_bool(oc, "gh3x2x-fixture",
         best1503_get_gh3x2x_fixture, best1503_set_gh3x2x_fixture);
     object_class_property_set_description(oc, "gh3x2x-fixture",
@@ -5821,6 +6304,7 @@ static const TypeInfo best1503_type = {
     .parent = TYPE_MACHINE,
     .instance_size = sizeof(Best1503State),
     .instance_finalize = best1503_finalize,
+    .instance_init = q65_instance_init,
     .class_init = best1503_class_init,
 };
 

@@ -207,13 +207,14 @@ typedef struct {
     Best1503State *machine;
     uint8_t page[4];
     uint32_t rx[8];
-    int adc_channel[8];
+    int8_t adc_channel[8];
     uint64_t adc_version[8];
-    uint64_t adc_sampled_version[BES_ADC_CHANNELS];
+    uint64_t adc_sample_version[BES_ADC_CHANNELS];
+    bool adc_sample_valid[BES_ADC_CHANNELS];
     unsigned head, count;
     unsigned logged_reads;
     unsigned logged_adc;
-    uint16_t adc_pending, adc_converted;
+    uint16_t adc_pending;
     uint16_t key_pending;
     qemu_irq pmu_irq;
     int64_t adc_deadline;
@@ -265,8 +266,6 @@ struct Best1503State {
     bool sensor_ready, sensor_held, sensor_needs_reset;
     unsigned sensor_reset_generation;
     MemoryRegion flash, flash_exec, flash_nc, flash_nc_exec;
-    /* TEMP DEBUG: traced XIP windows over the factory_data MTD partition. */
-    MemoryRegion factory_window[4];
     MemoryRegion sram, sram_exec, bt_ram, bt_ram_exec, bt_patch, bt_cpudump;
     MemoryRegion psram, psram_exec, psram_cached, psram_cached_exec;
     MemoryRegion boot_vectors;
@@ -2335,19 +2334,19 @@ static void ispi_adc_update(BesIspi *spi)
          * Channels 2 and 5 retain their fixture inputs. The AP's default
          * calibration maps 15968 to 800 mV and 20816 to 1050 mV; its battery
          * divider is 5.01. These are raw inputs, not host-computed percentages
-         * or temperatures. */
+         * or temperatures. Snapshot one vector version for the whole scan. */
+        qemu_mutex_lock(&spi->machine->adc_lock);
         for (unsigned channel = 0; channel < BES_ADC_CHANNELS; channel++) {
             if ((r[0x1d] & (1u << channel)) &&
                 ((1u << channel) & 0x6c)) {
-                qemu_mutex_lock(&spi->machine->adc_lock);
                 r[0x56 + channel] = bes_adc_sample(&spi->machine->adc_input,
-                    channel, &spi->adc_sampled_version[channel]);
-                qemu_mutex_unlock(&spi->machine->adc_lock);
+                    channel, &spi->adc_sample_version[channel]);
+                spi->adc_sample_valid[channel] = true;
                 sampled |= 1u << channel;
             }
         }
+        qemu_mutex_unlock(&spi->machine->adc_lock);
     }
-    spi->adc_converted |= sampled;
     spi->adc_pending |= sampled | (sampled ? 0x100 : 0);
     if ((r[0x4f] & 0x20) && (r[0x18] & 0x1000)) {
         /* Interval mode uses the reference's 1024 ns period units. */
@@ -2438,10 +2437,10 @@ static void ispi_write(void *opaque, hwaddr offset, uint64_t value,
             } else if (reg == 0x51) {
                 data = spi->adc_pending & spi->analog[3][0][0x1f] &
                        spi->analog[3][0][0x20];
-            } else if (reg >= 0x56 && reg <= 0x5d &&
-                       (spi->adc_converted & (1u << (reg - 0x56)))) {
+            } else if (reg >= 0x56 && reg < 0x56 + BES_ADC_CHANNELS &&
+                       spi->adc_sample_valid[reg - 0x56]) {
                 adc_channel = reg - 0x56;
-                adc_version = spi->adc_sampled_version[adc_channel];
+                adc_version = spi->adc_sample_version[adc_channel];
             }
         }
         if (pmu_adc) {
@@ -4561,10 +4560,13 @@ static void best1503_peripheral_reset(void *opaque)
     memset(s->ispi.analog, 0, sizeof(s->ispi.analog));
     memset(s->ispi.page, 0, sizeof(s->ispi.page));
     s->ispi.head = s->ispi.count = 0;
+    memset(s->ispi.adc_channel, -1, sizeof(s->ispi.adc_channel));
+    memset(s->ispi.adc_version, 0, sizeof(s->ispi.adc_version));
+    memset(s->ispi.adc_sample_version, 0, sizeof(s->ispi.adc_sample_version));
+    memset(s->ispi.adc_sample_valid, 0, sizeof(s->ispi.adc_sample_valid));
     s->ispi.logged_reads = 0;
     s->ispi.logged_adc = 0;
-    s->ispi.adc_pending = s->ispi.adc_converted = 0;
-    memset(s->ispi.adc_sampled_version, 0, sizeof(s->ispi.adc_sampled_version));
+    s->ispi.adc_pending = 0;
     s->ispi.key_pending = 0;
     s->pmu_charger_edges = 0;
     s->pmu_charger_ac_on = s->pmu_charger_armed = false;
@@ -4625,82 +4627,6 @@ static void best1503_peripheral_reset(void *opaque)
     lcdc_update_irq(&s->lcdc);
 }
 
-/* TEMP DEBUG: trace every AP-core access into the writable NOR tail
- * (0xcc0000..0x1000000: factory_data + audio partitions) across all flash
- * alias windows. Reads return the backing RAM content; writes are logged and
- * applied so behavior is unchanged apart from logging. Accesses from the
- * sensor/audio core are ignored to keep the log usable. */
-static bool factory_trace_ap_only(target_ulong pc)
-{
-    return (pc & 0xff000000u) == 0x0c000000u;
-}
-
-static uint64_t factory_window_read(void *opaque, hwaddr addr, unsigned size)
-{
-    Best1503State *s = opaque;
-    uint64_t value = 0;
-    hwaddr off = 0xcc0000 + addr;
-    uint8_t *flash = memory_region_get_ram_ptr(&s->flash);
-    target_ulong pc = 0;
-    CPUState *cpu = current_cpu;
-    if (cpu && cpu->cc && cpu->cc->get_pc) {
-        pc = cpu->cc->get_pc(cpu);
-    }
-    if (off + size <= 16 * MiB) {
-        memcpy(&value, flash + off, size);
-    }
-    if (factory_trace_ap_only(pc)) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "BES factory_data XIP read: offset=0x%06x size=%u pc=0x%08x\n",
-                      (unsigned)off, size, (unsigned)pc);
-    }
-    return value;
-}
-
-static void factory_window_write(void *opaque, hwaddr addr, uint64_t value,
-                                 unsigned size)
-{
-    Best1503State *s = opaque;
-    hwaddr off = 0xcc0000 + addr;
-    uint8_t *flash = memory_region_get_ram_ptr(&s->flash);
-    target_ulong pc = 0;
-    CPUState *cpu = current_cpu;
-    if (cpu && cpu->cc && cpu->cc->get_pc) {
-        pc = cpu->cc->get_pc(cpu);
-    }
-    if (off + size <= 16 * MiB) {
-        memcpy(flash + off, &value, size);
-    }
-    if (factory_trace_ap_only(pc) || 1) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "BES factory_data XIP write: offset=0x%06x size=%u "
-                      "value=0x%0*llx pc=0x%08x\n",
-                      (unsigned)off, size, size * 2, (unsigned long long)value,
-                      (unsigned)pc);
-    }
-}
-
-static const MemoryRegionOps factory_window_ops = {
-    .read = factory_window_read,
-    .write = factory_window_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .impl = {.min_access_size = 1, .max_access_size = 4},
-};
-
-static void map_factory_windows(Best1503State *s)
-{
-    static const hwaddr bases[] = {0x2c000000, 0x28000000, 0x0c000000,
-                                   0x08000000};
-    for (unsigned i = 0; i < 4; i++) {
-        g_autofree char *name = g_strdup_printf("bes.factory-data.trace%u", i);
-        memory_region_init_io(&s->factory_window[i], OBJECT(s),
-                              &factory_window_ops, s, name, 0x340000);
-        memory_region_add_subregion_overlap(get_system_memory(),
-                                            bases[i] + 0xcc0000,
-                                            &s->factory_window[i], 1);
-    }
-}
-
 static void map_ram(Best1503State *s, MemoryRegion *mr, const char *name,
                     hwaddr base, uint64_t size)
 {
@@ -4714,6 +4640,49 @@ static void map_alias(Best1503State *s, MemoryRegion *mr, const char *name,
     memory_region_init_alias(mr, OBJECT(s), name, target, 0,
                              memory_region_size(target));
     memory_region_add_subregion(get_system_memory(), base, mr);
+}
+
+/* P65 3.100.031 AP: 0x74-byte NOR descriptors at file 0x1b1d90.
+ * audio descriptor +0x68/+0x6c = 0x6800/0x1800; the registration path
+ * checks 512-byte blocks and 8 KiB erase units (0x0c50fee4/0x0c50feee).
+ * Store the original BES image, including its segment header. The AP loader
+ * owns relocation to CP RAM; this does not execute an audio CPU. */
+static bool p65_install_audio(uint8_t *flash, size_t flash_bytes,
+                              const uint8_t *audio, size_t audio_bytes,
+                              const char **error)
+{
+    const size_t offset = 0xd00000, capacity = 3 * MiB;
+    if (!flash || flash_bytes != 16 * MiB || !audio ||
+        audio_bytes < 0x128 || audio_bytes > capacity ||
+        ldl_le_p(audio) != 0xbe57ec1c) {
+        *error = "P65 audio requires an original BES image within its 3 MiB NOR partition";
+        return false;
+    }
+    bool erased = true, identical = true;
+    for (size_t i = 0; i < capacity; i++) {
+        uint8_t expected = i < audio_bytes ? audio[i] : 0xff;
+        erased &= flash[offset + i] == 0xff;
+        identical &= flash[offset + i] == expected;
+    }
+    /* NOR restoration precedes this initialization. Never replace a different
+     * non-erased persisted image with a newly selected external image. */
+    if (!erased && !identical) {
+        *error = "P65 audio conflicts with existing non-erased NOR audio data";
+        return false;
+    }
+    if (erased) {
+        memcpy(flash + offset, audio, audio_bytes);
+    }
+    return true;
+}
+
+static bool p65_resource_image_valid(const uint8_t *data, size_t bytes)
+{
+    /* AP file 0x2e4c80: resource pages 0..0x1b800; nand_data begins
+     * at 0x1b800 and spans 0x24800 pages, using 2048-byte NAND pages.
+     * The alternate 4096-byte table encodes the same 220/292 MiB split. */
+    return data && bytes >= 16 && bytes <= 220 * MiB &&
+           !memcmp(data, "-rom1fs-", 8);
 }
 
 static void sensor_map_image(Best1503State *s)
@@ -5018,10 +4987,10 @@ static void best1503_init(MachineState *machine)
             nor_store_failure(&s->nor[0], "NOR writeback requires nor-image, nor-writeback and no factory-image");
         }
         /* The isolated P65 core has one fixed catalog geometry: AP at
-         * 0xc0000, NV tail at 0xcc0000, factory data at 0xfe0000, no
-         * separate config extent. */
+         * 0xc0000, factory_data at 0xcc0000 (256 KiB), and audio at
+         * 0xd00000 (3 MiB). The compact tail has no config extent. */
         if (!bes_nor_layout_init(&nor_layout, 16 * MiB, 0xc0000, 0xcc0000,
-                                 0xfe0000, 0, 0)) {
+                                 0xcc0000, 0, 0)) {
             nor_store_failure(&s->nor[0], "NOR writeback requires an exact catalog geometry");
         }
     }
@@ -5042,31 +5011,13 @@ static void best1503_init(MachineState *machine)
         g_autofree char *contents = NULL;
         gsize length;
         if (!g_file_get_contents(s->resource_image, &contents, &length, NULL) ||
-            length < 16 || length > 512 * MiB || memcmp(contents, "-rom1fs-", 8)) {
+            !p65_resource_image_valid((const uint8_t *)contents, length)) {
             error_report("Invalid ROMFS resource image: %s", s->resource_image);
             exit(1);
         }
         s->nor[1].nand_data = g_malloc(512 * MiB);
         memset(s->nor[1].nand_data, 0xff, 512 * MiB);
-        if (length > 235 * MiB) { error_report("Resource exceeds NAND partition"); exit(1); }
-        /* Q65 AP partition table at file 0x2edf1c: resource pages
-         * 0..0x1d600, audio_img pages 0x1d600..0x1e000.  NAND data
-         * starts at 0x1e000 (240 MiB), verified by the guest page reads. */
         memcpy(s->nor[1].nand_data, contents, length);
-        if (s->audio_image) {
-            g_autofree char *audio = NULL;
-            gsize audio_length;
-            if (!g_file_get_contents(s->audio_image, &audio, &audio_length, NULL) ||
-                audio_length < 16 || audio_length > 5 * MiB ||
-                memcmp(audio, "-rom1fs-", 8)) {
-                error_report("Invalid ROMFS audio image: %s", s->audio_image);
-                exit(1);
-            }
-            memcpy(s->nor[1].nand_data + 235 * MiB, audio, audio_length);
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "BES audio ROMFS loaded: offset=0x0eb00000 size=%zu\n",
-                          audio_length);
-        }
         s->nor[1].nand_spare = g_malloc(16 * MiB);
         memset(s->nor[1].nand_spare, 0xff, 16 * MiB);
         memory_region_init_io(&s->nand_cache, OBJECT(s), &nand_cache_ops, &s->nor[1],
@@ -5162,28 +5113,28 @@ static void best1503_init(MachineState *machine)
                       bes_nor_layout_bytes(&nor_layout));
     }
     if (s->factory_image) {
-        g_autofree char *contents = NULL;
-        gsize length;
-        /* Q65 table at AP file 0x249398: /dev/misc starts at sector
-         * 0x7f00 and spans 0x100 x 512-byte sectors.  The property loader
-         * reads /misc/factory.prop.  /dev/nv at 0xfc0000 is a separate
-         * 64 KiB partition and must not receive the 128 KiB misc image. */
-        if (!g_file_get_contents(s->factory_image, &contents, &length, NULL) ||
-            length != 128 * KiB) {
-            error_report("factory-image must be a 128 KiB Q65 misc LittleFS partition");
-            exit(1);
-        }
-        memcpy((uint8_t *)memory_region_get_ram_ptr(&s->flash) + 0xfe0000,
-               contents, length);
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "BES factory storage loaded: offset=0x00fe0000 size=%zu\n",
-                      length);
+        error_report("P65 factory-image payload format is unverified; Q65 LittleFS images are incompatible");
+        exit(1);
     }
     s->nor[0].backing = &s->flash;
+    if (s->audio_image) {
+        g_autofree char *audio = NULL;
+        gsize audio_length;
+        const char *reason = "P65 audio image could not be read";
+        if (!g_file_get_contents(s->audio_image, &audio, &audio_length, NULL) ||
+            !p65_install_audio(memory_region_get_ram_ptr(&s->flash),
+                               memory_region_size(&s->flash),
+                               (const uint8_t *)audio, audio_length, &reason)) {
+            error_report("%s: %s", reason, s->audio_image);
+            exit(1);
+        }
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "BES P65 audio storage loaded: NOR0 offset=0x00d00000 size=%zu (CP execution not modeled)\n",
+                      audio_length);
+    }
     map_alias(s, &s->flash_exec, "bes.flash.exec", &s->flash, 0x0c000000);
     map_alias(s, &s->flash_nc, "bes.flash.nc", &s->flash, 0x28000000);
     map_alias(s, &s->flash_nc_exec, "bes.flash.nc.exec", &s->flash, 0x08000000);
-    map_factory_windows(s);
     map_ram(s, &s->sram, "bes.sram", 0x20000000, 0x1a0000);
     map_alias(s, &s->sram_exec, "bes.sram.exec", &s->sram, 0x00200000);
     sensor_map_image(s);
@@ -5643,66 +5594,17 @@ static bool best1503_get_power_adc_fixture(Object *obj, Error **errp)
 
 static void best1503_set_power_adc_fixture(Object *obj, bool value, Error **errp)
 {
-    ((Best1503State *)obj)->power_adc_fixture = value;
-}
-
-static void best1503_apply_adc_ntc(Best1503State *s)
-{
-    qemu_mutex_lock(&s->adc_lock);
-    for (unsigned i = 0; i < BES_ADC_CHANNELS; i++) {
-        if (s->adc_ntc_channels & (1u << i)) {
-            s->adc_input.values[i] = s->adc_ntc_room;
-        }
-    }
-    qemu_mutex_unlock(&s->adc_lock);
-}
-
-static void best1503_get_adc_ntc(Object *obj, Visitor *v, const char *name,
-                                 void *opaque, Error **errp)
-{
-    uint32_t value = ((Best1503State *)obj)->adc_ntc_channels;
-    visit_type_uint32(v, name, &value, errp);
-}
-
-static void best1503_set_adc_ntc(Object *obj, Visitor *v, const char *name,
-                                 void *opaque, Error **errp)
-{
     Best1503State *s = (Best1503State *)obj;
-    uint32_t value;
-    if (!visit_type_uint32(v, name, &value, errp)) {
-        return;
+    if (s->power_adc_fixture != value) {
+        /* With the fixture off the analog register file is guest writable.
+         * Do not attribute those words to an earlier host conversion when
+         * enabled again. Already queued RX words retain their own version. */
+        memset(s->ispi.adc_sample_valid, 0, sizeof(s->ispi.adc_sample_valid));
     }
-    if (value >> BES_ADC_CHANNELS) {
-        error_setg(errp, "pmu-adc-ntc is a mask of channels 0..7");
-        return;
-    }
-    s->adc_ntc_channels = value;
-    best1503_apply_adc_ntc(s);
+    s->power_adc_fixture = value;
 }
 
-static void best1503_get_adc_ntc_room(Object *obj, Visitor *v, const char *name,
-                                      void *opaque, Error **errp)
-{
-    uint32_t value = ((Best1503State *)obj)->adc_ntc_room;
-    visit_type_uint32(v, name, &value, errp);
-}
-
-static void best1503_set_adc_ntc_room(Object *obj, Visitor *v, const char *name,
-                                      void *opaque, Error **errp)
-{
-    Best1503State *s = (Best1503State *)obj;
-    uint32_t value;
-    if (!visit_type_uint32(v, name, &value, errp)) {
-        return;
-    }
-    if (value > 0xffff) {
-        error_setg(errp, "pmu-adc-ntc-room is a raw ADC word 0..65535");
-        return;
-    }
-    s->adc_ntc_room = value;
-    best1503_apply_adc_ntc(s);
-}
-
+/* Raw vector and actual ISPI FIFO-dequeue observations only. */
 static void best1503_set_adc_raw(Object *obj, const char *value, Error **errp)
 {
     Best1503State *s = (Best1503State *)obj;
@@ -5730,6 +5632,8 @@ static char *best1503_get_adc_state(Object *obj, Error **errp)
     qemu_mutex_lock(&s->adc_lock);
     snapshot = s->adc_input;
     qemu_mutex_unlock(&s->adc_lock);
+    /* Fixed eight-element arrays: bounded response, no host-controlled size.
+     * The version marks vector replacement, not a guest calibration epoch. */
     GString *result = g_string_new(NULL);
     g_string_append_printf(result,
         "{\"schema\":1,\"fixtureEnabled\":%s,\"version\":%" PRIu64,
@@ -5749,6 +5653,77 @@ static char *best1503_get_adc_state(Object *obj, Error **errp)
     }
     g_string_append(result, "]}");
     return g_string_free(result, false);
+}
+
+static bool best1503_apply_adc_ntc(Best1503State *s, uint32_t channels,
+                                  uint32_t room)
+{
+    uint16_t next[BES_ADC_CHANNELS];
+    qemu_mutex_lock(&s->adc_lock);
+    memcpy(next, s->adc_input.values, sizeof(next));
+    for (unsigned i = 0; i < BES_ADC_CHANNELS; i++) {
+        if (channels & (1u << i)) {
+            next[i] = room;
+        }
+    }
+    /* NTC configuration changes the same raw input vector as pmu.adcRaw.
+     * Preserve latched conversion versions and reject all changes on overflow. */
+    bool applied = !memcmp(next, s->adc_input.values, sizeof(next)) ||
+                   bes_adc_replace(&s->adc_input, next);
+    if (applied) {
+        s->adc_ntc_channels = channels;
+        s->adc_ntc_room = room;
+    }
+    qemu_mutex_unlock(&s->adc_lock);
+    return applied;
+}
+
+static void best1503_get_adc_ntc(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    uint32_t value = ((Best1503State *)obj)->adc_ntc_channels;
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void best1503_set_adc_ntc(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    uint32_t value;
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value >> BES_ADC_CHANNELS) {
+        error_setg(errp, "pmu-adc-ntc is a mask of channels 0..7");
+        return;
+    }
+    if (!best1503_apply_adc_ntc(s, value, s->adc_ntc_room)) {
+        error_setg(errp, "pmu-adc-ntc input version exhausted");
+    }
+}
+
+static void best1503_get_adc_ntc_room(Object *obj, Visitor *v, const char *name,
+                                      void *opaque, Error **errp)
+{
+    uint32_t value = ((Best1503State *)obj)->adc_ntc_room;
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void best1503_set_adc_ntc_room(Object *obj, Visitor *v, const char *name,
+                                      void *opaque, Error **errp)
+{
+    Best1503State *s = (Best1503State *)obj;
+    uint32_t value;
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value > 0xffff) {
+        error_setg(errp, "pmu-adc-ntc-room is a raw ADC word 0..65535");
+        return;
+    }
+    if (!best1503_apply_adc_ntc(s, s->adc_ntc_channels, value)) {
+        error_setg(errp, "pmu-adc-ntc-room input version exhausted");
+    }
 }
 
 static char *best1503_get_battery_charger(Object *obj, Error **errp)
@@ -5952,9 +5927,7 @@ static void best1503_set_sensor_image(Object *obj, const char *value, Error **er
 
 static void best1503_set_factory_image(Object *obj, const char *value, Error **errp)
 {
-    Best1503State *s = (Best1503State *)obj;
-    g_free(s->factory_image);
-    s->factory_image = g_strdup(value);
+    error_setg(errp, "P65 factory-image payload format is unverified; Q65 LittleFS images are incompatible");
 }
 
 static void best1503_set_bt_hci_chardev(Object *obj, const char *value, Error **errp)
@@ -5993,6 +5966,7 @@ static void best1503_finalize(Object *obj)
     g_free(l->argb_pixels);
     l->argb_pixels = NULL;
     g_free(l->frame_file);
+    qemu_mutex_destroy(&s->adc_lock);
 }
 
 static void best1503_instance_init(Object *obj)
@@ -6026,18 +6000,28 @@ static void best1503_class_init(ObjectClass *oc, const void *data)
                                   best1503_set_resource_image);
     object_class_property_add_str(oc, "audio-image", best1503_get_audio_image,
                                   best1503_set_audio_image);
+    object_class_property_set_description(oc, "audio-image",
+        "Original BES audio image in P65 NOR0 at 0xd00000; storage only, no audio CPU");
     object_class_property_add_str(oc, "sensor-image", best1503_get_sensor_image,
                                   best1503_set_sensor_image);
     object_class_property_set_description(oc, "sensor-image",
         "Original sensor-hub BES image, executed by an independently reset Cortex-M33");
     object_class_property_add_str(oc, "factory-image", best1503_get_factory_image,
                                   best1503_set_factory_image);
+    object_class_property_set_description(oc, "factory-image",
+        "Unsupported: P65 factory_data payload format has not been verified");
     object_class_property_add_str(oc, "nor-image", best1503_get_nor_image,
                                   best1503_set_nor_image);
     object_class_property_add_bool(oc, "nor-writeback", best1503_get_nor_writeback,
                                    best1503_set_nor_writeback);
     object_class_property_set_description(oc, "nor-writeback",
         "Persist exclusive private compact catalog NOR; caller owns rollback transaction");
+    object_class_property_add_str(oc, "pmu-adc-raw", NULL, best1503_set_adc_raw);
+    object_class_property_set_description(oc, "pmu-adc-raw",
+        "Eight raw input words; P65 conversion model samples only channels 2, 3, 5, 6");
+    object_class_property_add_str(oc, "pmu-adc-state", best1503_get_adc_state, NULL);
+    object_class_property_set_description(oc, "pmu-adc-state",
+        "Raw vector version and actual guest ISPI FIFO dequeue counters; no physical calibration");
     object_class_property_add_bool(oc, "touch", best1503_get_touch, best1503_set_touch);
     object_class_property_add_bool(oc, "bt-hci-reject-fixture",
         best1503_get_bt_hci_reject_fixture, best1503_set_bt_hci_reject_fixture);
@@ -6046,11 +6030,7 @@ static void best1503_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "power-adc-fixture",
         best1503_get_power_adc_fixture, best1503_set_power_adc_fixture);
     object_class_property_set_description(oc, "power-adc-fixture",
-        "Adjustable raw ADC inputs for enabled P65 PMU channels 0..7");
-    object_class_property_add_str(oc, "pmu-adc-raw", NULL, best1503_set_adc_raw);
-    object_class_property_set_description(oc, "pmu-adc-raw",
-        "Atomically replace eight raw ADC words; dedicated runner input only");
-    object_class_property_add_str(oc, "pmu-adc-state", best1503_get_adc_state, NULL);
+        "Adjustable raw ADC inputs for modeled P65 PMU channels 2, 3, 5, 6");
     object_class_property_add(oc, "pmu-adc-ntc", "uint32",
         best1503_get_adc_ntc, best1503_set_adc_ntc, NULL, NULL);
     object_class_property_set_description(oc, "pmu-adc-ntc",

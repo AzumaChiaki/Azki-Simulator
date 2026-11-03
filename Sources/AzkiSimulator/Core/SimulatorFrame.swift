@@ -46,7 +46,12 @@ nonisolated enum SimulatorError: LocalizedError, Equatable, Sendable {
     }
 }
 
-/// Wire format: <8s6I, followed by height rows of little-endian RGB565.
+nonisolated enum SimulatorFramePixelFormat: UInt32, Sendable {
+    case rgb565 = 1, rgb888 = 2
+    var bytesPerPixel: Int { self == .rgb565 ? 2 : 3 }
+}
+
+/// Wire format: <8s6I, followed by packed LE RGB565 (1) or R,G,B RGB888 (2).
 /// An odd sequence means the producer is writing. The reader also compares the
 /// header before/after copying; an even value alone is not a complete seqlock.
 nonisolated struct SimulatorFrameHeader: Equatable, Sendable {
@@ -56,6 +61,7 @@ nonisolated struct SimulatorFrameHeader: Equatable, Sendable {
     let width: Int
     let height: Int
     let stride: Int
+    let pixelFormat: SimulatorFramePixelFormat
 
     var byteCount: Int { Self.byteCount + stride * height }
 
@@ -66,16 +72,18 @@ nonisolated struct SimulatorFrameHeader: Equatable, Sendable {
         func word(_ offset: Int) -> UInt32 {
             (0..<4).reduce(UInt32(0)) { $0 | UInt32(data[data.startIndex + offset + $1]) << ($1 * 8) }
         }
-        guard word(8) == 1, word(28) == 1 else { throw SimulatorError.invalidFrame("版本或像素格式不受支持") }
+        guard word(8) == 1, let pixelFormat = SimulatorFramePixelFormat(rawValue: word(28)) else {
+            throw SimulatorError.invalidFrame("版本或像素格式不受支持")
+        }
         let sequence = word(12)
         guard sequence != 0, sequence & 1 == 0 else { throw SimulatorError.frameBeingWritten }
         let width = Int(word(16)), height = Int(word(20)), stride = Int(word(24))
         guard (1...2_048).contains(width), (1...2_048).contains(height),
-              stride >= width * 2, stride <= 8_192, stride.isMultiple(of: 2),
+              stride == width * pixelFormat.bytesPerPixel,
               stride * height <= maximumBytes - byteCount else {
             throw SimulatorError.invalidFrame("尺寸、行宽或长度超限")
         }
-        return Self(sequence: sequence, width: width, height: height, stride: stride)
+        return Self(sequence: sequence, width: width, height: height, stride: stride, pixelFormat: pixelFormat)
     }
 }
 
@@ -95,7 +103,7 @@ nonisolated struct SimulatorFrame: Sendable {
         if let expectedSize {
             guard let geometry = SimulatorDisplayGeometry(size: expectedSize),
                   header.width == geometry.width, header.height == geometry.height,
-                  header.stride == geometry.width * 2 else {
+                  header.stride == geometry.width * header.pixelFormat.bytesPerPixel else {
                 throw SimulatorError.invalidFrame("画面尺寸或行宽与已验证会话不一致")
             }
         }
@@ -108,6 +116,9 @@ nonisolated struct SimulatorFrame: Sendable {
                 var destination = vImage_Buffer(data: outputBytes.baseAddress!,
                     height: vImagePixelCount(header.height), width: vImagePixelCount(header.width), rowBytes: header.width * 4)
                 let flags = vImage_Flags(kvImageDoNotTile)
+                if header.pixelFormat == .rgb888 {
+                    return vImageConvert_RGB888toRGBA8888(&source, nil, 255, &destination, false, flags)
+                }
                 let converted = vImageConvert_RGB565toRGBA8888(255, &source, &destination, flags)
                 guard converted == kvImageNoError else { return converted }
                 // Table order follows RGBA bytes, not the function's ARGB name.

@@ -68,22 +68,36 @@ def _state(value):
 
 
 def _response(payload, request):
-    result = _decode(payload)
-    if type(result) is not dict or set(result) != {"return"}:
-        raise MError("adc_rejected", "Runner did not return an ADC acknowledgement")
-    value = result["return"]
     write = request["command"] == "pmu.adcRaw.set"
+    try:
+        result = _decode(payload)
+    except (ValueError, TypeError) as error:
+        if write:
+            raise MError("adc_outcome_unknown", "ADC acknowledgement is malformed; do not automatically retry") from error
+        raise
+    if type(result) is dict and set(result) == {"error"} and type(result["error"]) is str:
+        if result["error"].startswith("input_outcome_unknown:"):
+            raise MError("adc_outcome_unknown", "ADC write may have been applied; do not automatically retry")
+        raise MError("adc_rejected", result["error"][:300])
+    if type(result) is not dict or set(result) != {"return"}:
+        raise MError("adc_outcome_unknown" if write else "adc_protocol", "Runner did not return an ADC acknowledgement")
+    value = result["return"]
     if type(value) is not dict or value.get("accepted") is not write or value.get("guestObserved") is not False:
-        raise MError("adc_protocol", "Runner ADC acknowledgement is invalid")
+        raise MError("adc_outcome_unknown" if write else "adc_protocol", "Runner ADC acknowledgement is invalid")
     if set(value) == {"accepted", "guestObserved", "stateUnavailable"}:
         if not write or value["stateUnavailable"] is not True:
-            raise MError("adc_protocol", "Only an acknowledged write can lack a state snapshot")
+            raise MError("adc_outcome_unknown" if write else "adc_protocol", "Only an acknowledged write can lack a state snapshot")
         return value
     if set(value) != {"accepted", "guestObserved", "state"}:
-        raise MError("adc_protocol", "Runner ADC acknowledgement has unexpected fields")
-    _state(value["state"])
-    if write and value["state"]["values"] != request["values"]:
-        raise MError("adc_protocol", "Returned ADC values differ from the acknowledged write")
+        raise MError("adc_outcome_unknown" if write else "adc_protocol", "Runner ADC acknowledgement has unexpected fields")
+    try:
+        _state(value["state"])
+        if write and value["state"]["values"] != request["values"]:
+            raise MError("adc_protocol", "Returned ADC values differ from the acknowledged write")
+    except MError:
+        if write:
+            return {"accepted": True, "guestObserved": False, "stateUnavailable": True}
+        raise
     return value
 
 
@@ -101,7 +115,10 @@ def _request(adapter, arguments, *, write):
         raise MError("unsupported_hardware", "This exact core does not declare pmu.adcRaw support")
     try:
         result = _response(runner_exchange(adapter, request, write=write, deadline=deadline), request)
-        _remaining(deadline)
+        # A completed write acknowledgement remains authoritative even if its
+        # validation crosses the deadline. Never erase it with a timeout.
+        if not write:
+            _remaining(deadline)
         return result
     except MError as error:
         renamed = {"runner_outcome_unknown": ("adc_outcome_unknown", "ADC write may have been applied; state is unconfirmed. Do not automatically retry."),

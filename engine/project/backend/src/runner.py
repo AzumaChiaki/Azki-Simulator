@@ -59,6 +59,16 @@ DEBUG_FLAGS = WATCH_FLAGS + ('gpu_no_render', 'gpu_completion_fixture', 'gh3x2x_
                              'gh3x2x_reg0724', 'revision_id')
 
 
+def firmware_provenance(original_sha256, boot_sha256, *, skip_binding_applied):
+    """Describe the bytes actually booted, separately from the preserved input."""
+    if any(type(value) is not str or re.fullmatch('[0-9a-f]{64}', value) is None
+           for value in (original_sha256, boot_sha256)) or type(skip_binding_applied) is not bool:
+        raise ValueError('Firmware provenance requires exact input and boot SHA-256 digests')
+    return {'firmware_modified': original_sha256 != boot_sha256,
+            'firmware_sha256': boot_sha256, 'original_input_sha256': original_sha256,
+            'boot_ap_sha256': boot_sha256, 'skip_binding_applied': skip_binding_applied}
+
+
 def validate_virtual_guest_identity(state, board, firmware_sha256, qemu_sha256):
     """Match the synthetic identity to the explicitly selected board profile.
 
@@ -69,7 +79,37 @@ def validate_virtual_guest_identity(state, board, firmware_sha256, qemu_sha256):
         raise ValueError('Virtual mode requires matching exact state/board profiles')
 
 
-def initialize_startup_nor(storage, virtual_state, *, skip_oobe, property_file):
+def validate_p65_geometry(board):
+    """The isolated core's fixed map must match all caller storage metadata.
+
+    Older compact files have the same byte count but a different factory
+    descriptor; they must not be silently reinterpreted or migrated.
+    """
+    geometry = board.get('geometry', {})
+    nor = board.get('nor_geometry', {})
+    expected = {'ap-offset':0xc0000, 'flash-bytes':0x1000000,
+                'nv-offset':0xcc0000, 'factory-offset':0xcc0000,
+                'nand-data-offset':220*1024**2, 'nand-data-bytes':292*1024**2}
+    expected_nor = {'apOffset':0xc0000, 'flashBytes':0x1000000,
+                    'offset':0xcc0000, 'bytes':0x340000, 'factoryOffset':0xcc0000}
+    if (board.get('machine') != 'azki-p65' or board.get('factory_bytes') != 256*1024
+            or any(geometry.get(k) != v for k,v in expected.items())
+            or any(nor.get(k) != v for k,v in expected_nor.items())
+            or any(geometry.get(k,0) != 0 for k in ('config-offset','config-bytes'))
+            or any(nor.get(k,0) != 0 for k in ('configOffset','configBytes'))):
+        raise ValueError('P65 requires the verified 0xcc0000/256 KiB factory layout; old layouts are not migrated')
+
+
+def validate_factory_input(machine, path):
+    if path is None:
+        return
+    if machine == 'azki-p65':
+        raise ValueError('P65 factory-image payload format is unverified; Q65 LittleFS images are incompatible')
+    if not path.is_file() or path.stat().st_size != 128 * 1024:
+        raise ValueError('--factory-image requires a 128 KiB Q66 LittleFS partition')
+
+
+def initialize_startup_nor(storage, virtual_state, *, skip_oobe, property_file, machine=None):
     """Initialize new storage only; changing the preference never resets a device.
 
     Synthetic manufacturing identity is independent from setup completion and
@@ -77,6 +117,12 @@ def initialize_startup_nor(storage, virtual_state, *, skip_oobe, property_file):
     """
     if storage is None or not storage['norInitialize']:
         return False
+    if machine == 'azki-p65':
+        if virtual_state is not None:
+            raise ValueError('P65 factory seed format is unverified; no synthetic payload may be written')
+        # P65 local setup uses a separately identified AP boot copy. Its raw
+        # factory_data remains erased until original firmware authors it.
+        return True
     if virtual_state is not None:
         from .virtual_peer.state import factory_image, config_image
         factory_seed = factory_image(virtual_state, skip_oobe=skip_oobe)
@@ -341,7 +387,8 @@ def main():
     args = parser.parse_args()
     virtual_state = virtual_peer = None
     firmware_bytes = args.firmware.read_bytes() if args.board_profile or args.bluetooth == 'virtual' else None
-    firmware_sha256 = None  # No startup AP content scan; profile geometry is checked below.
+    firmware_sha256 = None  # Startup geometry validation does not require a content allowlist.
+    original_input_sha256 = hashlib.sha256(firmware_bytes).hexdigest() if firmware_bytes is not None else None
     virtual_requested = any((args.virtual_peer_state,args.virtual_peer_state_sha256,args.virtual_peer_output))
     if args.bluetooth == 'virtual':
         if not all((args.virtual_peer_state,args.virtual_peer_state_sha256,args.virtual_peer_output)) or args.factory_image or args.trace or args.tap or args.serve is not None:
@@ -352,6 +399,7 @@ def main():
             parser.error('Virtual mode requires an exact AP-bound board profile')
     elif virtual_requested:
         parser.error('Private peer state is only accepted in virtual mode')
+    board = {}
     geometry = {}
     property_file = 'factory.prop'
     if args.board_profile:
@@ -370,6 +418,11 @@ def main():
         if board.get('chip') not in ('best1503', 'best1502p') or not allowed <= set(geometry) or set(geometry)-allowed-optional or any(
                 type(v) is not int or not 0 <= v <= 0xffffffff for v in geometry.values()):
             parser.error('Unsupported board profile or invalid memory geometry')
+        if board.get('machine') == 'azki-p65':
+            try:
+                validate_p65_geometry(board)
+            except ValueError as error:
+                parser.error(str(error))
         if virtual_state is not None:
             try:
                 validate_virtual_guest_identity(virtual_state, board, firmware_sha256,
@@ -437,13 +490,14 @@ def main():
         parser.error('--bluetooth hci requires an existing --hci-socket from hci_bridge.py')
     if args.hci_socket and args.bluetooth != 'hci':
         parser.error('--hci-socket requires --bluetooth hci')
-    if args.factory_image is None and args.bluetooth == 'hci':
+    if args.factory_image is None and args.bluetooth == 'hci' and board.get('machine') != 'azki-p65':
         configured_factory = here / 'device/hci-factory.bin'
         if configured_factory.is_file():
             args.factory_image = configured_factory
-    if args.factory_image and (not args.factory_image.is_file() or
-                               args.factory_image.stat().st_size != 128 * 1024):
-        parser.error('--factory-image requires a 128 KiB Q66 LittleFS partition')
+    try:
+        validate_factory_input(board.get('machine'), args.factory_image)
+    except ValueError as error:
+        parser.error(str(error))
     if (args.tap or args.serve is not None or args.window or args.python_window) and not args.touch:
         parser.error('--tap/--serve/--window/--python-window require the watch profile or a custom touch model')
     if args.touch and not args.lcd_frame_capture:
@@ -501,6 +555,11 @@ def main():
         parser.error(f'QEMU executable missing: {args.qemu}')
     if not args.firmware.is_file():
         parser.error(f'Firmware missing: {args.firmware}')
+    if original_input_sha256 is None:
+        with args.firmware.open('rb') as original_stream:
+            original_input_sha256 = hashlib.file_digest(original_stream, 'sha256').hexdigest()
+    boot_ap_sha256 = original_input_sha256
+    skip_binding_applied = False
     if args.resource and not args.resource.is_file():
         parser.error(f'Resource image missing: {args.resource}')
     if args.audio_image and not args.audio_image.is_file():
@@ -518,7 +577,7 @@ def main():
         parser.error('Virtual mode requires a private NOR transaction')
     if virtual_state is not None and args.virtual_peer_output != logdir/'virtual-peer-state.pending.json':
         parser.error('Virtual peer output must be in this private run')
-    if args.skip_binding and instance_nor is None:
+    if args.skip_binding and instance_nor is None and board.get('machine') != 'azki-p65':
         from .factory import local_desktop_image
         desktop_factory = logdir / 'desktop-factory.bin'
         if factory_source and factory_source.resolve() == desktop_factory:
@@ -547,7 +606,10 @@ def main():
             from .virtual_peer.state import boot_properties
             guest_properties = boot_properties(virtual_state)
         try:
-            image = local_boot_image(args.firmware.read_bytes(), guest_properties)
+            original_image = args.firmware.read_bytes()
+            if hashlib.sha256(original_image).hexdigest() != original_input_sha256:
+                raise ValueError('Original firmware changed while preparing the local boot copy')
+            image = local_boot_image(original_image, guest_properties)
         except (OSError, ValueError, RuntimeError) as error:
             # Require a structurally valid P65 watch ROMFS; never fall back to
             # an unmodified OOBE image or another model's firmware.
@@ -556,11 +618,14 @@ def main():
             boot_firmware.chmod(0o600)
             stream.write(image)
         args.firmware = boot_firmware
+        boot_ap_sha256 = hashlib.sha256(image).hexdigest()
+        skip_binding_applied = True
         print('P65 local OOBE properties prepared in /etc/build.prop (boot copy; original firmware unchanged).', flush=True)
     if instance_nor is not None and instance_nor['norInitialize']:
         try:
             initialize_startup_nor(instance_nor, virtual_state,
-                                   skip_oobe=args.skip_oobe, property_file=property_file)
+                                   skip_oobe=args.skip_oobe, property_file=property_file,
+                                   machine=board.get('machine'))
         except (OSError, ValueError, RuntimeError) as error:
             parser.error('NOR instance initialization failed: ' + str(error))
         print('First-run setup: ' + ('skip OOBE.' if args.skip_oobe else 'firmware OOBE; no local binding injected.'), flush=True)
@@ -750,17 +815,18 @@ def main():
                             raise RuntimeError('GDB server port could not be determined')
                         print(f"GDB server: target remote 127.0.0.1:{gdb_endpoint['port']}"
                               + ('; CPU held at reset until the debugger continues.' if args.gdb_wait else ''), flush=True)
-                    # Publish ADC only after the running core proves its schema.
-                    # P65 and generic BEST1503 share the narrow ADC/live ABI;
-                    # Q65 uses a separate runner and never reaches this record.
+                    # An isolated P65 core exposes ADC only after the strict
+                    # QOM schema probe succeeds. The parent's exact manifest
+                    # must separately authorize that machine/core ABI.
                     control_record = dict(
                         qmp=str(qmp_path), framebuffer=str(frame_file), pid=proc.pid,
                         input_socket=str(input_socket) if has_input else None)
-                    control_record['hardware_inputs'] = {'pmu.adcRaw': {
-                        'supported': adc_raw, 'schema': 1, 'channels': 8,
-                        'minimum': 0, 'maximum': 65535,
-                        'unit': 'uncalibrated-raw',
-                        'readEvidence': 'guest-ispi-fifo-dequeue'}}
+                    if not isolated_p65 or adc_raw:
+                        control_record['hardware_inputs'] = {'pmu.adcRaw': {
+                            'supported': adc_raw, 'schema': 1, 'channels': 8,
+                            'minimum': 0, 'maximum': 65535,
+                            'unit': 'uncalibrated-raw',
+                            'readEvidence': 'guest-ispi-fifo-dequeue'}}
                     if virtual_peer is not None:
                         control_record['virtual_peer'] = virtual_peer.descriptor()
                     if gdb_endpoint is not None:
@@ -1274,8 +1340,8 @@ def main():
               'display_power_mode_response_count': sum(p['source'] == 'panel-dcs-state' for p in panel_packets),
               'display_command_capture_count': sum(p['direction'] == 'write' for p in panel_packets),
               'machine': 'best1503 partial boot peripheral model',
-              'firmware_modified': False,
-              'firmware_sha256': firmware_sha256,
+              **firmware_provenance(original_input_sha256, boot_ap_sha256,
+                                    skip_binding_applied=skip_binding_applied),
               'hash_verification': 'not-required-for-startup',
               'board_geometry': geometry,
               'boot_rom': 'synthetic reset vectors: SP=0x%08x, PC=0x%08x' % (

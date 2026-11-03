@@ -241,7 +241,7 @@ class WatchControl:
         with self.frame_geometry_lock:
             return self._shared_frame_geometry()
 
-    def _shared_frame_geometry(self):
+    def _open_shared_frame(self):
         path = self.frame_file
         if (not path.is_absolute() or '..' in path.parts or
                 path.parent != self.log_directory or path.name != 'lcd-frame.raw'):
@@ -267,36 +267,55 @@ class WatchControl:
             identity = (info.st_dev, info.st_ino, info.st_size)
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or
                     stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1 or
-                    not 32 <= info.st_size <= 32 + 1024 * 1024 * 2 or
+                    not 32 <= info.st_size <= 32 + 1024 * 1024 * 3 or
                     (self.frame_geometry_identity is not None and
                      identity != self.frame_geometry_identity)):
                 raise RuntimeError('Unsafe or replaced QEMU LCD frame file')
+            return fd, info
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @staticmethod
+    def _frame_header(header, info):
+        if len(header) != 32:
+            raise RuntimeError('Waiting for the first QEMU LCD frame')
+        magic, version, sequence, width, height, stride, pixel_format = struct.unpack('<8s6I', header)
+        pixel_bytes = {1: 2, 2: 3}.get(pixel_format)
+        if magic != b'Q66FRAME' or version != 1 or pixel_bytes is None:
+            raise RuntimeError('Unsupported QEMU LCD frame format')
+        # RGB565 cores retain a fixed 1024x1024 mmap allocation; Q65 RGB888
+        # and session frame.raw snapshots are compact. Reject arbitrary tails.
+        capacities = (32 + stride * height, 32 + 1024 * 1024 * pixel_bytes)
+        if not (1 <= width <= 1024 and 1 <= height <= 1024 and
+                stride == width * pixel_bytes and info.st_size in capacities):
+            raise RuntimeError('Invalid QEMU LCD frame dimensions or capacity')
+        if sequence == 0:
+            raise RuntimeError('Waiting for the first QEMU LCD frame')
+        return sequence, width, height, stride, pixel_format
+
+    def _verify_shared_frame_identity(self, fd, info):
+        identity = (info.st_dev, info.st_ino, info.st_size)
+        after = os.fstat(fd)
+        named = os.stat(self.frame_file, follow_symlinks=False)
+        if any((value.st_dev, value.st_ino, value.st_size) != identity or
+               not stat.S_ISREG(value.st_mode) or value.st_nlink != 1 or
+               value.st_uid != os.getuid() or stat.S_IMODE(value.st_mode) != 0o600
+               for value in (after, named)):
+            raise RuntimeError('QEMU LCD frame file changed while reading')
+        self.frame_geometry_identity = identity
+
+    def _shared_frame_geometry(self):
+        fd, info = self._open_shared_frame()
+        try:
             for _ in range(3):
                 header = os.pread(fd, 32, 0)
-                if len(header) != 32:
-                    raise RuntimeError('Waiting for the first QEMU LCD frame')
-                magic, version, sequence, width, height, stride, pixel_format = struct.unpack(
-                    '<8s6I', header)
-                if magic != b'Q66FRAME' or version != 1 or pixel_format != 1:
-                    raise RuntimeError('Unsupported QEMU LCD frame format')
-                if sequence == 0:
-                    raise RuntimeError('Waiting for the first QEMU LCD frame')
+                sequence, width, height, _, _ = self._frame_header(header, info)
                 if sequence & 1:
                     continue
-                if not (1 <= width <= 1024 and 1 <= height <= 1024 and
-                        width * 2 <= stride <= 2048 and stride % 2 == 0 and
-                        32 + stride * height <= info.st_size):
-                    raise RuntimeError('Invalid QEMU LCD frame dimensions or capacity')
                 if os.pread(fd, 32, 0) != header:
                     continue
-                after = os.fstat(fd)
-                named = os.stat(path, follow_symlinks=False)
-                if any((value.st_dev, value.st_ino, value.st_size) != identity or
-                       not stat.S_ISREG(value.st_mode) or value.st_nlink != 1 or
-                       value.st_uid != os.getuid() or stat.S_IMODE(value.st_mode) != 0o600
-                       for value in (after, named)):
-                    raise RuntimeError('QEMU LCD frame file changed while reading')
-                self.frame_geometry_identity = identity
+                self._verify_shared_frame_identity(fd, info)
                 return width, height
             raise RuntimeError('Waiting for a complete QEMU LCD frame header')
         finally:
@@ -344,9 +363,7 @@ class WatchControl:
             if not getattr(self, 'adc_raw_available', False):
                 raise RuntimeError('unsupported_hardware_input: pmu.adcRaw')
             if values is not None:
-                self.qmp.execute('qom-set', {
-                    'path': '/machine', 'property': 'pmu-adc-raw',
-                    'value': ','.join(map(str, values))})
+                self._write_input('pmu-adc-raw', ','.join(map(str, values)))
             try:
                 state = self._adc_raw_state()
             except (OSError, RuntimeError, ValueError, TypeError):
@@ -377,11 +394,15 @@ class WatchControl:
         if set(data) == {'command'} and data['command'] == 'health.get':
             return self.health()
         if set(data) == {'command', 'value'} and data['command'] == 'health.set':
+            if type(data['value']) is not dict:
+                raise ValueError('health.set value must be a nonempty object')
             return self.health(data['value'])
         if set(data) == {'command', 'steps'} and data['command'] == 'health.walk':
             return self.walk(data['steps'])
         if set(data) == {'command', 'value'} and data['command'] == 'motion.orientation.set':
             return self.orientation(data['value'], write=True)
+        if set(data) == {'command', 'value'} and data['command'] == 'motion.raw.set':
+            return self.motion_raw(data['value'], write=True)
         if set(data) == {'command'} and data['command'] == 'live.get':
             return self.live()
         if set(data) == {'command', 'value'} and data['command'] == 'charger.set':
@@ -430,14 +451,29 @@ class WatchControl:
                 raise ValueError('health.walk would exceed 10000000 steps since boot')
             return self.health({'walkSteps': target})
 
+    def _write_input(self, property_name, value):
+        """A correlated QMP rejection is known; a lost write reply is uncertain."""
+        try:
+            self.qmp.execute('qom-set', {'path': '/machine', 'property': property_name, 'value': value})
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise RuntimeError('input_outcome_unknown: do not automatically retry') from error
+
+    def _live_write_receipt(self):
+        """Never discard an acknowledged write because a later snapshot failed."""
+        try:
+            state = self.live()
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return {'accepted': True, 'guestObserved': False, 'stateUnavailable': True}
+        return {'accepted': True, 'guestObserved': False, 'state': state}
+
     def charger(self, value):
         """Plug/unplug the modeled charger now; the firmware's own charger
         driver sees the PMU plug edge and charger chip status."""
         if value not in ('unplugged', 'charging', 'full'):
             raise ValueError('charger.set value must be unplugged, charging or full')
         with self.lock:
-            self.qmp.execute('qom-set', {'path': '/machine', 'property': 'battery-charger', 'value': value})
-            return self.live()
+            self._write_input('battery-charger', value)
+            return self._live_write_receipt()
 
     def adc_channels(self, channels):
         """Replace selected raw ADC words, keeping the others (live input)."""
@@ -452,8 +488,10 @@ class WatchControl:
             values = list(self._adc_raw_state()['values'])
             for key, value in channels.items():
                 values[int(key)] = value
-            self.adc_raw(values)
-            return self.live()
+            receipt = self.adc_raw(values)
+            if receipt.get('stateUnavailable'):
+                return receipt
+            return self._live_write_receipt()
 
     def live(self):
         """One snapshot of every live input this session drives."""
@@ -462,15 +500,64 @@ class WatchControl:
                 health = self.health()
             except RuntimeError:
                 health = None
-            charger = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'battery-charger'})
+            try:
+                charger = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'battery-charger'})
+            except RuntimeError:
+                charger = None
+            if charger is not None and charger not in ('unplugged', 'charging', 'full'):
+                raise ValueError('Invalid charger readback')
             adc = self._adc_raw_state()['values'] if getattr(self, 'adc_raw_available', False) else None
             try:
                 orientation = self.orientation()
             except RuntimeError:
                 orientation = None
-            return {'health': health, 'charger': charger if charger in ('unplugged', 'charging', 'full') else None,
+            try:
+                motion_raw = self.motion_raw()
+            except RuntimeError:
+                motion_raw = None
+            try:
+                sensor_observation = self.sensor_observation()
+            except RuntimeError:
+                sensor_observation = None
+            return {'health': health, 'charger': charger,
                     'adc': adc, 'batteryChannel': self.battery_channel, 'ntcChannels': self.ntc_channels,
-                    'orientation': orientation}
+                    'orientation': orientation, 'motionRaw': motion_raw,
+                    'sensorObservation': sensor_observation}
+
+    def sensor_observation(self):
+        """Bounded sensor-port evidence; never evidence of firmware algorithm use."""
+        encoded = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'sensor-observation'})
+        if type(encoded) is not str or len(encoded) > 2048:
+            raise ValueError('Invalid sensor observation response')
+        def unique_pairs(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError('Duplicate sensor observation field')
+                result[key] = value
+            return result
+        state = json.loads(encoded, object_pairs_hook=unique_pairs)
+        self._validate_sensor_observation(state)
+        return state
+
+    @staticmethod
+    def _validate_sensor_observation(state):
+        if (type(state) is not dict or set(state) != {
+                'schema', 'scope', 'guestObserved', 'inputVersion', 'mode', 'imu', 'accel', 'gyro'} or
+                type(state['schema']) is not int or state['schema'] != 1 or
+                state['scope'] != 'sensor-bus' or state['guestObserved'] is not False or
+                type(state['inputVersion']) is not int or not 0 <= state['inputVersion'] <= 2**64 - 1 or
+                state['mode'] not in ('raw', 'auto') or state['imu'] not in ('lsm6dso', 'icm42607', 'none')):
+            raise ValueError('Invalid sensor observation schema')
+        for kind in ('accel', 'gyro'):
+            sample = state[kind]
+            if (type(sample) is not dict or set(sample) != {'sampleValid', 'generatedVersion', 'registerReads',
+                    'registerVersion', 'fifoReads', 'fifoVersion'} or type(sample['sampleValid']) is not bool):
+                raise ValueError('Invalid sensor observation sample')
+            for key in ('generatedVersion', 'registerReads', 'registerVersion', 'fifoReads', 'fifoVersion'):
+                maximum = 2**64 - 1 if key.endswith('Reads') else state['inputVersion']
+                if type(sample[key]) is not int or not 0 <= sample[key] <= maximum:
+                    raise ValueError('Invalid sensor observation counter')
 
     def orientation(self, value=None, *, write=False):
         """Read or atomically set the modeled IMU's held body pose, not Lua data.
@@ -516,11 +603,86 @@ class WatchControl:
             return {'mode': 'auto', 'rollDegrees': None, 'pitchDegrees': None}
         if type(current) is not str or len(current) > 128:
             raise RuntimeError('Invalid orientation readback')
-        fields = dict(item.split('=', 1) for item in current.split(';'))
+        pairs = [item.split('=', 1) for item in current.split(';')]
+        fields = dict(pairs)
         roll, pitch = float(fields['roll']), float(fields['pitch'])
-        if set(fields) != {'roll', 'pitch'} or not all(math.isfinite(v) and -180 <= v <= 180 for v in (roll, pitch)):
+        if len(pairs) != 2 or set(fields) != {'roll', 'pitch'} or not all(math.isfinite(v) and -180 <= v <= 180 for v in (roll, pitch)):
             raise RuntimeError('Invalid orientation readback')
         return {'mode': 'held', 'rollDegrees': roll, 'pitchDegrees': pitch}
+
+    @staticmethod
+    def _validate_motion_raw(value):
+        if type(value) is not dict:
+            raise ValueError('motionRaw requires an auto or raw object')
+        if value == {'mode': 'auto'}:
+            return
+        if (set(value) != {'mode', 'accel', 'gyro'} or value['mode'] != 'raw' or
+                any(type(value[k]) is not list or len(value[k]) != 3 or
+                    any(type(v) is not int or not -32768 <= v <= 32767 for v in value[k])
+                    for k in ('accel', 'gyro'))):
+            raise ValueError('motionRaw requires mode raw with three signed16 accel and gyro counts')
+
+    @classmethod
+    def _motion_raw_state(cls, current):
+        if current == 'auto':
+            return {'mode': 'auto'}
+        if type(current) is not str or len(current) > 128:
+            raise ValueError('Invalid motion raw readback')
+        pairs = [item.split('=', 1) for item in current.split(';')]
+        fields = dict(pairs)
+        if len(pairs) != 6 or set(fields) != {'ax', 'ay', 'az', 'gx', 'gy', 'gz'}:
+            raise ValueError('Invalid motion raw readback fields')
+        if any(not token.isascii() or not token.removeprefix('-').isdigit() for token in fields.values()):
+            raise ValueError('Invalid motion raw count')
+        state = {'mode': 'raw', 'accel': [int(fields[k]) for k in ('ax', 'ay', 'az')],
+                 'gyro': [int(fields[k]) for k in ('gx', 'gy', 'gz')]}
+        cls._validate_motion_raw(state)
+        return state
+
+    def motion_raw(self, value=None, *, write=False):
+        """Six native signed16 IMU output counts, or auto pose/gait samples."""
+        if write:
+            self._validate_motion_raw(value)
+        with self.lock:
+            try:
+                current = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'motion-raw'})
+            except RuntimeError as error:
+                raise RuntimeError('unsupported_hardware_input: motionRaw') from error
+            if current == 'unsupported':
+                raise RuntimeError('unsupported_hardware_input: motionRaw')
+            self._motion_raw_state(current)
+            if write:
+                encoded = 'auto' if value['mode'] == 'auto' else ';'.join(
+                    '%s=%d' % item for item in zip(('ax', 'ay', 'az', 'gx', 'gy', 'gz'), value['accel'] + value['gyro']))
+                self._write_input('motion-raw', encoded)
+            try:
+                if write:
+                    current = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'motion-raw'})
+                state = self._motion_raw_state(current)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                if write:
+                    return {'accepted': True, 'guestObserved': False, 'stateUnavailable': True}
+                raise
+            return {'accepted': True, 'guestObserved': False, 'state': state} if write else state
+
+    @staticmethod
+    def _health_state(encoded):
+        if type(encoded) is not str or len(encoded) > 256:
+            raise ValueError('Invalid health readback')
+        pairs = [item.split('=', 1) for item in encoded.split(';')]
+        fields = dict(pairs)
+        limits = {'walk': (0, 10000000), 'cadence': (40, 200), 'heart-rate': (0, 255),
+                  'worn': (0, 1), 'walked': (0, 10000000)}
+        if len(pairs) != len(limits) or set(fields) != set(limits):
+            raise ValueError('Invalid health readback fields')
+        numbers = {}
+        for key, (low, high) in limits.items():
+            token = fields[key]
+            if not token.isascii() or not token.isdigit() or not low <= int(token) <= high:
+                raise ValueError('Invalid health readback ' + key)
+            numbers[key] = int(token)
+        return {'walkSteps': numbers['walk'], 'cadence': numbers['cadence'],
+                'heartRate': numbers['heart-rate'], 'worn': bool(numbers['worn']), 'walked': numbers['walked']}
 
     def health(self, value=None):
         """Live health input of the session's modeled sensors.
@@ -534,8 +696,9 @@ class WatchControl:
                   'heartRate': ('heart-rate', 0, 255), 'worn': None}
         with self.lock:
             state = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'health-fixture'})
-            if not isinstance(state, str) or state == 'off':
+            if state == 'off':
                 raise RuntimeError('unsupported_hardware_input: health')
+            parsed = self._health_state(state)
             if value is not None:
                 if type(value) is not dict or not value or set(value) - set(limits):
                     raise ValueError('health.set requires walkSteps, cadence, heartRate or worn')
@@ -550,47 +713,40 @@ class WatchControl:
                     if type(item) is not int or not low <= item <= high:
                         raise ValueError('health.%s must be an integer in %d..%d' % (key, low, high))
                     fields.append('%s=%d' % (name, item))
-                self.qmp.execute('qom-set', {'path': '/machine', 'property': 'health-fixture',
-                                             'value': ';'.join(fields)})
-                state = self.qmp.execute('qom-get', {'path': '/machine', 'property': 'health-fixture'})
-            parsed = dict(item.split('=', 1) for item in state.split(';') if '=' in item)
-            return {'walkSteps': int(parsed.get('walk', 0)), 'cadence': int(parsed.get('cadence', 0)),
-                    'heartRate': int(parsed.get('heart-rate', 0)), 'worn': parsed.get('worn', '1') == '1',
-                    'walked': int(parsed.get('walked', 0))}
+                self._write_input('health-fixture', ';'.join(fields))
+                return self._live_write_receipt()
+            return parsed
 
     def _shared_frame(self):
         """Read the LCD snapshot published by QEMU, independent of QMP/Web."""
         from PIL import Image
         for _ in range(3):
-            with self.frame_file.open('rb', buffering=0) as stream:
-                header = stream.read(32)
-                if len(header) != 32:
-                    raise RuntimeError('Waiting for the first QEMU LCD frame')
-                magic, version, sequence, width, height, stride, pixel_format = struct.unpack(
-                    '<8s6I', header)
-                if magic != b'Q66FRAME' or version != 1 or pixel_format != 1:
-                    raise RuntimeError('Unsupported QEMU LCD frame format')
-                if sequence == 0:
-                    raise RuntimeError('Waiting for the first QEMU LCD frame')
+            fd, info = self._open_shared_frame()
+            try:
+                header = os.pread(fd, 32, 0)
+                sequence, width, height, stride, pixel_format = self._frame_header(header, info)
                 if sequence & 1:
                     continue
-                if not (1 <= width <= 1024 and 1 <= height <= 1024 and
-                        width * 2 <= stride <= 1024 * 2):
-                    raise RuntimeError('Invalid QEMU LCD frame dimensions')
                 if sequence == self.frame_sequence:
+                    if os.pread(fd, 32, 0) != header:
+                        continue
+                    self._verify_shared_frame_identity(fd, info)
                     return self.frame_picture
-                pixels = stream.read(stride * height)
-                stream.seek(0)
-                after = stream.read(32)
+                pixels = os.pread(fd, stride * height, 32)
+                after = os.pread(fd, 32, 0)
+                self._verify_shared_frame_identity(fd, info)
+            finally:
+                os.close(fd)
             # Odd sequences mark an in-progress write.  Do not expose torn
             # frames when the next transfer starts during this file read.
             if after != header or len(pixels) != stride * height:
                 continue
             picture = Image.frombytes('RGB', (width, height), pixels,
-                                      'raw', 'BGR;16', stride, 1)
+                                      'raw', 'BGR;16' if pixel_format == 1 else 'RGB', stride, 1)
             # BGR;16 is Pillow's name for the little-endian RGB565 layout.
             # Its RGB output already has R/G/B in the correct order.
-            picture = picture.point(RGB565_LEFT_ALIGNED)
+            if pixel_format == 1:
+                picture = picture.point(RGB565_LEFT_ALIGNED)
             self.frame_sequence = sequence
             self.frame_picture = picture
             self.frame_png = None

@@ -19,6 +19,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <errno.h>
+#include <inttypes.h>
 
 typedef enum {
     BES_IMU_NONE = 0,
@@ -70,6 +72,19 @@ typedef struct {
     uint8_t mreg[4][256];
     uint8_t bfifo[2048];
     unsigned bfifo_head, bfifo_count;
+    /* Host observation only; never guest-visible register state. Bus reads
+     * prove transfer at the sensor port, not CPU/DMA RX consumption. */
+    uint64_t generated_version[2];       /* accel, gyro */
+    bool sample_valid[2];
+    uint8_t reg_read_mask[2];
+    uint64_t reg_bus_reads[2], reg_bus_version[2];
+    uint64_t fifo_bus_reads[2], fifo_bus_version[2];
+    uint64_t fifo_version[BES_IMU_FIFO_WORDS];
+    uint8_t fifo_read_mask;
+    uint64_t bfifo_version[128], bfifo_sequence[128];
+    uint8_t bfifo_components[128];
+    uint64_t bfifo_read_sequence;
+    uint16_t bfifo_read_mask;
 } BesImu;
 
 typedef enum {
@@ -126,9 +141,110 @@ struct BesSensorHub {
     /* Optional host-held body pose; default false preserves the gait model. */
     bool orientation_enabled;
     double roll_degrees, pitch_degrees;
+    /* Explicit chip-native signed 16-bit counts, after mount/scale. */
+    bool raw_motion_enabled;
+    int16_t raw_accel[3], raw_gyro[3];
+    uint64_t motion_version;
 };
 
 /* ---- motion model ------------------------------------------------------ */
+
+/* Version identifies the host raw-input selection. It does not assert that
+ * the guest enabled an ODR, clocked the bus or consumed a sample. */
+static inline bool bes_motion_raw_set(BesSensorHub *h, const char *value)
+{
+    if (!value || h->motion_version == UINT64_MAX) {
+        return false;
+    }
+    bool automatic = !strcmp(value, "auto");
+    int16_t values[6] = {0};
+    const char *keys[] = {"ax=", "ay=", "az=", "gx=", "gy=", "gz="};
+    const char *p = value;
+    if (!automatic) {
+        for (unsigned i = 0; i < 6; i++) {
+            if (strncmp(p, keys[i], 3)) { return false; }
+            p += 3;
+            /* Decimal only, no whitespace, + sign or empty fields. */
+            const char *digits = p + (*p == '-');
+            if (*digits < '0' || *digits > '9') { return false; }
+            errno = 0;
+            char *end;
+            long n = strtol(p, &end, 10);
+            if (errno || n < INT16_MIN || n > INT16_MAX ||
+                (i < 5 ? *end != ';' : *end != '\0')) {
+                return false;
+            }
+            values[i] = n;
+            p = end + (i < 5);
+        }
+    }
+    memcpy(h->raw_accel, values, sizeof(h->raw_accel));
+    memcpy(h->raw_gyro, values + 3, sizeof(h->raw_gyro));
+    h->raw_motion_enabled = !automatic;
+    h->motion_version++;
+    return true;
+}
+
+static inline void bes_imu_clear_pending(BesImu *m)
+{
+    memset(m->sample_valid, 0, sizeof(m->sample_valid));
+    memset(m->reg_read_mask, 0, sizeof(m->reg_read_mask));
+    m->fifo_read_mask = 0;
+    m->bfifo_read_mask = 0;
+}
+
+static inline void bes_imu_register_read(BesImu *m, unsigned component, unsigned byte)
+{
+    if (!m->sample_valid[component]) { return; }
+    uint8_t prior = m->reg_read_mask[component];
+    m->reg_read_mask[component] |= 1u << byte;
+    if (prior != 0x3f && m->reg_read_mask[component] == 0x3f) {
+        if (m->reg_bus_reads[component] != UINT64_MAX) {
+            m->reg_bus_reads[component]++;
+        }
+        m->reg_bus_version[component] = m->generated_version[component];
+    }
+}
+
+static inline void bes_imu_fifo_read(BesImu *m, unsigned component, uint64_t version)
+{
+    if (m->fifo_bus_reads[component] != UINT64_MAX) {
+        m->fifo_bus_reads[component]++;
+    }
+    m->fifo_bus_version[component] = version;
+}
+
+static inline char *bes_motion_raw_describe(const BesSensorHub *h)
+{
+    if (h->imu.kind == BES_IMU_NONE) { return g_strdup("unsupported"); }
+    if (!h->raw_motion_enabled) { return g_strdup("auto"); }
+    return g_strdup_printf("ax=%d;ay=%d;az=%d;gx=%d;gy=%d;gz=%d",
+        h->raw_accel[0], h->raw_accel[1], h->raw_accel[2],
+        h->raw_gyro[0], h->raw_gyro[1], h->raw_gyro[2]);
+}
+
+static inline char *bes_sensor_observation(const BesSensorHub *h)
+{
+    const BesImu *m = &h->imu;
+    GString *out = g_string_new(NULL);
+    g_string_append_printf(out,
+        "{\"schema\":1,\"scope\":\"sensor-bus\",\"guestObserved\":false,"
+        "\"inputVersion\":%" PRIu64 ",\"mode\":\"%s\",\"imu\":\"%s\"",
+        h->motion_version, h->raw_motion_enabled ? "raw" : "auto",
+        m->kind == BES_IMU_LSM6DSO ? "lsm6dso" :
+        m->kind == BES_IMU_ICM42607 ? "icm42607" : "none");
+    for (unsigned i = 0; i < 2; i++) {
+        g_string_append_printf(out,
+            ",\"%s\":{\"sampleValid\":%s,\"generatedVersion\":%" PRIu64
+            ",\"registerReads\":%" PRIu64 ",\"registerVersion\":%" PRIu64
+            ",\"fifoReads\":%" PRIu64 ",\"fifoVersion\":%" PRIu64 "}",
+            i ? "gyro" : "accel", m->sample_valid[i] ? "true" : "false",
+            m->generated_version[i], m->reg_bus_reads[i], m->reg_bus_version[i],
+            m->fifo_bus_reads[i], m->fifo_bus_version[i]);
+    }
+    g_string_append_c(out, '}');
+    return g_string_free(out, false);
+}
 
 /* Fixed, atomic property grammar. It never accepts chip/register addresses.
  * All angles are degrees in the band's body frame, before the board mount.
@@ -284,6 +400,7 @@ static inline double lsm_odr_hz(unsigned code)
 
 static inline void lsm_reset(BesImu *m)
 {
+    bes_imu_clear_pending(m);
     memset(m->regs, 0, sizeof(m->regs));
     memset(m->bank, 0, sizeof(m->bank));
     m->regs[LSM_WHO_AM_I] = 0x6c;
@@ -335,8 +452,11 @@ static inline void lsm_fifo_push(BesImu *m, uint8_t tag, const int16_t v[3])
         m->fifo_head = (m->fifo_head + 1) % BES_IMU_FIFO_WORDS;
         m->fifo_count--;
         m->fifo_read_pos = 0;
+        m->fifo_read_mask = 0;
     }
-    uint8_t *w = m->fifo[(m->fifo_head + m->fifo_count) % BES_IMU_FIFO_WORDS];
+    unsigned slot = (m->fifo_head + m->fifo_count) % BES_IMU_FIFO_WORDS;
+    uint8_t *w = m->fifo[slot];
+    m->fifo_version[slot] = m->generated_version[tag == 0x02 ? 0 : 1];
     uint8_t t = (tag << 3) | ((m->tag_counter & 3) << 1);
     t |= __builtin_parity(t);
     w[0] = t;
@@ -374,11 +494,13 @@ static inline uint8_t lsm_read(BesSensorHub *h, uint8_t reg)
     case 0x21: return 0x00;
     case 0x22 ... 0x27: {
         int16_t v = m->gyro_raw[(reg - 0x22) / 2];
+        bes_imu_register_read(m, 1, reg - 0x22);
         if (reg == 0x27) { m->gy_ready = false; }
         return reg & 1 ? (uint16_t)v >> 8 : v & 0xff;
     }
     case 0x28 ... 0x2d: {
         int16_t v = m->accel_raw[(reg - 0x28) / 2];
+        bes_imu_register_read(m, 0, reg - 0x28);
         if (reg == 0x2d) { m->xl_ready = false; }
         return reg & 1 ? (uint16_t)v >> 8 : v & 0xff;
     }
@@ -400,7 +522,13 @@ static inline uint8_t lsm_read(BesSensorHub *h, uint8_t reg)
             return 0;
         }
         uint8_t v = m->fifo[m->fifo_head][reg - LSM_FIFO_TAG];
+        m->fifo_read_mask |= 1u << (reg - LSM_FIFO_TAG);
         if (reg == LSM_FIFO_TAG + 6) {
+            unsigned tag = m->fifo[m->fifo_head][0] >> 3;
+            if (m->fifo_read_mask == 0x7f && (tag == 1 || tag == 2)) {
+                bes_imu_fifo_read(m, tag == 2 ? 0 : 1, m->fifo_version[m->fifo_head]);
+            }
+            m->fifo_read_mask = 0;
             m->fifo_head = (m->fifo_head + 1) % BES_IMU_FIFO_WORDS;
             m->fifo_count--;
             m->fifo_overrun = false;
@@ -437,6 +565,7 @@ static inline void lsm_write(BesSensorHub *h, uint8_t reg, uint8_t value)
         if (!(value & 7)) {                /* bypass mode empties the FIFO */
             m->fifo_head = m->fifo_count = 0;
             m->fifo_overrun = false;
+            m->fifo_read_mask = 0;
         }
         break;
     case LSM_TIMESTAMP0 + 2:               /* TIMESTAMP2 0xAA resets the counter */
@@ -461,6 +590,8 @@ static inline void lsm_update(BesSensorHub *h)
     double xl = lsm_odr_hz(m->regs[LSM_CTRL1_XL] >> 4);
     double gy = lsm_odr_hz(m->regs[LSM_CTRL2_G] >> 4);
     double rate = xl > gy ? xl : gy;
+    if (xl <= 0) { m->sample_valid[0] = false; m->reg_read_mask[0] = 0; }
+    if (gy <= 0) { m->sample_valid[1] = false; m->reg_read_mask[1] = 0; }
     if (rate <= 0) {
         m->next_sample_ns = 0;
         return;
@@ -477,14 +608,20 @@ static inline void lsm_update(BesSensorHub *h)
     double bdr_gy = lsm_odr_hz(m->regs[LSM_FIFO_CTRL3] >> 4);
     while (m->next_sample_ns <= now) {
         double a[3], g[3];
-        bes_motion_sample(h, 1.0 / rate, a, g);
-        bes_mount(m, a);
-        bes_mount(m, g);
+        if (!h->raw_motion_enabled) {
+            bes_motion_sample(h, 1.0 / rate, a, g);
+            bes_mount(m, a);
+            bes_mount(m, g);
+        }
         m->samples++;
         unsigned n = (unsigned)m->samples;
         if (xl > 0) {
+            m->generated_version[0] = h->motion_version;
+            m->sample_valid[0] = true;
+            m->reg_read_mask[0] = 0;
             for (int i = 0; i < 3; i++) {
-                m->accel_raw[i] = bes_sat16(a[i] * lsm_accel_lsb_per_g(m));
+                m->accel_raw[i] = h->raw_motion_enabled ? h->raw_accel[i] :
+                    bes_sat16(a[i] * lsm_accel_lsb_per_g(m));
             }
             m->xl_ready = true;
             if (bdr_xl > 0 && (n % (unsigned)fmax(1, lrint(rate / bdr_xl))) == 0) {
@@ -492,8 +629,12 @@ static inline void lsm_update(BesSensorHub *h)
             }
         }
         if (gy > 0) {
+            m->generated_version[1] = h->motion_version;
+            m->sample_valid[1] = true;
+            m->reg_read_mask[1] = 0;
             for (int i = 0; i < 3; i++) {
-                m->gyro_raw[i] = bes_sat16(g[i] * lsm_gyro_lsb_per_dps(m));
+                m->gyro_raw[i] = h->raw_motion_enabled ? h->raw_gyro[i] :
+                    bes_sat16(g[i] * lsm_gyro_lsb_per_dps(m));
             }
             m->gy_ready = true;
             if (bdr_gy > 0 && (n % (unsigned)fmax(1, lrint(rate / bdr_gy))) == 0) {
@@ -535,6 +676,7 @@ static inline double icm_odr_hz(unsigned code)
 
 static inline void icm_reset(BesImu *m)
 {
+    bes_imu_clear_pending(m);
     memset(m->regs, 0, sizeof(m->regs));
     memset(m->mreg, 0, sizeof(m->mreg));
     m->regs[0x00] = 0x08;                 /* MCLK_RDY */
@@ -619,6 +761,8 @@ static inline void icm_update(BesSensorHub *h)
     double xl = icm_accel_on(m) ? icm_odr_hz(m->regs[ICM_ACCEL_CONFIG0]) : 0;
     double gy = icm_gyro_on(m) ? icm_odr_hz(m->regs[ICM_GYRO_CONFIG0]) : 0;
     double rate = xl > gy ? xl : gy;
+    if (xl <= 0) { m->sample_valid[0] = false; m->reg_read_mask[0] = 0; }
+    if (gy <= 0) { m->sample_valid[1] = false; m->reg_read_mask[1] = 0; }
     if (rate <= 0) {
         m->next_sample_ns = 0;
         return;
@@ -634,15 +778,27 @@ static inline void icm_update(BesSensorHub *h)
     static const double dps_lsb[4] = {16.4, 32.8, 65.5, 131};
     while (m->next_sample_ns <= now) {
         double a[3], g[3];
-        bes_motion_sample(h, 1.0 / rate, a, g);
-        bes_mount(m, a);
-        bes_mount(m, g);
+        if (!h->raw_motion_enabled) {
+            bes_motion_sample(h, 1.0 / rate, a, g);
+            bes_mount(m, a);
+            bes_mount(m, g);
+        }
         m->samples++;
         double ga = g_lsb[(m->regs[ICM_ACCEL_CONFIG0] >> 5) & 3];
         double gg = dps_lsb[(m->regs[ICM_GYRO_CONFIG0] >> 5) & 3];
+        m->sample_valid[0] = xl > 0;
+        m->sample_valid[1] = gy > 0;
+        for (unsigned component = 0; component < 2; component++) {
+            if (m->sample_valid[component]) {
+                m->generated_version[component] = h->motion_version;
+            }
+            m->reg_read_mask[component] = 0;
+        }
         for (int i = 0; i < 3; i++) {
-            m->accel_raw[i] = xl > 0 ? bes_sat16(a[i] * ga) : 0;
-            m->gyro_raw[i] = gy > 0 ? bes_sat16(g[i] * gg) : 0;
+            m->accel_raw[i] = xl > 0 ? (h->raw_motion_enabled ? h->raw_accel[i] :
+                bes_sat16(a[i] * ga)) : 0;
+            m->gyro_raw[i] = gy > 0 ? (h->raw_motion_enabled ? h->raw_gyro[i] :
+                bes_sat16(g[i] * gg)) : 0;
         }
         m->xl_ready = true;
         m->regs[ICM_INT_STATUS_DRDY] |= 1;
@@ -653,6 +809,15 @@ static inline void icm_update(BesSensorHub *h)
                 m->regs[ICM_INT_STATUS] |= 0x02;      /* stop-on-full */
             } else {
                 uint16_t ts = (uint16_t)(now / 16000);
+                /* Every producer record starts at a 16-byte ring boundary.
+                 * Keep identity separate from data: an overflow or a partial
+                 * read must not turn 16 unrelated bytes into one observation. */
+                unsigned slot = ((m->bfifo_head + m->bfifo_count) %
+                                 sizeof(m->bfifo)) / 16;
+                m->bfifo_version[slot] = h->motion_version;
+                m->bfifo_sequence[slot] = m->samples;
+                m->bfifo_components[slot] = (fa && xl > 0 ? 1 : 0) |
+                                             (fg && gy > 0 ? 2 : 0);
                 /* Always the 16-byte accel+gyro record: the driver advances
                  * by the header's fields and reads 16 bytes per record, so a
                  * disabled sensor's words are sent as zero. */
@@ -689,6 +854,7 @@ static inline uint8_t icm_read(BesSensorHub *h, uint8_t reg)
     case 0x0a: return 0;
     case 0x0b ... 0x16: {
         unsigned i = (reg - 0x0b) / 2;
+        bes_imu_register_read(m, i < 3 ? 0 : 1, (reg - 0x0b) % 6);
         int16_t v = i < 3 ? m->accel_raw[i] : m->gyro_raw[i - 3];
         bool first = !((reg - 0x0b) & 1), big = m->regs[ICM_INTF_CONFIG0] & 0x10;
         return first == big ? (uint16_t)v >> 8 : v & 0xff;
@@ -716,7 +882,21 @@ static inline uint8_t icm_read(BesSensorHub *h, uint8_t reg)
             return 0xff;
         }
         {
-            uint8_t v = m->bfifo[m->bfifo_head];
+            unsigned index = m->bfifo_head, slot = index / 16, byte = index % 16;
+            uint8_t v = m->bfifo[index];
+            if (!byte || m->bfifo_read_sequence != m->bfifo_sequence[slot]) {
+                m->bfifo_read_sequence = m->bfifo_sequence[slot];
+                m->bfifo_read_mask = 0;
+            }
+            m->bfifo_read_mask |= 1u << byte;
+            if (byte == 15 && m->bfifo_read_mask == 0xffff) {
+                for (unsigned component = 0; component < 2; component++) {
+                    if (m->bfifo_components[slot] & (1u << component)) {
+                        bes_imu_fifo_read(m, component, m->bfifo_version[slot]);
+                    }
+                }
+                m->bfifo_read_mask = 0;
+            }
             m->bfifo_head = (m->bfifo_head + 1) % sizeof(m->bfifo);
             m->bfifo_count--;
             return v;
@@ -746,6 +926,7 @@ static inline void icm_write(BesSensorHub *h, uint8_t reg, uint8_t value)
         }
         if (value & 0x04) {
             m->bfifo_head = m->bfifo_count = 0;
+            m->bfifo_read_mask = 0;
             m->regs[ICM_INT_STATUS] = 0;
         }
         return;
@@ -761,6 +942,7 @@ static inline void icm_write(BesSensorHub *h, uint8_t reg, uint8_t value)
     m->regs[reg] = value;
     if (reg == ICM_FIFO_CONFIG1 && (value & 1)) {
         m->bfifo_head = m->bfifo_count = 0;
+        m->bfifo_read_mask = 0;
     }
     if (reg == ICM_PWR_MGMT0 || reg == ICM_ACCEL_CONFIG0 || reg == ICM_GYRO_CONFIG0) {
         m->next_sample_ns = 0;
@@ -1377,6 +1559,10 @@ static inline void bes_sensors_reset(BesSensorHub *h)
     h->walk_phase = 0;
     h->step_rate = h->step_gain = 1;
     h->noise = 0x1503;
+    memset(h->imu.reg_bus_reads, 0, sizeof(h->imu.reg_bus_reads));
+    memset(h->imu.reg_bus_version, 0, sizeof(h->imu.reg_bus_version));
+    memset(h->imu.fifo_bus_reads, 0, sizeof(h->imu.fifo_bus_reads));
+    memset(h->imu.fifo_bus_version, 0, sizeof(h->imu.fifo_bus_version));
 }
 
 /* Idle interrupt levels after a board reset. */
@@ -1413,12 +1599,14 @@ static inline bool bes_parse_mount(const char *a, int8_t mount[3])
 static inline bool bes_parse_port(gchar **f, BesSensorPort *port)
 {
     char *end;
+    errno = 0;
     long a = strtol(f[3], &end, 0);
-    if (*end) {
+    if (errno || end == f[3] || *end || g_ascii_isspace(f[3][0])) {
         return false;
     }
+    errno = 0;
     long irq = strtol(f[4], &end, 0);
-    if (*end || irq < -1 || irq >= 96) {
+    if (errno || end == f[4] || *end || g_ascii_isspace(f[4][0]) || irq < -1 || irq >= 96) {
         return false;
     }
     port->irq_pin = irq;
@@ -1428,7 +1616,11 @@ static inline bool bes_parse_port(gchar **f, BesSensorPort *port)
         return a >= 0 && a < 96;
     }
     if (!strncmp(f[2], "i2c", 3)) {
+        errno = 0;
         long c = strtol(f[2] + 3, &end, 0);
+        if (errno || end == f[2] + 3 || g_ascii_isspace(f[2][3])) {
+            return false;
+        }
         port->bus = BES_BUS_I2C;
         port->i2c_controller = c;
         port->i2c_address = a;
@@ -1454,6 +1646,11 @@ static inline bool bes_sensors_configure(BesSensorHub *h, const char *spec, char
         if (n != 5 && n != 6) {
             ok = false;
         } else if (!strcmp(f[0], "imu")) {
+            if (imu.kind) {
+                ok = false;
+                g_strfreev(f);
+                break;
+            }
             imu.kind = !strcmp(f[1], "lsm6dso") ? BES_IMU_LSM6DSO :
                        !strcmp(f[1], "icm42607") ? BES_IMU_ICM42607 : BES_IMU_NONE;
             ok = imu.kind && bes_parse_port(f, &imu.port);
@@ -1461,6 +1658,11 @@ static inline bool bes_sensors_configure(BesSensorHub *h, const char *spec, char
                 ok = bes_parse_mount(f[5], imu.mount);
             }
         } else if (!strcmp(f[0], "ppg")) {
+            if (ppg.kind) {
+                ok = false;
+                g_strfreev(f);
+                break;
+            }
             ppg.kind = !strcmp(f[1], "hx3695") ? BES_PPG_HX3695 :
                        !strcmp(f[1], "hx3697") ? BES_PPG_HX3697 : BES_PPG_NONE;
             ok = ppg.kind && bes_parse_port(f, &ppg.port);
@@ -1468,8 +1670,10 @@ static inline bool bes_sensors_configure(BesSensorHub *h, const char *spec, char
                 /* Tick clock the board's driver programs the sample period
                  * against (Band 9: 30400 Hz, Band 10 Pro: 32000 Hz). */
                 char *end;
+                errno = 0;
                 long hz = strtol(f[5], &end, 10);
-                ok = !*end && hz >= 1000 && hz <= 1000000;
+                ok = !errno && end != f[5] && !*end && !g_ascii_isspace(f[5][0]) &&
+                     hz >= 1000 && hz <= 1000000;
                 ppg.clock_hz = hz;
             }
         } else {
@@ -1478,6 +1682,15 @@ static inline bool bes_sensors_configure(BesSensorHub *h, const char *spec, char
         g_strfreev(f);
     }
     g_strfreev(entries);
+    /* A single address/chip-select cannot select two distinct models. */
+    if (ok && imu.kind && ppg.kind && imu.port.bus == ppg.port.bus) {
+        if (imu.port.bus == BES_BUS_I2C) {
+            ok = imu.port.i2c_controller != ppg.port.i2c_controller ||
+                 imu.port.i2c_address != ppg.port.i2c_address;
+        } else {
+            ok = imu.port.cs_pin != ppg.port.cs_pin;
+        }
+    }
     if (!ok) {
         *error = g_strdup("sensor-board entries must be <imu|ppg>:<chip>:<spi0|spi1|i2cN>:"
                           "<cs-pin|address>:<irq-pin|-1>[:+x+y+z imu mount | :ppg tick Hz], separated by ';'");

@@ -366,8 +366,9 @@ def _resolve_health(health, hardware):
         return None
     health = health or {}
     resolved = {}
-    if inputs.get("steps") and "walkSteps" in health:
-        resolved["walkSteps"] = health["walkSteps"]
+    if inputs.get("steps"):
+        if "walkSteps" in health:
+            resolved["walkSteps"] = health["walkSteps"]
         if "cadence" in health:
             resolved["cadence"] = health["cadence"]
     if inputs.get("heartRate"):
