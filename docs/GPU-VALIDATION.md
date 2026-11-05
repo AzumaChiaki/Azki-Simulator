@@ -88,12 +88,17 @@ Run from the repository root with an existing C compiler and Python environment:
 ```sh
 python3 -m unittest discover -s tests -p test_gpu_tiling.py -v
 python3 -m unittest discover -s tests -p test_gpu_lifecycle.py -v
+python3 -m unittest discover -s tests -p test_gpu_copy.py -v
 python3 -m unittest discover -s tests -p test_gpu_q65_sampler.py -v
 ```
 
 The tile/format/invalid-state suite executed 4,580 vectors and 27,410 checks
 under ASan/UBSan. The MMIO lifecycle suite executed 102 checks, including
 completion-time reentry, pending-work cancellation and interrupt acknowledgement.
+The ordered-copy contract checks that a transparent NONE blit replaces stale
+target pixels and that a later GPU draw reads the earlier offscreen result in
+the same submission. These operations support multi-pass background effects;
+the effect itself is a separate application.
 Host/runtime and sensor contracts and Swift frame/isolation tests are separate
 from these pixel tests. On macOS use the installed Xcode toolchain for
 `swift test --jobs 4`; the default SwiftPM sandbox is retained.

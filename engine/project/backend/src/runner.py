@@ -354,11 +354,11 @@ def main():
     parser.add_argument('--gpu-probe', action='store_true',
                         help='VGLite reset/idle probe with unsupported identity; no renderer')
     parser.add_argument('--gpu-id-fixture', action='store_true',
-                        help='Q66 VGLite identity fixture; requires --gpu-probe; no rendering')
+                        help='VGLite identity fixture; requires --gpu-probe; no rendering')
     parser.add_argument('--gpu-no-render', action='store_true',
                         help='Experimental GPU accept-and-ignore commands; no pixels or IRQ')
     parser.add_argument('--gpu-software-renderer', action='store_true',
-                        help='Bounded VGLite A8/path software renderer with END IRQ; requires GPU ID')
+                        help='Bounded VGLite image/path software renderer with END IRQ; requires GPU ID')
     parser.add_argument('--gpu-completion-fixture', action='store_true',
                         help='Experimental GPU END completion and IRQ70; requires --gpu-no-render; no pixels')
     parser.add_argument('--bt-hci-reset-fixture', action='store_true',

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * Bounded software subset of the public VGLite command stream. This is not
  * a Vivante hardware renderer: curves use 32 segments and coverage uses a
- * 4 x 4 sample grid. Only the Q66 startup operations listed below are accepted.
+ * 4 x 4 sample grid. N66, N67, O66, P67 and Q66 use this renderer.
  * All writes and persistent state remain private until the caller commits.
  */
 #ifndef BEST1503_GPU_H
