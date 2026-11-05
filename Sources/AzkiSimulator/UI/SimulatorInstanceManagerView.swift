@@ -355,29 +355,58 @@ private struct SimulatorInspectorAttachment: ViewModifier {
     @Binding var logsPresented: Bool
     @Environment(\.openWindow) private var openWindow
     private var session: SimulatorSessionModel { instance.runtime.runtimeSession }
-    private let logPanelHeight: CGFloat = 320
+    @State private var preferredLogPaneHeight = SimulatorDeviceContentLayout.defaultLogPaneHeight
+    @State private var dragStartHeight: CGFloat?
 
     var body: some View {
-        Group {
-            if logsPresented {
-                VSplitView {
-                    canvas
-                        .frame(maxWidth: .infinity, minHeight: 240, maxHeight: .infinity)
-                    SimulatorLogPanel(runtime: instance.runtime, stream: instance.logStream, instanceName: instance.record.name)
-                        // Keep the divider anchored to the bottom. The native
-                        // text view's content height must not move it when the
-                        // VM publishes its first frame or appends more logs.
-                        .frame(maxWidth: .infinity, minHeight: 120,
-                               idealHeight: logPanelHeight, maxHeight: logPanelHeight)
-                }
-                .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
-            } else {
+        GeometryReader { proxy in
+            let availableHeight = proxy.size.height
+            let logHeight = logsPresented
+                ? SimulatorDeviceContentLayout.logPaneHeight(availableHeight: availableHeight,
+                                                            preferred: preferredLogPaneHeight)
+                : 0
+            let dividerHeight: CGFloat = logsPresented ? SimulatorDeviceContentLayout.dividerHeight : 0
+            let canvasHeight = logsPresented
+                ? SimulatorDeviceContentLayout.canvasHeight(availableHeight: availableHeight, logPaneHeight: logHeight)
+                : availableHeight
+            VStack(spacing: 0) {
                 canvas
-                    .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(width: proxy.size.width, height: max(0, canvasHeight), alignment: .top)
+                if logsPresented {
+                    logDivider(availableHeight: availableHeight)
+                        .frame(width: proxy.size.width, height: dividerHeight)
+                    SimulatorLogPanel(runtime: instance.runtime, stream: instance.logStream,
+                                      instanceName: instance.record.name)
+                        .frame(width: proxy.size.width, height: logHeight, alignment: .topLeading)
+                        .clipped()
+                }
             }
+            .frame(width: proxy.size.width, height: availableHeight, alignment: .top)
         }
-        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
         .clipped()
+        .onChange(of: logsPresented) { _, _ in dragStartHeight = nil }
+    }
+
+    /// A SwiftUI divider replaces the AppKit split view: dragging changes only
+    /// the stored preference, never the measured container, so live log text
+    /// can no longer move the canvas or push it under the window toolbar.
+    private func logDivider(availableHeight: CGFloat) -> some View {
+        ZStack {
+            Rectangle().fill(Color(nsColor: .separatorColor))
+            Capsule().fill(Color(nsColor: .tertiaryLabelColor)).frame(width: 36, height: 3)
+        }
+        .contentShape(Rectangle())
+        .gesture(DragGesture(minimumDistance: 1)
+            .onChanged { value in
+                let start = dragStartHeight ?? preferredLogPaneHeight
+                if dragStartHeight == nil { dragStartHeight = start }
+                let proposed = start - value.translation.height
+                let upperBound = SimulatorDeviceContentLayout.maximumLogPaneHeight(availableHeight: availableHeight)
+                preferredLogPaneHeight = min(max(SimulatorDeviceContentLayout.minimumLogPaneHeight, proposed), upperBound)
+            }
+            .onEnded { _ in dragStartHeight = nil })
+        .accessibilityIdentifier("simulator.log-divider")
     }
 
     @ViewBuilder private var canvas: some View {
