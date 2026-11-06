@@ -62,6 +62,15 @@ jobs:
           echo "$(brew --prefix python@3.12)/libexec/bin" >> "$GITHUB_PATH"
           # Cached build trees link against these Homebrew libraries.
           echo "brew=$(brew list --versions python@3.12 glib gettext libffi pcre2 zstd dtc openssl@3 | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - name: Install Python test dependencies
+        # control.py decodes LCD snapshots through PIL. The shipped engine
+        # carries its own Pillow wheel, but unittest runs on the Homebrew
+        # interpreter before the engine exists, so the test run needs it too.
+        # Read the pinned version from the engine recipe to avoid drift.
+        run: |
+          pillow="$(python3 -B -c "import runpy; print(runpy.run_path('scripts/build-engine.py')['PACKAGES']['pillow'])")"
+          python3 -m pip install --disable-pip-version-check --break-system-packages "Pillow==$pillow"
+          python3 -B -c "import PIL; print('Pillow', PIL.__version__)"
       - name: Run tests
         run: python3 -B -m unittest discover -s tests -p 'test_*.py'
       # QEMU and CPython dominate build time. The key prefix pins everything
