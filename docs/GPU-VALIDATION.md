@@ -15,6 +15,10 @@ seams. Floating coordinates are reduced before integer conversion. Each backend
 retains its existing pixel-centre convention; the captured watch LINEAR/PAD
 ramp and A8 LINEAR row rules remain intact.
 
+vg_lite_blit_rect moves c_step back by half a texel on the axes it filters
+(LINEAR on u, BI_LINEAR on u and v), so the sampler subtracts the half texel
+only on the remaining axes.
+
 Validated layouts include BGRA8888, RGB565, packed BGRA5658 and BGR888, plus
 watch BGRA5551 and Q65's captured legacy encoding. Existing alpha blending,
 path coverage and clipping remain in use. Unsupported Gaussian states are
@@ -54,7 +58,9 @@ Additional original-firmware checks:
 - Q155: 90-second interaction run, 734 GPU submissions/completions, zero
   rejections, native watchface/list navigation and a captured list transition.
   Ten sampled frames are not automatically ten different or consecutive frames.
-- O66 .28: the previous core produced one BUSY rejection followed by reboot.
+- O66 .28: an earlier core produced one BUSY rejection followed by reboot.
+  A submission that arrives during a draw now retires that draw in order and
+  starts, as the hardware queue does, so it no longer becomes a bus error.
   New-core runs completed 80 seconds with 831 submissions (diagnostic trace)
   and 345 submissions (normal logging), zero rejections and no reboot. The
   old race was not reproduced; its cause is not established or claimed fixed.

@@ -31,7 +31,7 @@ static void check(const char*name,uint32_t mode,unsigned target,bool linear,cons
     memcpy(ram+256,source,8);regs[0xa00]=mode;regs[0xa02]=tint;regs[0xa10]=target;regs[0xa11]=0x20000000;
     regs[0xa12]=target==0x101?2:4;regs[0xa13]=0x10001;
     regs[0xa25]=linear?0x01020107:0x01000107;regs[0xa29]=0x20000100;regs[0xa2b]=8;regs[0xa2f]=0x00010002;
-    regs[0xa18]=bits(linear?0.5f:0.25f);regs[0xa19]=bits(0.5f);regs[0xa1a]=bits(1);regs[0xa1f]=1;
+    regs[0xa18]=bits(0.25f);regs[0xa19]=bits(linear?0.0f:0.5f);regs[0xa1a]=bits(1);regs[0xa1f]=1;
     stl_le_p(command,0x40000001);stw_le_p(command+12,1);stw_le_p(command+14,1);
     if((mode&255)==2){
         uint32_t path[]={2,0,0,4,bits(0.5f),0,4,bits(0.5f),bits(1),4,0,bits(1),1,0};

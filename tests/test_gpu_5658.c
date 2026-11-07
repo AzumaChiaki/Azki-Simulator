@@ -61,7 +61,7 @@ static void source_vectors(void){
     const uint8_t colors[][3]={{0x00,0xf8,255},{0xe0,0x07,255},{0x1f,0x00,255},{0xff,0xff,255},{0,0,0}};
     const uint8_t expected[][4]={{0,0,255,255},{0,255,0,255},{255,0,0,255},{255,255,255,255},{0,0,0,0}};
     for(unsigned linear=0;linear<2;linear++)for(unsigned i=0;i<G_N_ELEMENTS(colors);i++){
-        uint32_t r[BES_GPU_REGS];uint8_t command[24];fixture(r,command,1);r[0xa25]|=linear?0x20000:0;
+        uint32_t r[BES_GPU_REGS];uint8_t command[24];fixture(r,command,1);if(linear){r[0xa25]|=0x20000;r[0xa18]=r[0xa19]=bits(0);}
         memcpy(ram+256,colors[i],3);BesGpuWork*w=draw(r,command);
         bytes_equal(w->targets[0].pixels,expected[i],4,"independent color vector");gpu_sw_free(w);
     }
@@ -74,7 +74,7 @@ static void source_vectors(void){
     }
     /* Halfway between premultiplied red(65,0,0,A=128) and transparent. */
     uint32_t r[BES_GPU_REGS];uint8_t command[24];fixture(r,command,1);
-    r[0xa25]=0x41020100;r[0xa2b]=8;r[0xa2f]=0x10002;
+    r[0xa25]=0x41020100;r[0xa2b]=8;r[0xa2f]=0x10002;r[0xa18]=bits(0.25f);r[0xa19]=bits(0);
     memcpy(ram+256,(uint8_t[]){0x00,0x40,128,0,0,0},6);
     /* Existing two-stage integer blend rounds 65/2 to 32 here. */
     BesGpuWork*w=draw(r,command);bytes_equal(w->targets[0].pixels,(uint8_t[]){0,0,32,64},4,"linear transparent edge");gpu_sw_free(w);

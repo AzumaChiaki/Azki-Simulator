@@ -2025,6 +2025,12 @@ static MemTxResult gpu_probe_write(void *opaque, hwaddr offset, uint64_t value,
         }
         if (s->gpu_software_renderer) {
             const char *error = "busy";
+            /* The hardware queues submissions. Retire the draw in flight so
+             * this one starts on its output, in the same order. */
+            if (s->gpu_busy) {
+                timer_del(s->gpu_timer);
+                gpu_complete(s);
+            }
             if (s->gpu_busy ||
                 !(s->gpu_work = gpu_sw_prepare(s->gpu_sw_regs, commands,
                                                value * 8, gpu_ram_read, &error))) {

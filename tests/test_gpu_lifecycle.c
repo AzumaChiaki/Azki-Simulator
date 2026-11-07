@@ -96,7 +96,7 @@ static void advance(Best1503State *s, int64_t now) {
         s->gpu_timer->pending=false; gpu_complete(s);
     }
 }
-static void deferred_commit_and_busy_preserves_first(void) {
+static void deferred_commit_and_busy_queues_in_order(void) {
     Best1503State s; QEMUTimer timer; start(&s,&timer);
     unsigned bytes=make_draw(256,0xff204080,0); make_draw(512,0xff112233,1);
     CHECK(write_reg(&s,0x14,3)==MEMTX_OK);
@@ -109,17 +109,18 @@ static void deferred_commit_and_busy_preserves_first(void) {
     int64_t deadline=timer.deadline; CHECK(deadline==101000);
     CHECK(write_reg(&s,0x500,RAM_BASE+512)==MEMTX_OK); /* Address staging isn't execution. */
     CHECK(s.gpu_work==first && s.gpu_pending_id==first_id && timer.schedules==1);
-    CHECK(write_reg(&s,0x504,bytes/8)==MEMTX_ERROR);
-    CHECK(s.gpu_work==first && s.gpu_pending_id==first_id && s.gpu_pending_event==1);
-    CHECK(timer.schedules==1 && timer.deadline==deadline && s.gpu_status==0 && !irq_level);
-    memset(ram+256,0xff,bytes); /* Active work owns a decoded snapshot. */
-    advance(&s,deadline-1); CHECK(s.gpu_busy && memory_writes==0 && !irq_level);
-    advance(&s,deadline); CHECK(!s.gpu_busy && !s.gpu_work && memory_writes==1);
+    /* A second submission retires the first in order, then starts itself. */
+    CHECK(write_reg(&s,0x504,bytes/8)==MEMTX_OK);
+    CHECK(s.gpu_busy && s.gpu_work && s.gpu_work!=first && memory_writes==1);
     CHECK(ldl_le_p(ram)==0xff804020 && s.gpu_sw_regs[0xa02]==0xff204080);
-    CHECK(s.gpu_status==1 && s.gpu_pending_event==0 && irq_level==1 && irq_rises==1);
-    CHECK(read_reg(&s,4)==0xb05 && read_reg(&s,0x14)==3);
+    CHECK(s.gpu_status==1 && s.gpu_pending_event==2 && irq_level==1 && irq_rises==1);
+    CHECK(read_reg(&s,0x14)==3);
     CHECK(read_reg(&s,0x10)==1 && !irq_level && s.gpu_status==0);
-    CHECK(read_reg(&s,0x10)==0 && irq_rises==1);
+    advance(&s,timer.deadline); CHECK(!s.gpu_busy && !s.gpu_work && memory_writes==2);
+    CHECK(s.gpu_sw_regs[0xa02]==0xff112233 && s.gpu_status==2 && irq_level==1);
+    CHECK(read_reg(&s,4)==0xb05);
+    CHECK(read_reg(&s,0x10)==2 && !irq_level && s.gpu_status==0);
+    CHECK(read_reg(&s,0x10)==0 && irq_rises==2);
 }
 static void masked_completion_and_unacknowledged_status(void) {
     Best1503State s; QEMUTimer timer; start(&s,&timer);
@@ -205,7 +206,7 @@ static void invalid_commands_do_not_schedule_an_end(void) {
     CHECK(write_reg(&s,0x520,4)==MEMTX_OK && !timer.pending && !s.gpu_busy);
 }
 int main(void) {
-    deferred_commit_and_busy_preserves_first();
+    deferred_commit_and_busy_queues_in_order();
     masked_completion_and_unacknowledged_status();
     completion_is_reentrant_after_irq_ack();
     resets_cancel_uncommitted_work();

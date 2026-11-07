@@ -492,7 +492,8 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
     unsigned source_tile = (r[0xa25] >> 12) & 3;
     bool pad_source = source_tile == 1;
     uint32_t source_format = r[0xa25] & ~0x3000u;
-    bool indexed = source_format == 0x01000900 || source_format == 0x01020900;
+    bool index4 = source_format == 0x01000700 || source_format == 0x01020700;
+    bool indexed = index4 || source_format == 0x01000900 || source_format == 0x01020900;
     bool packed_source = source_format == 0x41020100 || source_format == 0x41000100;
     bool rgb565_source = source_format == 0x01000105 ||
                          source_format == 0x01010105 || source_format == 0x01020105;
@@ -549,9 +550,10 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
         /* Captured linear sources, transparent border, no source origin. */
         uint64_t length = (uint64_t)stride * sh;
         uint32_t canonical;
-        if ((!colored_source && source_format != 0x01010102) ||
+        if ((!colored_source && source_format != 0x01010102 &&
+             source_format != 0x01000102 && source_format != 0x01020102) ||
             r[0xa27] || r[0xa2d] ||
-            !sw || !sh || sw > 1024 || sh > 1024 || stride < sw * source_bpp ||
+            !sw || !sh || sw > 1024 || sh > 1024 || stride < (index4 ? (sw + 1) / 2 : sw * source_bpp) ||
             stride > 4096 || length > 4 * 1024 * 1024 ||
             !(canonical = gpu_sw_canonical(r[0xa29], length))) {
             return gpu_sw_fail(w, "unsupported or unsafe image source");
@@ -620,11 +622,15 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
             unsigned a = (constant.a * cov + 8) / 16;
             unsigned sr = constant.r, sg = constant.g, sb = constant.b;
             if (image) {
-                /* Linear normalized coordinates; c_step includes pixel-center
-                 * adjustment in public VGLite. Out-of-image samples are zero.
+                /* Linear normalized coordinates; c_step includes the pixel
+                 * center. For the axes it filters, vg_lite_blit_rect has
+                 * already moved c_step back by half a texel (LINEAR on u,
+                 * BI_LINEAR on u and v). Out-of-image samples are zero.
                  */
-                double u = (m[0] + x*m[3] + y*m[6]) * sw - 0.5;
-                double v = (m[1] + x*m[4] + y*m[7]) * sh - 0.5;
+                unsigned filter = r[0xa25] & 0x30000;
+                double u = (m[0] + x*m[3] + y*m[6]) * sw - (filter ? 0 : 0.5);
+                double v = (m[1] + x*m[4] + y*m[7]) * sh -
+                           (filter == 0x20000 ? 0 : 0.5);
                 if (!isfinite(u) || !isfinite(v)) {
                     continue;
                 }
@@ -662,8 +668,12 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                         int xx = ix + (int)dx, yy = iy + (int)dy;
                         if (gpu_sw_tile_index(&xx, sw, source_tile) &&
                             gpu_sw_tile_index(&yy, sh, source_tile)) {
-                            uint8_t *sample_pixel = source + yy * stride + xx * source_bpp;
+                            uint8_t *sample_pixel = source + yy * stride +
+                                (index4 ? xx / 2 : xx * source_bpp);
                             unsigned texel = sample_pixel[0];
+                            if (index4) {
+                                texel = xx & 1 ? texel >> 4 : texel & 15;
+                            }
                             double weight = (dx ? fx : 1-fx) * (dy ? fy : 1-fy);
                             if (colored_source) {
                                 BesGpuColor color;
