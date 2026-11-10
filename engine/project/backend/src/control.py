@@ -5,7 +5,7 @@ import json
 import math
 import os
 from pathlib import Path
-from socketserver import StreamRequestHandler
+from socketserver import StreamRequestHandler, ThreadingUnixStreamServer
 import struct
 import stat
 import sys
@@ -875,7 +875,6 @@ class WatchControl:
 
     def serve_input(self, path):
         """Local input relay for display.py; frames stay in shared memory."""
-        from socketserver import ThreadingUnixStreamServer
         control = self
         pending = threading.BoundedSemaphore(8)
         def unique_fields(pairs):

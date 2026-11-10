@@ -17,12 +17,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#ifdef _WIN32
-#include "windows_helper_io.h"
-#define pread azki_win_pread
-#define pwrite azki_win_pwrite
-#define fsync azki_win_fsync
-#endif
 #include "yaffsfs.h"
 #include "yaffs_guts.h"
 #include "yaffs_trace.h"
@@ -80,19 +74,11 @@ static int write_chunk(struct yaffs_dev *d, int chunk, const u8 *data, int len, 
 
 static int open_image(const char *path, size_t *size, int writing)
 {
-#ifdef _WIN32
-    int fd = azki_helper_open(path, writing != 0, false, true);
-    LARGE_INTEGER bytes;
-    check(fd >= 0 && GetFileSizeEx((HANDLE)_get_osfhandle(fd), &bytes) && bytes.QuadPart >= 0 &&
-          (uint64_t)bytes.QuadPart <= SIZE_MAX, "private image open");
-    *size = (size_t)bytes.QuadPart;
-#else
     int fd = open(path, (writing ? O_RDWR : O_RDONLY) | O_NOFOLLOW | O_CLOEXEC);
     struct stat st;
     check(fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 1 &&
           st.st_uid == geteuid() && !(st.st_mode & 077), "private image open");
     *size = (size_t)st.st_size;
-#endif
     return fd;
 }
 
@@ -116,11 +102,7 @@ static int extract(const char *inside, const char *host)
 {
     int in = yaffs_open(inside, 0, 0);
     if (in < 0) return 0;
-#ifdef _WIN32
-    int out = azki_helper_open(host, true, true, false);
-#else
     int out = open(host, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
-#endif
     check(out >= 0, "temporary file");
     unsigned char buf[65536];
     int n;
@@ -131,11 +113,7 @@ static int extract(const char *inside, const char *host)
 
 static void store(const char *host, const char *inside)
 {
-#ifdef _WIN32
-    int in = azki_helper_open(host, false, false, false);
-#else
     int in = open(host, O_RDONLY | O_NOFOLLOW);
-#endif
     check(in >= 0, "updated database open");
     /* O_CREAT|O_TRUNC|O_RDWR in the Linux values yportenv uses. */
     int out = yaffs_open(inside, 02 | 0100 | 01000, 0644);
@@ -196,11 +174,7 @@ static int dump(unqlite *db)
 
 static void apply(unqlite *db, const char *path)
 {
-#ifdef _WIN32
-    FILE *f = azki_helper_stream(path, false);
-#else
     FILE *f = fopen(path, "r");
-#endif
     check(f != NULL, "change file");
     char line[MAX_VALUE + 256];
     int count = 0;
@@ -254,17 +228,10 @@ int main(int argc, char **argv)
     }
 
     /* The sandboxed runner grants only its own TMPDIR. */
-#ifdef _WIN32
-    char dir[1024];
-    check(azki_helper_tempdir(dir, sizeof(dir)), "private temporary directory");
-    HANDLE private_temp=azki_helper_directory(dir);
-    check(private_temp!=INVALID_HANDLE_VALUE, "pin private temporary directory");
-#else
     const char *tmp = getenv("TMPDIR");
     char dir[1024];
     check(snprintf(dir, sizeof(dir), "%s/instance-props-XXXXXX", tmp && *tmp ? tmp : "/tmp") < (int)sizeof(dir), "temporary path");
     check(mkdtemp(dir) != NULL, "temporary directory");
-#endif
     char db_path[1100], journal_path[1100];
     snprintf(db_path, sizeof(db_path), "%s/persist.db", dir);
     snprintf(journal_path, sizeof(journal_path), "%s/persist.db_unqlite_journal", dir);
@@ -285,13 +252,7 @@ int main(int argc, char **argv)
         if (journal) check(yaffs_unlink("/nand/persist.db_unqlite_journal") == 0, "stale journal removal");
     }
     check(yaffs_unmount("/nand") == 0, "unmount");
-#ifdef _WIN32
-    azki_helper_remove(db_path,false); azki_helper_remove(journal_path,false);
-    CloseHandle(private_temp);
-    check(azki_helper_remove(dir,true)==0,"temporary directory cleanup");
-#else
     unlink(db_path); unlink(journal_path); rmdir(dir);
-#endif
     if (writing) {
         unsigned char erased[2048];
         memset(erased, 255, sizeof(erased));

@@ -96,9 +96,6 @@ static void bes_nor_store_close(BesNorStore *s)
 
 static bool bes_nor_store_valid(int fd, const BesNorLayout *layout)
 {
-#ifdef _WIN32
-    return azki_win_store_valid(fd, bes_nor_layout_bytes(layout));
-#else
     struct stat st;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
         st.st_nlink != 1 || (st.st_mode & 07777) != 0600 ||
@@ -107,14 +104,13 @@ static bool bes_nor_store_valid(int fd, const BesNorLayout *layout)
         return false;
     }
     return true;
-#endif
 }
 
 static bool bes_nor_store_read_extent(int fd, uint8_t *bytes, size_t count,
                                      off_t offset)
 {
     while (count) {
-        ssize_t n = BES_STORE_PREAD(fd, bytes, count, offset);
+        ssize_t n = pread(fd, bytes, count, offset);
         if (n < 0 && errno == EINTR) {
             continue;
         }
@@ -140,19 +136,12 @@ static bool bes_nor_store_open(BesNorStore *s, const char *path,
                             layout->config_offset, layout->config_bytes)) {
         return false;
     }
-#ifdef _WIN32
-    int fd = bes_store_open_file(path, bes_nor_layout_bytes(layout));
-#else
     int fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-#endif
     if (fd < 0) {
         return false;
     }
     uint32_t tail_bytes = layout->flash_bytes - layout->tail_offset;
-    if (!bes_nor_store_valid(fd, layout) ||
-#ifndef _WIN32
-        flock(fd, LOCK_EX | LOCK_NB) ||
-#endif
+    if (!bes_nor_store_valid(fd, layout) || flock(fd, LOCK_EX | LOCK_NB) ||
         !bes_nor_store_read_extent(fd, flash + layout->tail_offset, tail_bytes, 0) ||
         (layout->config_bytes &&
          !bes_nor_store_read_extent(fd, flash + layout->config_offset,

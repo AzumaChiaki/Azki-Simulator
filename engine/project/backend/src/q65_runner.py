@@ -8,6 +8,8 @@ import subprocess
 import tempfile
 import time
 
+from .control import WatchControl
+from .qmp import QMP
 from .q65_factory import local_desktop_image
 
 FLAGS = ('bt-peer', 'bt-tx-capture', 'bt-hci-reset-fixture',
@@ -127,10 +129,6 @@ def run(profile, args):
 
 
 def _run(profile, args, logdir):
-    # The original desktop runner uses POSIX control sockets. Board metadata
-    # also serves the native Windows runtime and must be importable there.
-    from .control import WatchControl
-    from .qmp import QMP
     from device_catalog import ROOT
     from firmware_resources import checked_member
     from .instance_data import (instance_machine_options, instance_nor_machine_options,

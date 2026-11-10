@@ -26,7 +26,6 @@ OUTPUT_NAME = 'virtual-peer-state.pending.json'
 # attempt, not acceptance. No ROM fallback identity or key is ever imported.
 _PROFILE_ROWS = (
     (PROFILE, AP_SHA256, 'miwear.watch.q66nfc', None),
-    ('q66@4.100.071', '0b78f4d6c22104b98d259b1bd3bf2e07b89695eab23a0e72addcfe1ce5795f5c', 'miwear.watch.q66nfc', None),
     ('miwear.watch.q66glt@4.200.078@754da125b286', 'bf36cc88905271e7f596b1de9b8c314e6a9737d5e36f8d67f60535f003ee229c', 'miwear.watch.q66glt', None),
     ('miwear.watch.q66tc@4.100.155@f1c824fef81d', 'ea0bdf1920cb30223d616432af00565ca67622e6468328f5eab155f8cdc2fb9f', 'miwear.watch.q66tc', None),
     ('miwear.watch.q66u@4.100.108@6ef691453a86', '9315ca353f624cec25dfcfc98a95ba959e2d7b24573bf1d6adf16ea10341bd99', 'miwear.watch.q66u', None),

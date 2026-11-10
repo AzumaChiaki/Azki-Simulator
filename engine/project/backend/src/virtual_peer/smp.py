@@ -6,7 +6,7 @@ Unsupported methods fail. No key or raw SMP payload is emitted into evidence.
 """
 import hmac
 import secrets
-from .crypto import SystemAES as CommonCryptoAES
+from .crypto import CommonCryptoAES
 from .auth_crypto import AESModes, xor
 
 

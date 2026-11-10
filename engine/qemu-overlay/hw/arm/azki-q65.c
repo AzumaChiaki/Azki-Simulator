@@ -70,9 +70,6 @@ typedef struct {
     bool display_invalidated;
     char *frame_file;
     uint8_t *shared_frame;
-#ifdef _WIN32
-    AzkiWinMapping shared_mapping;
-#endif
     uint32_t shared_sequence;
     uint32_t frame_address, frame_pitch;
     unsigned frame_width, frame_height, frame_count;
@@ -3915,18 +3912,14 @@ static void lcdc_shared_init(BesLcdc *l)
         exit(1);
     }
     l->shared_frame = mapped;
-#else
-    if (!azki_win_mapping_open(&l->shared_mapping, l->frame_file, LCD_SHARED_SIZE)) {
-        error_report("Cannot map private Windows LCD framebuffer %s: %s",
-                     l->frame_file, strerror(errno));
-        exit(1);
-    }
-    l->shared_frame = l->shared_mapping.view;
-#endif
     memset(l->shared_frame, 0, LCD_SHARED_SIZE);
     memcpy(l->shared_frame, "Q66FRAME", 8);
     stl_le_p(l->shared_frame + 8, 1);
     stl_le_p(l->shared_frame + 28, LCD_SHARED_RGB888);
+#else
+    error_report("lcd-frame-file requires a POSIX host");
+    exit(1);
+#endif
 }
 
 static void lcdc_shared_publish(BesLcdc *l)
@@ -6177,9 +6170,6 @@ static void best1503_finalize(Object *obj)
     if (l->shared_frame) {
         munmap(l->shared_frame, LCD_SHARED_SIZE);
     }
-#else
-    azki_win_mapping_close(&l->shared_mapping);
-    l->shared_frame = NULL;
 #endif
     g_free(l->argb_pixels);
     l->argb_pixels = NULL;

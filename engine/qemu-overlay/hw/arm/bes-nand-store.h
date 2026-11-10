@@ -10,35 +10,15 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#ifdef _WIN32
-#include "azki-windows-file.h"
-#else
-#include <sys/file.h>
-#endif
-
-#ifndef BES_STORE_PREAD
-#ifdef _WIN32
-#define BES_STORE_PREAD azki_win_pread
-#else
-#define BES_STORE_PREAD pread
-#endif
-#endif
 
 #ifndef BES_STORE_PWRITE
-#ifdef _WIN32
-#define BES_STORE_PWRITE azki_win_pwrite
-#else
 #define BES_STORE_PWRITE pwrite
 #endif
-#endif
 #ifndef BES_STORE_FSYNC
-#ifdef _WIN32
-#define BES_STORE_FSYNC azki_win_fsync
-#else
 #define BES_STORE_FSYNC fsync
-#endif
 #endif
 
 typedef struct BesNandStore {
@@ -58,9 +38,6 @@ static void bes_store_close(BesNandStore *s)
 
 static int bes_store_open_file(const char *path, uint64_t bytes)
 {
-#ifdef _WIN32
-    return azki_win_store_open(path, bytes);
-#else
     struct stat st;
     int fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) { return -1; }
@@ -73,7 +50,6 @@ static int bes_store_open_file(const char *path, uint64_t bytes)
     }
     if (flock(fd, LOCK_EX | LOCK_NB)) { close(fd); return -1; }
     return fd;
-#endif
 }
 
 static bool bes_store_open(BesNandStore *s, const char *data,
@@ -98,7 +74,7 @@ static bool bes_store_read(int fd, uint8_t *bytes, size_t length)
 {
     size_t done = 0;
     while (done < length) {
-        ssize_t count = BES_STORE_PREAD(fd, bytes + done, length - done, done);
+        ssize_t count = pread(fd, bytes + done, length - done, done);
         if (count < 0 && errno == EINTR) { continue; }
         if (count <= 0) { return false; }
         done += count;
