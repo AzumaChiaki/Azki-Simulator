@@ -5,7 +5,9 @@ same-OTA resource image stay unchanged. Runtime desktop success is separate.
 """
 from __future__ import annotations
 import argparse
-import fcntl
+import os
+if os.name != "nt":
+    import fcntl
 import hashlib
 import json
 from pathlib import Path
@@ -22,8 +24,8 @@ PREFERENCES = {
     'persist.screen.dimmer_timeout': '2147483647',
 }
 UNQLITE = ROOT / 'references/openvela-unqlite'
-DB_HELPER = ROOT / 'backend/build/legacy-ui-db'
-YAFFS_HELPER = ROOT / 'backend/build/yaffs-image'
+DB_HELPER = ROOT / ('backend/build/legacy-ui-db.exe' if os.name == 'nt' else 'backend/build/legacy-ui-db')
+YAFFS_HELPER = ROOT / ('backend/build/yaffs-image.exe' if os.name == 'nt' else 'backend/build/yaffs-image')
 
 
 def data_partition(ap_data):
@@ -86,6 +88,10 @@ def prepare_ui_seed(profile, data_bytes=None):
     directory.mkdir(parents=True, exist_ok=True)
     # Two native windows can request the same configuration concurrently. Hold
     # the lock through both files' publication and recheck the cache inside it.
+    if os.name == 'nt':
+        from backend.src.windows_runtime_files import WindowsCacheLock
+        with WindowsCacheLock(directory / '.build.lock'):
+            return _prepare_locked_seed(directory, expected, partition)
     with (directory / '.build.lock').open('a+b') as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         return _prepare_locked_seed(directory, expected, partition)
@@ -101,7 +107,15 @@ def _prepare_locked_seed(directory, expected, partition):
         if image.stat().st_size != partition['size'] or digest(image) != proof['sha256']:
             raise ValueError('Cached local UI image hash or size mismatch')
         return image, proof['sha256'], proof
-    with tempfile.TemporaryDirectory(prefix='ui-seed-', dir=directory) as temp:
+    temporary_directory = tempfile.TemporaryDirectory
+    if os.name == 'nt':
+        from backend.src.windows_runtime_files import WindowsTemporaryDirectory
+        temporary_directory = WindowsTemporaryDirectory
+    # UnQLite's original Windows VFS has a MAX_PATH-sized full-name buffer.
+    # Stage under the session cache root, keeping the DB away from nested
+    # OTA/config hash directories. Final immutable cache proofs stay unchanged.
+    staging_parent = CACHE if os.name == 'nt' else directory
+    with temporary_directory(prefix='ui-seed-', dir=staging_parent) as temp:
         staging = Path(temp)
         tree = staging / 'tree'
         tree.mkdir()

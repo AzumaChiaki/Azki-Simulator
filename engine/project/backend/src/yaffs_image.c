@@ -3,7 +3,9 @@
  * Also remount and compare every file before publishing the image.
  */
 #include <assert.h>
+#ifndef _WIN32
 #include <dirent.h>
+#endif
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -12,6 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include "windows_helper_io.h"
+#endif
 #include "yaffsfs.h"
 #include "yaffs_guts.h"
 #include "yaffs_trace.h"
@@ -61,6 +66,44 @@ static void add_item(const char *host, const char *dest, int directory) {
     check(items[item_count-1].host && items[item_count-1].dest,"path allocation");
     if(!directory)file_count++;
 }
+#ifdef _WIN32
+static int name_compare(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+static void collect_tree(const char *host, const char *dest, unsigned depth) {
+    check(depth<32,"tree depth");
+    HANDLE directory=azki_helper_directory(host);check(directory!=INVALID_HANDLE_VALUE,"private source directory without reparse");
+    AzkiWinPath checked;check(azki_win_path_open(&checked,host),"source tree path");
+    size_t length=wcslen(checked.name);wchar_t *pattern=malloc((length+3)*sizeof(wchar_t));check(pattern!=NULL,"tree pattern allocation");
+    memcpy(pattern,checked.name,length*sizeof(wchar_t));wcscpy(pattern+length,L"\\*");
+    WIN32_FIND_DATAW data;HANDLE search=FindFirstFileW(pattern,&data);DWORD error=GetLastError();
+    free(pattern);azki_win_path_close(&checked);
+    char **names=NULL;size_t count=0;
+    if(search==INVALID_HANDLE_VALUE)check(error==ERROR_FILE_NOT_FOUND,"enumerate source directory");
+    else {
+        do {
+            if(!wcscmp(data.cFileName,L".") || !wcscmp(data.cFileName,L".."))continue;
+            check(!(data.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT),"source reparse point rejected");
+            char *name=azki_helper_utf8(data.cFileName);check(name!=NULL,"source filename UTF-8");
+            check(*name && strlen(name)<=255 && !strchr(name,'/'),"tree filename");
+            char **next=realloc(names,(count+1)*sizeof(*names));check(next!=NULL,"directory allocation");names=next;names[count++]=name;
+        } while(FindNextFileW(search,&data));
+        error=GetLastError();FindClose(search);check(error==ERROR_NO_MORE_FILES,"complete directory enumeration");
+    }
+    if(count>1)qsort(names,count,sizeof(*names),name_compare);
+    for(size_t i=0;i<count;i++) {
+        char child[4096],target[1024];
+        check(snprintf(child,sizeof(child),"%s/%s",host,names[i])<(int)sizeof(child),"source path length");
+        check(snprintf(target,sizeof(target),"%s/%s",dest,names[i])<(int)sizeof(target),"target path length");
+        AzkiWinPath childpath;check(azki_win_path_open(&childpath,child),"source child path");
+        DWORD attributes=GetFileAttributesW(childpath.name);azki_win_path_close(&childpath);
+        check(attributes!=INVALID_FILE_ATTRIBUTES && !(attributes&FILE_ATTRIBUTE_REPARSE_POINT),"real source child");
+        int is_directory=(attributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
+        if(is_directory) {HANDLE h=azki_helper_directory(child);check(h!=INVALID_HANDLE_VALUE,"private child directory");CloseHandle(h);}
+        else {int fd=azki_helper_open(child,false,false,false);check(fd>=0,"private regular single-link source");_close(fd);}
+        add_item(child,target,is_directory);if(is_directory)collect_tree(child,target,depth+1);free(names[i]);
+    }
+    free(names);CloseHandle(directory);
+}
+#else
 static void collect_tree(const char *host, const char *dest, unsigned depth) {
     check(depth<32,"tree depth");
     struct dirent **entries;
@@ -80,11 +123,16 @@ static void collect_tree(const char *host, const char *dest, unsigned depth) {
     }
     free(entries);
 }
+#endif
+#ifdef _WIN32
+static FILE *open_source(const char *path) {FILE *stream=azki_helper_stream(path,false);check(stream!=NULL,"private source stream");return stream;}
+#else
 static FILE *open_source(const char *path) {
     int fd=open(path,O_RDONLY|O_NOFOLLOW);check(fd>=0,"open source without symlink");
     struct stat st;check(fstat(fd,&st)==0 && S_ISREG(st.st_mode),"regular source");
     FILE *stream=fdopen(fd,"rb");check(stream!=NULL,"source stream");return stream;
 }
+#endif
 int main(int argc,char **argv) {
     if(argc<4) {fprintf(stderr,"Usage: yaffs-image output megabytes flat-file...\n       yaffs-image output --bytes byte-count --tree directory\n");return 2;}
     char *end;int first=3;
@@ -100,11 +148,19 @@ int main(int argc,char **argv) {
     check(first<argc,"source arguments");
     if(!strcmp(argv[first],"--tree")) {
         check(argc==first+2,"one source tree required");
+#ifdef _WIN32
+        HANDLE root=azki_helper_directory(argv[first+1]);check(root!=INVALID_HANDLE_VALUE,"tree root must be private real directory");CloseHandle(root);
+#else
         struct stat st;check(lstat(argv[first+1],&st)==0 && S_ISDIR(st.st_mode),"tree root must be a real directory");
+#endif
         collect_tree(argv[first+1],"/nand",0);
     } else {
         for(int i=first;i<argc;i++) {
-            const char *name=strrchr(argv[i],'/');name=name?name+1:argv[i];
+            const char *name=strrchr(argv[i],'/');
+#ifdef _WIN32
+            const char *backslash=strrchr(argv[i],'\\');if(backslash && (!name || backslash>name))name=backslash;
+#endif
+            name=name?name+1:argv[i];
             check(strlen(name)<=255 && *name && strcmp(name,".") && strcmp(name,".."),"filename");
             char dest[300];snprintf(dest,sizeof(dest),"/nand/%s",name);add_item(argv[i],dest,0);
         }
@@ -146,8 +202,16 @@ int main(int argc,char **argv) {
         check(yaffs_unmount("/nand")==0,"unmount");
         if(!pass)check(yaffs_mount("/nand")==0,"remount");
     }
+#ifdef _WIN32
+    FILE *out=azki_helper_stream(argv[1],true);check(out!=NULL,"private CREATE_NEW output");
+#else
     FILE *out=fopen(argv[1],"wb");check(out!=NULL,"output");
-    check(fwrite(storage,1,storage_size,out)==storage_size,"image write");check(fclose(out)==0,"output close");
+#endif
+    check(fwrite(storage,1,storage_size,out)==storage_size,"image write");
+#ifdef _WIN32
+    check(fflush(out)==0 && azki_win_fsync(_fileno(out))==0,"output flush");
+#endif
+    check(fclose(out)==0,"output close");
     fprintf(stdout,"Verified %zu files and %zu directories after cold remount, %zu bytes YAFFS2 in-band tags\n",file_count,item_count-file_count,storage_size);
     return 0;
 }

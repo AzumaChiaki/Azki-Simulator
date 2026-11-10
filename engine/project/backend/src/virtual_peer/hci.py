@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import secrets
 import struct
 
-from .crypto import CommonCryptoAES, CryptoError
+from .crypto import SystemAES as CommonCryptoAES, CryptoError
 
 SUCCESS = 0x00
 UNKNOWN_COMMAND = 0x01

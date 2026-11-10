@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include "windows_helper_io.h"
+#endif
 #include "unqlite.h"
 
 static const struct { const char *key, *value; } preferences[] = {
@@ -64,7 +67,11 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc != 2) { fprintf(stderr, "Usage: %s [--verify] persist.db\n", argv[0]); return 2; }
+#ifdef _WIN32
+    int fd = azki_helper_open(argv[1], true, true, false);
+#else
     int fd = open(argv[1], O_WRONLY | O_CREAT | O_EXCL, 0600);
+#endif
     if (fd < 0) { perror("Create new database"); return 1; }
     close(fd);
     if (unqlite_open(&db, argv[1], UNQLITE_OPEN_CREATE | UNQLITE_OPEN_OMIT_JOURNALING) != UNQLITE_OK)
@@ -79,7 +86,14 @@ int main(int argc, char **argv)
 done:
     if (db && unqlite_close(db) != UNQLITE_OK) status = 1;
     if (!status) status = verify(argv[1]);
-    if (status) { unlink(argv[1]); fprintf(stderr, "UI database creation or cold-reopen verification failed\n"); }
+    if (status) {
+#ifdef _WIN32
+        azki_helper_remove(argv[1], false);
+#else
+        unlink(argv[1]);
+#endif
+        fprintf(stderr, "UI database creation or cold-reopen verification failed\n");
+    }
     else puts("Verified four exact NUL-terminated UI preference records after cold reopen");
     return status;
 }

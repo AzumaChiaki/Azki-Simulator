@@ -23,3 +23,9 @@ Firmware/
 instances/
 .workbuddy
 .build-debug
+
+# Native Windows Bluetooth build artifacts
+engine/windows-bluetooth/AzkiBluetoothHost/bin/
+engine/windows-bluetooth/AzkiBluetoothHost/obj/
+engine/windows-bluetooth/publish/
+engine/windows-bluetooth/completepublish/

@@ -13,7 +13,7 @@ import threading
 import time
 
 from .auth_protocol import AuthenticationCentral
-from .external import ExternalCentral
+from .external import ExternalCentral, external_request
 from .link import H4Link
 from .secure_link import SecureLinkController
 from .production_client import GuestOperations
@@ -79,21 +79,7 @@ def request(raw):
     base = {'schema','requestID','command'}
     cmd = value.get('command')
     if isinstance(cmd, str) and cmd.startswith('external-'):
-        fields = {'external-open': set(), 'external-status': {'bridgeID'}, 'external-reconnect': {'bridgeID'},
-                  'external-close': {'bridgeID'}, 'external-request': {'bridgeID','operation','key','value','offset','enabled'},
-                  'external-result': {'bridgeID','operationID'}}
-        if cmd == 'external-open' and 'connectionTimeoutSeconds' in value:
-            fields[cmd].add('connectionTimeoutSeconds')
-            if type(value['connectionTimeoutSeconds']) is not int or not 1 <= value['connectionTimeoutSeconds'] <= 300:
-                raise ValueError('Connection timeout must be 1–300 seconds')
-        if cmd not in fields or set(value) != base | fields[cmd] or type(value.get('schema')) is not int or value.get('schema') != 1 or not canonical_uuid(value.get('requestID')):
-            raise ValueError('Invalid external bridge request')
-        if cmd != 'external-open' and not canonical_uuid(value['bridgeID']): raise ValueError('Invalid bridge identity')
-        if cmd == 'external-request':
-            if value['operation'] not in ('read','write','subscribe') or not isinstance(value['key'],str) or len(value['key']) > 16 or not isinstance(value['value'],str) or len(value['value']) > 1024 or type(value['offset']) is not int or not 0 <= value['offset'] <= 512 or type(value['enabled']) is not bool:
-                raise ValueError('Invalid external ATT request')
-        if cmd == 'external-result' and not canonical_uuid(value['operationID']): raise ValueError('Invalid operation identity')
-        return value
+        return external_request(value)
     extra = {'status':set(),'connect':set(),'inventory':{'kind'},
         'install':{'filename','sha256'},'watchface-select':{'identifier'},
         'quickapp-uninstall':{'identifier','fingerprint'},'operation-status':{'operationID'}}

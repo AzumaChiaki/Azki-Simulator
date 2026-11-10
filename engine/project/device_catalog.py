@@ -291,7 +291,7 @@ def prepare_storage(profile):
     source=Path(profile['ota_path']).read_bytes()
     _verify_ota_ap(profile,source)
     records=_storage_members(profile,source)
-    helper=ROOT/'backend/build/yaffs-image'
+    helper=ROOT/('backend/build/yaffs-image.exe' if os.name == 'nt' else 'backend/build/yaffs-image')
     expected=dict(schema_version=2,ota_sha256=profile['ota_sha256'],ap_sha256=profile['ap']['sha256'],
         builder_sha256=digest(helper),filesystem='YAFFS2 inband tags',image_bytes=size,
         page_bytes=2048,erase_bytes=131072,original_members=records,remount_content_verified=True)
@@ -308,14 +308,25 @@ def prepare_storage(profile):
                 if not target.is_file() or target.stat().st_size!=size or digest(target)!=info.get('sha256'):
                     raise ValueError('Cached NAND image integrity mismatch')
                 return target,info['sha256'],'yaffs'
-    with tempfile.TemporaryDirectory(prefix='build-',dir=directory) as temporary:
+    temporary_directory = tempfile.TemporaryDirectory
+    if os.name == 'nt':
+        from backend.src.windows_runtime_files import WindowsTemporaryDirectory
+        temporary_directory = WindowsTemporaryDirectory
+    with temporary_directory(prefix='build-',dir=directory) as temporary:
         temporary=Path(temporary);root=temporary/'system';root.mkdir()
         for record in records:
             data=checked_member(source,record, verify_sha=False)
             path=root/record['target_path'];path.parent.mkdir(parents=True,exist_ok=True)
             path.write_bytes(data)
         image=temporary/'nand-system.bin'
-        subprocess.run([str(helper),str(image),'--bytes',str(size),'--tree',str(root)],check=True)
+        command=[str(helper),str(image),'--bytes',str(size),'--tree',str(root)]
+        if os.name == 'nt':
+            completed=subprocess.run(command,capture_output=True,text=True,encoding='utf-8',errors='replace')
+            if completed.returncode:
+                raise RuntimeError('Windows YAFFS resource builder failed: '+
+                                   (completed.stderr.strip() or completed.stdout.strip())[-2048:])
+        else:
+            subprocess.run(command,check=True)
         if image.stat().st_size!=size:raise ValueError('NAND builder image size mismatch')
         sha=digest(image)
         info=dict(expected,sha256=sha)

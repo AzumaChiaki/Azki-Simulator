@@ -1,0 +1,70 @@
+{
+  "schema": 1,
+  "source": {
+    "path": "Sources/AzkiSimulator/Runtime/azki_simulator/minative.py",
+    "sha256": "88c7e04cec9ef300009f77c65d11ed2a76d5f030a4e1154b55e273a6cf4c034c",
+    "tables": [
+      "BATTERY_ADC_CHANNEL",
+      "BATTERY_ADC_CHANNELS",
+      "BATTERY_GAUGES",
+      "HEALTH_SENSORS"
+    ]
+  },
+  "healthSensors": {
+    "miwear.watch.n66": {
+      "board": "imu:lsm6dso:spi0:53:71;ppg:hx3695:spi0:50:14",
+      "motion": "lsm6dso",
+      "optical": "hx3695",
+      "steps": true,
+      "heartRate": true
+    },
+    "miwear.watch.o66": {
+      "board": "imu:lsm6dso:spi0:53:71;ppg:hx3695:spi0:50:14",
+      "motion": "lsm6dso",
+      "optical": "hx3695",
+      "steps": true,
+      "heartRate": true
+    },
+    "miwear.watch.n67": {
+      "board": "imu:icm42607:spi0:13:10:+y+x-z;ppg:hx3695:spi1:61:0:32000",
+      "motion": "icm42607",
+      "optical": "hx3695",
+      "steps": true,
+      "heartRate": true
+    },
+    "miwear.watch.p67": {
+      "board": "imu:icm42607:spi0:13:29:+y+x-z;ppg:hx3695:spi1:61:0:32000",
+      "motion": "icm42607",
+      "optical": "hx3695",
+      "steps": true,
+      "heartRate": true
+    },
+    "miwear.watch.q66": {
+      "board": "imu:lsm6dso:spi0:53:71;ppg:hx3697:spi0:50:14",
+      "motion": "lsm6dso",
+      "optical": "hx3697",
+      "steps": true,
+      "heartRate": true
+    }
+  },
+  "batteryADCChannel": 2,
+  "batteryADCChannels": {
+    "miwear.watch.n67": 4,
+    "miwear.watch.p67": 4,
+    "miwear.watch.p65": 6
+  },
+  "batteryGauges": {
+    "hp4560": [
+      "miwear.watch.n66",
+      "miwear.watch.n67",
+      "miwear.watch.o66"
+    ],
+    "hp4570": [
+      "miwear.watch.p67",
+      "miwear.watch.q66"
+    ],
+    "soft": [
+      "miwear.watch.p65"
+    ]
+  }
+}

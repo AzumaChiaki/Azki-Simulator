@@ -4,6 +4,8 @@
 
 A standalone wearable-device simulator for Apple Silicon Macs. Its native SwiftUI/AppKit interface runs device firmware through a separate QEMU process. The emulator is not embedded in Azki Studio.
 
+A native Windows 11 x64 preview uses a Python/Tk interface and the same three QEMU boards, with firmware import, device displays, input, sensor controls and saved instances. See the [Windows guide](docs/WINDOWS.md) for building and use, and the [Windows Bluetooth guide](docs/WINDOWS-BLUETOOTH.md) for the bridge interfaces and validation scope. Complete firmware Bluetooth has not yet passed acceptance.
+
 ## Features
 
 - Create, name and manage independent instances, with multiple device displays.

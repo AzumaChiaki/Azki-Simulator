@@ -7,6 +7,15 @@ class CryptoError(RuntimeError):
     pass
 
 
+class SystemAES:
+    """Select a real system provider without changing the single-block ABI."""
+    def __new__(cls):
+        if sys.platform == "win32":
+            from .windows_crypto import BCryptAES
+            return BCryptAES()
+        return CommonCryptoAES()
+
+
 class CommonCryptoAES:
     provider = "macOS /usr/lib/system/libcommonCrypto.dylib CCCrypt"
 

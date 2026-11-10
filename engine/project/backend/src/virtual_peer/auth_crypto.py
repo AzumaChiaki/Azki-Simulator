@@ -8,7 +8,8 @@ tests cover the exact nonce/tag layouts before use with a guest.
 import ctypes as C
 import hashlib
 import hmac
-from .crypto import CommonCryptoAES
+import sys
+from .crypto import SystemAES as CommonCryptoAES
 
 
 def mac(key, message):
@@ -80,6 +81,12 @@ class AESModes:
 
 class P256:
     """Ephemeral standard P-256 ECDH through Apple's public SecKey API."""
+    def __new__(cls, private_data=None):
+        if sys.platform == "win32":
+            from .windows_crypto import BCryptP256
+            return BCryptP256(private_data)
+        return super().__new__(cls)
+
     def __init__(self, private_data=None):
         self.cf=C.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
         self.sec=C.CDLL('/System/Library/Frameworks/Security.framework/Security')

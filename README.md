@@ -4,6 +4,8 @@
 
 面向 Apple Silicon Mac 的独立手环模拟器。原生 SwiftUI/AppKit 界面通过独立 QEMU 进程运行设备固件，不嵌入 Azki Studio。
 
+另提供 Windows 11 x64 原生预览版，使用 Python/Tk 界面和相同的三个 QEMU 设备实现，支持固件导入、设备显示、输入、传感器控制和实例保存。构建与使用见 [Windows 说明](docs/WINDOWS.md)；蓝牙桥接的接口和验证范围见 [Windows 蓝牙说明](docs/WINDOWS-BLUETOOTH.md)，完整固件蓝牙功能尚未验收。
+
 ## 功能
 
 - 创建、命名和管理多个独立实例，同时显示设备画面。

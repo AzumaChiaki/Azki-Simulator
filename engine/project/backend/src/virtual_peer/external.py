@@ -8,9 +8,42 @@ from collections import deque
 import struct
 import time
 import uuid
+from .state import canonical_uuid
 
 HOST_SERVICES = {'1800', '1801', '00001800-0000-1000-8000-00805f9b34fb',
                  '00001801-0000-1000-8000-00805f9b34fb'}
+
+
+def external_request(value):
+    """Shared bounded external-* schema; transport authentication is separate."""
+    if type(value) is not dict:
+        raise ValueError('External request must be an object')
+    fields = {'external-open': set(), 'external-status': {'bridgeID'},
+              'external-reconnect': {'bridgeID'}, 'external-close': {'bridgeID'},
+              'external-request': {'bridgeID','operation','key','value','offset','enabled'},
+              'external-result': {'bridgeID','operationID'}}
+    command = value.get('command')
+    if command == 'external-open' and 'connectionTimeoutSeconds' in value:
+        fields[command].add('connectionTimeoutSeconds')
+        if type(value['connectionTimeoutSeconds']) is not int or not 1 <= value['connectionTimeoutSeconds'] <= 300:
+            raise ValueError('Connection timeout must be 1–300 seconds')
+    if (type(command) is not str or command not in fields or
+            set(value) != {'schema','requestID','command'} | fields[command] or
+            type(value.get('schema')) is not int or value.get('schema') != 1 or
+            not canonical_uuid(value.get('requestID'))):
+        raise ValueError('Invalid external bridge request')
+    if command != 'external-open' and not canonical_uuid(value['bridgeID']):
+        raise ValueError('Invalid bridge identity')
+    if command == 'external-request':
+        if (value['operation'] not in ('read','write','subscribe') or
+                not isinstance(value['key'],str) or len(value['key']) > 16 or
+                not isinstance(value['value'],str) or len(value['value']) > 1024 or
+                type(value['offset']) is not int or not 0 <= value['offset'] <= 512 or
+                type(value['enabled']) is not bool):
+            raise ValueError('Invalid external ATT request')
+    if command == 'external-result' and not canonical_uuid(value['operationID']):
+        raise ValueError('Invalid operation identity')
+    return value
 
 def uuid_text(raw):
     text = raw[::-1].hex()
@@ -18,9 +51,11 @@ def uuid_text(raw):
 
 
 class ExternalCentral:
-    def __init__(self, controller, timeout=30, smp=None, clock=time.monotonic):
+    def __init__(self, controller, timeout=30, smp=None, clock=time.monotonic,
+                 physical_link_security='managed-by-macOS'):
         self.controller = controller
         self.clock = clock
+        self.physical_link_security = physical_link_security
         self.link = None
         self.bridge_id = str(uuid.uuid4())
         self.timeout = timeout
@@ -248,4 +283,4 @@ class ExternalCentral:
             chars = [dict(key='h'+str(c['value']), uuid=c['uuid'], readable=bool(c['properties'] & 2), writable=bool(c['properties'] & 0x0c), writeWithoutResponse=bool(c['properties'] & 4), writeWithResponse=bool(c['properties'] & 8), notifies=bool(c['properties'] & 0x10), notifiable=bool(c['properties'] & 0x30), indicates=bool(c['properties'] & 0x20)) for c in self.characteristics if service['start'] <= c['decl'] <= service['end']]
             if chars: services.append(dict(key='s'+str(service['start']), uuid=service['uuid'], characteristics=chars))
         notifications = list(self.notifications); self.notifications.clear()
-        return dict(bridgeID=self.bridge_id, state=self.state, error=self.error, mtu=self.mtu, services=services, notifications=notifications, guestSMPFailures=self.smp_failed, guestLinkEncrypted=getattr(self.controller,'air',None) is not None, guestBondEstablished=self.smp.bond is not None, authentication='forwarded-to-guest; not inspected', physicalLinkSecurity='managed-by-macOS')
+        return dict(bridgeID=self.bridge_id, state=self.state, error=self.error, mtu=self.mtu, services=services, notifications=notifications, guestSMPFailures=self.smp_failed, guestLinkEncrypted=getattr(self.controller,'air',None) is not None, guestBondEstablished=self.smp.bond is not None, authentication='forwarded-to-guest; not inspected', physicalLinkSecurity=self.physical_link_security)
