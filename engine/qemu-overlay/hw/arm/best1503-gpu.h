@@ -661,6 +661,12 @@ static bool gpu_sw_draw(BesGpuWork *w, const uint8_t *data, unsigned bytes,
                 if (!(r[0xa25] & 0x30000)) {
                     ix = floor(u + 0.5); iy = floor(v + 0.5);
                     fx = fy = 0;
+                } else if (filter == 0x10000) {
+                    /* LINEAR interpolates horizontally. Its unfiltered v
+                     * retains the same pixel centre as POINT; blending a
+                     * second row here would incorrectly make it BI_LINEAR. */
+                    iy = floor(v + 0.5);
+                    fy = 0;
                 }
                 double colors[3] = {0};
                 for (unsigned dy = 0; dy < 2; dy++) {

@@ -97,6 +97,10 @@ static void oracle(unsigned width,unsigned height,unsigned tile,unsigned filter,
                    float u,float v,uint8_t result[4]) {
     int ix=(int)floor(u), iy=(int)floor(v);
     double fx=u-ix,fy=v-iy;
+#ifdef GENERIC_COORDS
+    /* NXP's LINEAR filter has horizontal interpolation and a nearest row. */
+    if(filter==1) { iy=(int)floor(v+0.5); fy=0; }
+#endif
     if(!filter) {
 #ifdef GENERIC_COORDS
         ix=(int)floor(u+0.5); iy=(int)floor(v+0.5);
@@ -128,7 +132,11 @@ static BesGpuWork *draw(unsigned width,unsigned height,unsigned tile,unsigned fi
     regs[0xa2b]=width*(source_bytes[SOURCE_KIND]==3 ? 4 : source_bytes[SOURCE_KIND]);
     regs[0xa2f]=height<<16|width;
 #ifdef GENERIC_COORDS
-    regs[0xa18]=bits((u+0.5f)/width); regs[0xa19]=bits((v+0.5f)/height);
+    /* Reconstruct the normalized command fields after vg_lite_blit_rect's
+     * filter-specific c_step adjustment: LINEAR backs up u, BI_LINEAR u/v.
+     * u/v above remain the oracle's texel coordinates for every filter. */
+    regs[0xa18]=bits((u+(filter ? 0 : 0.5f))/width);
+    regs[0xa19]=bits((v+(filter==2 ? 0 : 0.5f))/height);
 #else
     /* Existing watch LINEAR-PAD gradient command already supplies its
      * half-texel adjustment. All other filtered watch paths subtract .5. */

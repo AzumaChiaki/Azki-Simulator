@@ -19,6 +19,16 @@ vg_lite_blit_rect moves c_step back by half a texel on the axes it filters
 (LINEAR on u, BI_LINEAR on u and v), so the sampler subtracts the half texel
 only on the remaining axes.
 
+The shared band renderer now keeps LINEAR's vertical selection identical to
+POINT, while interpolating horizontally. Previously a fractional vertical
+coordinate mixed two rows, effectively applying bilinear filtering. The
+[NXP filter definitions](https://mcuxpresso.nxp.com/mcuxsdk/25.06.00/html/middleware/vglite/topics/blit_enumerations.html)
+distinguish these modes. An independent constant-row fixture constructs SDK
+inverse-translation coefficients and checks 104 vectors across all four tile
+modes, including negative coordinates and edges. It reproduces 24 incorrect
+LINEAR pixels before the fix and passes all 624 checks afterward. These are
+host decoder checks; they do not establish physical half-texel tie behavior.
+
 Validated layouts include BGRA8888, RGB565, packed BGRA5658 and BGR888, plus
 watch BGRA5551 and Q65's captured legacy encoding. Existing alpha blending,
 path coverage and clipping remain in use. Unsupported Gaussian states are
@@ -41,7 +51,10 @@ The [per-profile evidence matrix](gpu-device-validation.json) records all 39
 catalogue entries independently. Thirty-eight configurations using original AP bytes were
 run on the candidate core, produced nonzero GPU pixels and displayed native
 firmware UI, with no GPU rejection or reported Cortex/QMP fault in those runs.
-N187 was not run because its prior execution restriction remains in force.
+N187 was omitted under the restriction recorded for that earlier experiment.
+A later audit scoped the restriction to an old SDK task-reaping probe;
+ordinary display-only boot checks are separate. This GPU matrix retains its
+original execution records and does not claim an N187 GPU run.
 Some entries share AP bytes, but their observations are recorded separately.
 
 P67 needs a longer observation window: all nine configurations were still at the
