@@ -334,8 +334,19 @@ nonisolated enum StandaloneProcessSandbox {
                 writes.append(library)
             }
         case "prepare-bundled":
-            let arguments = ["--skip-oobe", "--no-skip-oobe"].contains(arguments.last ?? "")
+            var arguments = ["--skip-oobe", "--no-skip-oobe"].contains(arguments.last ?? "")
                 ? Array(arguments.dropLast()) : arguments
+            var physical = false
+            if arguments.count >= 4, arguments[arguments.count - 4] == "--bluetooth-mode" {
+                let options = Array(arguments.suffix(4))
+                guard options[1] == "esp32", options[2] == "--esp32-ready-file" else {
+                    throw SimulatorError.transport("蓝牙准备参数无效")
+                }
+                let ready = try physicalBluetoothReady(options[3])
+                inputs.append(ready.file)
+                extraRules.append("(allow file-read-metadata (literal \(quote(ready.socket.path))))")
+                arguments.removeLast(4); physical = true
+            }
             guard [5, 7, 11].contains(arguments.count), arguments[1] == "--profile-id", FirmwareLibraryValidation.identifier(arguments[2]),
                   arguments[3] == "--session-root" else { throw SimulatorError.transport("准备参数无效") }
             if arguments.count >= 7 {
@@ -350,9 +361,10 @@ nonisolated enum StandaloneProcessSandbox {
                 // cache subtree used by storage-maintain, not library writes.
                 writes.append(library.appendingPathComponent(".storage", isDirectory: true))
                 // Settles an interrupted earlier run of this instance itself.
-                if !isolatedDevelopment { extraRules = preparedSessionRules }
+                if !isolatedDevelopment { extraRules += preparedSessionRules }
             }
             if arguments.count == 11 {
+                guard !physical else { throw SimulatorError.transport("ESP32 实例不能使用虚拟身份参数") }
                 guard arguments[7] == "--virtual-serial", arguments[9] == "--virtual-address" else {
                     throw SimulatorError.transport("虚拟身份参数无效")
                 }
@@ -361,7 +373,7 @@ nonisolated enum StandaloneProcessSandbox {
             let root = try reservationRoot(arguments[4], prefix: "azki-b-")
             let nonce = try StandaloneSandboxFiles.reserve(root)
             argv += ["--reservation-nonce", nonce]; writes.append(root)
-            if arguments.count >= 7, try permitsSyntheticKey(runtime: runtime, profile: arguments[2]) {
+            if !physical, arguments.count >= 7, try permitsSyntheticKey(runtime: runtime, profile: arguments[2]) {
                 // SecKey random generation cannot run in the static helper's
                 // deny-default sandbox. Generate only our fresh ephemeral key
                 // in the native host; the helper imports this bounded snapshot.
@@ -373,6 +385,27 @@ nonisolated enum StandaloneProcessSandbox {
                 let keyFile = temporary.appendingPathComponent("native-p256.bin")
                 try StandaloneSandboxFiles.writeExclusive(key, to: keyFile)
                 argv += ["--virtual-key-file", keyFile.path, "--virtual-key-sha256", StandaloneSandboxFiles.digest(key)]
+            }
+        case "esp32-flash":
+            guard [7, 9].contains(arguments.count), arguments[1] == "--port",
+                  arguments[3] == "--backup-root", arguments[5] == "--operation",
+                  ["install", "restore"].contains(arguments[6]),
+                  (arguments[6] == "install" && arguments.count == 7)
+                    || (arguments[6] == "restore" && arguments.count == 9 && arguments[7] == "--backup") else {
+                throw SimulatorError.transport("ESP32 刷写参数无效")
+            }
+            try SimulatorSerialDevice.validatePath(arguments[2])
+            let backups = library.appendingPathComponent("esp32-backups", isDirectory: true)
+            guard arguments[4] == backups.path else { throw SimulatorError.transport("ESP32 备份目录不匹配") }
+            try StandaloneSandboxFiles.ensureLibrary(backups)
+            writes.append(backups)
+            inputs.append(URL(fileURLWithPath: arguments[2]))
+            extraRules += ["(allow file-write* file-ioctl (literal \(quote(arguments[2]))))"]
+            if arguments.count == 9 {
+                let backup = try StandaloneSandboxFiles.canonicalURL(arguments[8])
+                try validateInput(backup); inputs.append(backup)
+                let receipt = backup.deletingLastPathComponent().appendingPathComponent("receipt.json")
+                try validateInput(receipt); inputs.append(receipt)
             }
         case "instance-identity":
             guard arguments.count == 3, arguments[1] == "--instance-id",
@@ -411,7 +444,7 @@ nonisolated enum StandaloneProcessSandbox {
             if isolatedDevelopment { try requireNoIsolatedPendingSession(instance) }
             writes.append(instance)
             // A stopped run's session can then be committed instead of rolled back.
-            if !isolatedDevelopment { extraRules = preparedSessionRules }
+            if !isolatedDevelopment { extraRules += preparedSessionRules }
         case "sessions-cleanup":
             // Removes stale session roots this app created in /private/tmp. SBPL
             // `subpath` cannot express a name prefix, so the grant is a fixed regex
@@ -481,6 +514,16 @@ nonisolated enum StandaloneProcessSandbox {
             StandaloneSandboxFiles.narrowPrivate(instance)
             _ = try StandaloneSandboxFiles.directory(instance, privateOnly: true)
             writes += [session, instance]
+            let binding = try object(StandaloneSandboxFiles.regular(session.appendingPathComponent("instance-storage.json")))
+            if let physical = binding["physicalBluetooth"] as? [String: Any], let readyPath = physical["readyFile"] as? String {
+                let ready = try StandaloneSandboxFiles.canonicalURL(readyPath)
+                let radioRoot = ready.deletingLastPathComponent()
+                guard ready.lastPathComponent == "ready.json", radioRoot.deletingLastPathComponent().path == "/private/tmp",
+                      radioRoot.lastPathComponent.range(of: #"^azki-esp-[0-9a-f]{12}$"#, options: .regularExpression) != nil else {
+                    throw SimulatorError.transport("ESP32 清理记录路径无效")
+                }
+                inputs += [radioRoot, radioRoot.appendingPathComponent("closed.json")]
+            }
         case "prepare":
             guard arguments.count == 8, arguments[2] == "--qemu", arguments[4] == "--firmware", arguments[6] == "--resource" else {
                 throw SimulatorError.transport("高级准备参数无效")
@@ -492,7 +535,8 @@ nonisolated enum StandaloneProcessSandbox {
             argv += ["--reservation-nonce", try StandaloneSandboxFiles.reserve(root)]; writes.append(root)
         default: throw SimulatorError.transport("未授权的静态命令")
         }
-        if command != "prepare" { argv += ["--engine-root", runtime.engine.path, "--library-root", library.path] }
+        if command == "esp32-flash" { argv += ["--engine-root", runtime.engine.path] }
+        else if command != "prepare" { argv += ["--engine-root", runtime.engine.path, "--library-root", library.path] }
         let trees = try packagedReadTrees(runtime)
         // Prepare derives an imported firmware's NOR layout by forking the
         // bundled Python (multi_device --nor-layout); deny-default blocks fork
@@ -541,6 +585,23 @@ nonisolated enum StandaloneProcessSandbox {
         return layouts[profile] != nil
             || profile.range(of: #"^miwear\.watch\.(n66|n67|o66|p65|p67|q65|q66)[a-z]{0,8}@[0-9][0-9.]{0,31}@[0-9a-f]{12}$"#,
                              options: .regularExpression) != nil
+    }
+
+    static func physicalBluetoothReady(_ path: String) throws -> (file: URL, directory: URL, socket: URL) {
+        let file = try StandaloneSandboxFiles.canonicalURL(path)
+        let directory = file.deletingLastPathComponent()
+        guard file.lastPathComponent == "ready.json", directory.deletingLastPathComponent().path == "/private/tmp",
+              directory.lastPathComponent.range(of: #"^azki-esp-[0-9a-f]{12}$"#, options: .regularExpression) != nil else {
+            throw SimulatorError.transport("ESP32 会话路径无效")
+        }
+        _ = try StandaloneSandboxFiles.directory(directory, privateOnly: true)
+        let ready = try object(StandaloneSandboxFiles.regular(file, limit: 16_384, privateOnly: true))
+        guard ready["ready"] as? Bool == true, let port = ready["port"] as? String,
+              let socketPath = ready["hciSocket"] as? String else { throw SimulatorError.transport("ESP32 尚未准备好") }
+        try SimulatorSerialDevice.validatePath(port)
+        let socket = try StandaloneSandboxFiles.canonicalURL(socketPath)
+        guard socket.deletingLastPathComponent().path == directory.path else { throw SimulatorError.transport("ESP32 HCI 路径无效") }
+        return (file, directory, socket)
     }
 
     static func makeServe(runtime: StandaloneBundledRuntime, session: URL, approvedIdentity: String,
@@ -635,6 +696,30 @@ nonisolated enum StandaloneProcessSandbox {
             var instanceWrites: [URL] = []
             var instanceArguments: [String] = []
             var settingsArguments: [String] = []
+            var physicalArguments: [String] = []
+            var physicalRules: [String] = []
+            if let physical = identity["physicalBluetooth"] as? [String: Any] {
+                guard physical["mode"] as? String == "esp32", let readyPath = physical["readyFile"] as? String,
+                      let port = physical["port"] as? String,
+                      let address = physical["controllerAddress"] as? String,
+                      let socket = physical["hciSocket"] as? String else {
+                    throw SimulatorError.transport("ESP32 启动绑定无效")
+                }
+                let ready = try physicalBluetoothReady(readyPath)
+                let value = try object(StandaloneSandboxFiles.regular(ready.file, limit: 16_384, privateOnly: true))
+                guard value["port"] as? String == port, value["controllerAddress"] as? String == address,
+                      ready.socket.path == socket else { throw SimulatorError.transport("ESP32 已与准备时的设备不一致") }
+                guard let storage = identity["instanceStorage"] as? [String: Any],
+                      storage["available"] as? Bool == true, storage["virtualPeerEnabled"] as? Bool != true,
+                      let stored = storage["physicalBluetooth"] as? [String: Any],
+                      NSDictionary(dictionary: stored).isEqual(to: physical) else {
+                    throw SimulatorError.transport("ESP32 与实例存储的连接绑定不一致")
+                }
+                instanceReads.append(ready.file)
+                physicalRules = ["(allow network-bind network-inbound network-outbound (local unix-socket (subpath \(quote(ready.directory.path)))))",
+                                 "(allow file-read-metadata (literal \(quote(socket))))"]
+                physicalArguments = ["--bluetooth-mode", "esp32", "--esp32-ready-file", readyPath]
+            }
             if let binding = identity["instanceStorage"] as? [String: Any], binding["available"] as? Bool == true {
                 guard let capabilities = identity["runtimeCapabilities"] as? [String: Any],
                       let capability = capabilities["nandPersistence"] as? [String: Any],
@@ -712,17 +797,24 @@ nonisolated enum StandaloneProcessSandbox {
             guestWrites.append(assets)
             let text = policy(executables: guestExecutables, readTrees: [],
                 readFiles: pins + Array(directories) + instanceReads, writeTrees: guestWrites, writeFiles: instanceWrites,
-                unixDirectory: run, allowChildren: true, extraRules: debugger.map { [$0.sandboxRule] } ?? [])
+                unixDirectory: run, allowChildren: true, extraRules: physicalRules + (debugger.map { [$0.sandboxRule] } ?? []))
             return StandaloneSandboxLaunch(policyText: text, arguments: [runtime.python.path, "-I", "-S", "-B", supervisor.path,
                 "--native", String(maxRuntime), run.appendingPathComponent("runner-process.json").path,
-                String(getpid()), runtime.engine.path, project.path, profile, run.path] + instanceArguments + settingsArguments
+                String(getpid()), runtime.engine.path, project.path, profile, run.path] + instanceArguments + settingsArguments + physicalArguments
                     + [(plan["skipOOBE"] as? Bool ?? true) ? "--skip-oobe" : "--no-skip-oobe"] + (debugger?.arguments ?? []),
                 workingDirectory: project, temporaryDirectory: guestTemporary)
         }
         // H may inspect peer/process ownership, but never forks or executes G.
         // The native app creates G as a separate sibling under its narrower policy.
-        let text = policy(executables: [runtime.python], readTrees: [], readFiles: pins + Array(directories),
-                          writeTrees: [session, temporary], unixDirectory: session) + "(allow process-info*)\n"
+        var helperReads = pins + Array(directories)
+        var helperRules: [String] = []
+        if let physical = identity["physicalBluetooth"] as? [String: Any], let path = physical["readyFile"] as? String {
+            let ready = try physicalBluetoothReady(path)
+            helperReads.append(ready.file)
+            helperRules.append("(allow file-read-metadata (literal \(quote(ready.socket.path))))")
+        }
+        let text = policy(executables: [runtime.python], readTrees: [], readFiles: helperReads,
+                          writeTrees: [session, temporary], unixDirectory: session, extraRules: helperRules) + "(allow process-info*)\n"
         return StandaloneSandboxLaunch(policyText: text, arguments: [runtime.python.path, "-I", "-S", "-B", runtime.script.path,
             "serve", session.path, "--max-runtime", String(maxRuntime), "--approved-identity-sha256", approvedIdentity, "--no-discovery", "--native-broker"],
             workingDirectory: session, temporaryDirectory: temporary)
@@ -800,7 +892,7 @@ nonisolated enum StandaloneProcessSandbox {
 /// Serial actor bookkeeping, concurrent detached I/O. Cancellation before start
 /// and Process.run share the same lock, so a cancelled job cannot launch later.
 actor StandaloneInspectionExecutor {
-    private struct Job { let task: Task<Data, Error>; let owner: StandaloneOwnedCommand }
+    private struct Job { let task: Task<Data, Error>; let owner: StandaloneOwnedCommand; let command: String }
     private var jobs: [UUID: Job] = [:]
     func run(_ arguments: [String]) async throws -> Data {
         try Task.checkCancellation()
@@ -825,12 +917,12 @@ actor StandaloneInspectionExecutor {
             try Task.checkCancellation()
             return try StandalonePython.run(launch: launch, command: arguments[0], owner: owner)
         }
-        jobs[id] = Job(task: task, owner: owner)
+        jobs[id] = Job(task: task, owner: owner, command: arguments[0])
         defer { jobs[id] = nil }
         return try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel(); owner.cancel() })
     }
     func cancelAll() async {
-        let pending = Array(jobs.values)
+        let pending = jobs.values.filter { $0.command != "instance-storage-finish" }
         pending.forEach { $0.task.cancel(); $0.owner.cancel() }
         for job in pending { _ = try? await job.task.value }
     }

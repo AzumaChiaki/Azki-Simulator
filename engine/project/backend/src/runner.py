@@ -109,7 +109,7 @@ def validate_factory_input(machine, path):
         raise ValueError('--factory-image requires a 128 KiB Q66 LittleFS partition')
 
 
-def initialize_startup_nor(storage, virtual_state, *, skip_oobe, property_file, machine=None):
+def initialize_startup_nor(storage, virtual_state, *, skip_oobe, property_file, machine=None, physical_address=None, model=None, firmware_bytes=None):
     """Initialize new storage only; changing the preference never resets a device.
 
     Synthetic manufacturing identity is independent from setup completion and
@@ -123,7 +123,35 @@ def initialize_startup_nor(storage, virtual_state, *, skip_oobe, property_file, 
         # P65 local setup uses a separately identified AP boot copy. Its raw
         # factory_data remains erased until original firmware authors it.
         return True
-    if virtual_state is not None:
+    if physical_address is not None:
+        from .factory import make_image, random_properties, local_desktop_image
+        import re
+        if (virtual_state is not None or storage['factoryBytes'] != 128 * 1024
+                or re.fullmatch(r'[0-9A-F]{2}(:[0-9A-F]{2}){5}', physical_address) is None):
+            raise ValueError('Invalid physical controller factory binding')
+        properties = random_properties()
+        properties.update({'ro.factory.mac_bt': physical_address, 'product.model': model,
+                           'ro.factory.model': model})
+        if firmware_bytes:
+            marker = firmware_bytes.find(b'"product_info":')
+            start = firmware_bytes.rfind(b'{', 0, marker)
+            if marker < 0 or start < 0:
+                raise ValueError('Original firmware product identity table is absent')
+            info, _ = json.JSONDecoder().raw_decode(firmware_bytes[start:start + 16384].decode(errors='replace'))
+            product = next((p for p in info['product_info'] if p['miwear_model'] == model), None)
+            if product is None:
+                raise ValueError('Model is absent from original firmware identity table')
+            properties.update({'ro.factory.pid': product['miwear_pid'], 'product.pid': product['miwear_pid'],
+                               'ro.factory.board_id': str(product['board_id'])})
+        seed = make_image(properties)
+        if skip_oobe:
+            # Apply the same explicit local setup preference to the new identity.
+            from tempfile import NamedTemporaryFile
+            with NamedTemporaryFile() as source:
+                source.write(seed); source.flush()
+                seed = local_desktop_image(source.name, property_file)
+        initialize_instance_nor(storage, seed)
+    elif virtual_state is not None:
         from .virtual_peer.state import factory_image, config_image
         factory_seed = factory_image(virtual_state, skip_oobe=skip_oobe)
         config_seed = config_image(virtual_state)
@@ -381,6 +409,8 @@ def main():
     else:
         parser.print_help()
         return 0
+    parser.add_argument('--physical-controller-address')
+    parser.add_argument('--physical-model')
     parser.add_argument('--virtual-peer-state',type=Path)
     parser.add_argument('--virtual-peer-state-sha256')
     parser.add_argument('--virtual-peer-output',type=Path)
@@ -490,7 +520,7 @@ def main():
         parser.error('--bluetooth hci requires an existing --hci-socket from hci_bridge.py')
     if args.hci_socket and args.bluetooth != 'hci':
         parser.error('--hci-socket requires --bluetooth hci')
-    if args.factory_image is None and args.bluetooth == 'hci' and board.get('machine') != 'azki-p65':
+    if args.factory_image is None and args.bluetooth == 'hci' and not instance_nor and board.get('machine') != 'azki-p65':
         configured_factory = here / 'device/hci-factory.bin'
         if configured_factory.is_file():
             args.factory_image = configured_factory
@@ -625,7 +655,9 @@ def main():
         try:
             initialize_startup_nor(instance_nor, virtual_state,
                                    skip_oobe=args.skip_oobe, property_file=property_file,
-                                   machine=board.get('machine'))
+                                   machine=board.get('machine'),
+                                   physical_address=args.physical_controller_address, model=args.physical_model,
+                                   firmware_bytes=firmware_bytes)
         except (OSError, ValueError, RuntimeError) as error:
             parser.error('NOR instance initialization failed: ' + str(error))
         print('First-run setup: ' + ('skip OOBE.' if args.skip_oobe else 'firmware OOBE; no local binding injected.'), flush=True)

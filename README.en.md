@@ -11,6 +11,7 @@ A standalone wearable-device simulator for Apple Silicon Macs. Its native SwiftU
 - Start, stop, cold restart and persistent instance storage, with unlimited sessions by default.
 - Storage management: APFS copy-on-write snapshots, a shared erased-NAND template, automatic deduplication and session cleanup, with per-instance space accounting. Open it from the toolbar, the Storage menu, or Settings → Storage; see [storage notes](docs/STORAGE.md).
 - Install quick apps and watchfaces; configure synthetic serial numbers, virtual Bluetooth addresses and initial setup options.
+- ESP32 USB serial Bluetooth bridging, full-flash backup, firmware installation and restore for separate Q66 instances; see [ESP32 notes](docs/ESP32.md).
 - Edit raw PMU ADC inputs. Confirmed purposes are labelled; uncalibrated values do not imply physical units.
 
 The catalog provides hardware presets for the Xiaomi Smart Band 9, 9 Pro, 10, 10 Pro and 11 families. Any complete OTA package can be imported, not only catalog versions; an instance boots the selected firmware on its own hardware preset, and reports the reason at launch when the firmware is incompatible (chip, resource layout, or a device family that differs from the preset). Runtime behavior still depends on the implemented hardware and storage layout. Firmware switching uses a cold restart.
@@ -25,7 +26,7 @@ Requires **Apple Silicon and macOS 15 or later**. The app bundles its interprete
 2. Open the DMG and drag **Azki Simulator** into **Applications**.
 3. Import firmware you are entitled to use, create an instance, select a firmware version and start it.
 
-The repository and automated builds **exclude vendor firmware, real-device identities, test instances and personal logs**. Firmware is imported locally and is not uploaded to this repository. Preserve your instance data; the application retains the previous storage snapshot when switching versions.
+The repository and automated builds **exclude wearable OTA firmware, real-device identities, test instances and personal logs**. Firmware is imported locally and is not uploaded to this repository. Preserve your instance data; the application retains the previous storage snapshot when switching versions.
 
 Release packages are not Developer ID signed or Apple notarized. Apple Silicon executables use only the ad-hoc signatures required to run. macOS may report an unidentified developer. Do not disable system security; use the system's per-application opening controls only after verifying the source.
 
@@ -34,7 +35,7 @@ Release packages are not Developer ID signed or Apple notarized. Apple Silicon e
 ```sh
 git clone git@github.com:AzumaChiaki/Azki-Simulator.git
 cd Azki-Simulator
-brew install python@3.12 meson ninja pkgconf glib gettext libffi pcre2 zstd dtc
+brew install python@3.12 meson ninja pkgconf glib gettext libffi pcre2 zstd dtc openssl@3 rust
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 export PATH="$(brew --prefix python@3.12)/libexec/bin:$PATH"
 ./scripts/build-dmg.sh

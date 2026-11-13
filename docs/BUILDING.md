@@ -6,7 +6,7 @@
 
 - Apple Silicon Mac，macOS 15 或更新。
 - 完整 Xcode，Swift 6.2 或更新；仅安装 Command Line Tools 不足以编译 SwiftUI 宏。
-- Homebrew 构建依赖：`python@3.12 meson ninja pkgconf glib gettext libffi pcre2 zstd dtc`。
+- Homebrew 构建依赖：`python@3.12 meson ninja pkgconf glib gettext libffi pcre2 zstd dtc openssl@3 rust`。
 - 首次构建需要联网下载公开的上游源码和 Python 构建依赖。
 
 应用使用者无需安装这些开发依赖。

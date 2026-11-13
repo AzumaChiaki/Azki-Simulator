@@ -27,6 +27,12 @@ final class StandaloneRuntimeModel {
             }
         }
     }
+    var bluetoothMode: SimulatorBluetoothMode = .virtual {
+        didSet { if oldValue != bluetoothMode && !isServing { revision &+= 1; prepared = nil; bundledPrepared = nil } }
+    }
+    var esp32Port = "" {
+        didSet { if oldValue != esp32Port && !isServing { revision &+= 1; prepared = nil; bundledPrepared = nil } }
+    }
     var virtualIdentity: SimulatorVirtualIdentity? {
         didSet {
             if oldValue != virtualIdentity && !isServing {
@@ -74,6 +80,7 @@ final class StandaloneRuntimeModel {
     let instanceID: UUID?
     private(set) var instanceStorageMessage = "用户数据盘尚未启用"
     @ObservationIgnored private var storageSession: URL?
+    @ObservationIgnored private var storageFinishing: Task<Bool, Never>?
     /// Bumped whenever this instance's runtime caches are reset. Views clear
     /// their own per-instance caches (debug text, guest inventory, drafts) on it.
     private(set) var resetEpoch = 0
@@ -100,6 +107,7 @@ final class StandaloneRuntimeModel {
     @ObservationIgnored private var helperOutput: FileHandle?
     @ObservationIgnored private var helperLaunch: StandaloneSandboxLaunch?
     @ObservationIgnored private var guestBroker: StandaloneGuestBroker?
+    @ObservationIgnored private let esp32Bridge = ESP32BridgeSession()
     @ObservationIgnored private var stopping: Task<Bool, Never>?
 
     // The optional owned process permits deterministic authored lifecycle tests.
@@ -107,11 +115,12 @@ final class StandaloneRuntimeModel {
     init(ownedHelper: Process? = nil, helperOutput: FileHandle? = nil, helperIsStarting: Bool = false,
          firmwareService: BundledFirmwareService = BundledFirmwareService(),
          maximumRuntimeSeconds: Int = StandaloneRunLimits.unlimited,
-         modelConstraint: String? = nil, instanceID: UUID? = nil) {
+         modelConstraint: String? = nil, instanceID: UUID? = nil, ownedStorageSession: URL? = nil) {
         precondition(StandaloneRunLimits.isValid(maximumRuntimeSeconds))
         self.maximumRuntimeSeconds = maximumRuntimeSeconds
         self.modelConstraint = modelConstraint
         self.instanceID = instanceID
+        self.storageSession = ownedStorageSession
         if let instanceID, let saved = UserDefaults.standard.dictionary(forKey: "AzkiDebugger." + instanceID.uuidString.lowercased()) {
             debuggerEnabled = saved["enabled"] as? Bool ?? false
             debuggerWaitForAttach = saved["waitForAttach"] as? Bool ?? false
@@ -420,8 +429,8 @@ final class StandaloneRuntimeModel {
         return true
     }
 
-    /// Prepare happens internally after the user's Run action. It never starts
-    /// a helper or executes firmware; the fresh receipt is the approval boundary.
+    /// Preparation binds storage and inputs before firmware execution. ESP32
+    /// mode first opens the selected controller to obtain its actual identity.
     @discardableResult func prepareSelectedFirmware() async -> Bool {
         guard canRunSelectedFirmware, let profileID = selectedProfileID else { return false }
         operationCount += 1
@@ -443,13 +452,28 @@ final class StandaloneRuntimeModel {
                 .appendingPathComponent("azki-b-" + UUID().uuidString.lowercased().prefix(12), isDirectory: true)
             var arguments = ["prepare-bundled", "--profile-id", profileID, "--session-root", root.path]
             if let instanceID { arguments += ["--instance-id", instanceID.uuidString.lowercased()] }
-            if let virtualIdentity, instanceID != nil {
+            if bluetoothMode == .virtual, let virtualIdentity, instanceID != nil {
                 arguments += ["--virtual-serial", virtualIdentity.serial, "--virtual-address", virtualIdentity.address]
+            }
+            if bluetoothMode == .esp32 {
+                try SimulatorSerialDevice.validatePath(esp32Port)
+                guard await esp32Bridge.stop() else { throw SimulatorError.transport("旧 ESP32 桥接尚未退出") }
+                esp32Bridge.archiveStoppedState()
+                esp32Bridge.onFailure = { [weak self] in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        let stopped = await self.stop()
+                        self.errorMessage = stopped ? "ESP32 桥接已断开，设备已停止。"
+                            : (self.esp32Bridge.lastFailure ?? "ESP32 桥接已断开，清理尚未确认。")
+                    }
+                }
+                let ready = try await esp32Bridge.start(port: esp32Port, timeout: connectionSettings.timeoutSeconds)
+                arguments += ["--bluetooth-mode", "esp32", "--esp32-ready-file", ready.path]
             }
             arguments += [skipOOBE ? "--skip-oobe" : "--no-skip-oobe"]
             let output = try await runHelper(arguments)
             let receipt = try BundledPreparedSession.decode(output, requestedRoot: root, profileID: profileID)
-            guard token == revision, profileID == selectedProfileID else { return false }
+            guard token == revision, profileID == selectedProfileID else { _ = await esp32Bridge.stop(); return false }
             prepared = nil
             bundledPrepared = receipt
             sessionURL = receipt.root
@@ -464,7 +488,12 @@ final class StandaloneRuntimeModel {
             selectedSummary = receipt.summary + "\n\n完整身份 SHA-256：" + receipt.identityDigest
             statusMessage = "已核验所选固件；等待本次运行确认"
             return true
-        } catch { errorMessage = error.localizedDescription; return false }
+        } catch {
+            let stopped = await esp32Bridge.stop()
+            if stopped, storageSession == nil { esp32Bridge.archiveStoppedState() }
+            errorMessage = error.localizedDescription + (stopped ? "" : "\n" + (esp32Bridge.lastFailure ?? "ESP32 清理尚未确认"))
+            return false
+        }
     }
 
     private func selectionChanged() {
@@ -498,6 +527,30 @@ final class StandaloneRuntimeModel {
     static func waitForLaunchCleanup() async {
         guard let gate = launchCleanup else { return }
         _ = await SimulatorDeadline.bounded(20, fallback: false) { await gate.value; return true }
+    }
+
+    private(set) var esp32FlashMessage: String?
+    func flashESP32(restore backup: URL? = nil) async {
+        guard !isBusy, !isServing, !runtimeSession.isAttached else { return }
+        operationCount += 1
+        defer { operationCount -= 1 }
+        errorMessage = nil
+        esp32FlashMessage = backup == nil ? "正在备份并刷入桥接固件，完整备份可能需要数分钟，请保持连接…" : "正在恢复备份，请勿拔出设备…"
+        let access = backup?.startAccessingSecurityScopedResource() ?? false
+        defer { if access { backup?.stopAccessingSecurityScopedResource() } }
+        do {
+            guard await esp32Bridge.stop() else { throw SimulatorError.transport("ESP32 桥接尚未退出") }
+            guard await finishInstanceStorage() else { throw SimulatorError.transport(instanceStorageMessage) }
+            try SimulatorSerialDevice.validatePath(esp32Port)
+            var arguments = ["esp32-flash", "--port", esp32Port, "--backup-root",
+                             BundledFirmwareService.libraryRoot.appendingPathComponent("esp32-backups").path,
+                             "--operation", backup == nil ? "install" : "restore"]
+            if let backup { arguments += ["--backup", backup.path] }
+            let data = try await runHelper(arguments)
+            let value = try StandaloneProcessSandbox.object(data)
+            if value["ok"] as? Bool == false { throw SimulatorError.transport("ESP32 刷写未成功，请查看备份目录中的日志") }
+            esp32FlashMessage = backup == nil ? "桥接固件已刷入。原固件备份保存在 ESP32 备份目录。" : "备份已恢复。"
+        } catch { errorMessage = error.localizedDescription; esp32FlashMessage = "刷写未完成；请保留设备连接并查看错误。" }
     }
 
     private func runHelper(_ arguments: [String]) async throws -> Data {
@@ -668,6 +721,7 @@ final class StandaloneRuntimeModel {
     /// Executable contents are not rehashed as a second launch gate.
     func startApproved(maxRuntimeSeconds: Int? = nil) async {
         guard canStartPrepared else { return }
+        if bluetoothMode == .esp32, !esp32Bridge.isRunning { errorMessage = "ESP32 桥接已断开，请重新运行设备"; return }
         let preparedRoot: URL
         guard maxRuntimeSeconds.map(StandaloneRunLimits.isValid) ?? true else {
             errorMessage = "运行时限超出已准备会话的范围"
@@ -778,7 +832,7 @@ final class StandaloneRuntimeModel {
             } ?? error.localizedDescription
             let stopped: Bool
             if let launchedProcess { stopped = await stopOwnedHelper(expected: launchedProcess) }
-            else { stopped = true }
+            else { stopped = await esp32Bridge.stop() }
             if stopped { await finishInstanceStorage() }
             // A cancelled/older attempt must not overwrite a later session's UI.
             guard token == revision else { return }
@@ -805,12 +859,17 @@ final class StandaloneRuntimeModel {
         operationCount += 1
         defer { operationCount -= 1 }
         revision &+= 1
-        await firmwareService.cancelAll()
+        if storageFinishing == nil { await firmwareService.cancelAll() }
         let stopped = await stopOwnedHelper()
-        if stopped { await finishInstanceStorage() }
-        statusMessage = stopped ? "已停止；本应用创建的核心和 helper 已结束" : "停止尚未确认，请重试停止"
-        if !stopped { errorMessage = "设备进程尚未确认退出。可再次点击「停止模拟器」重试；仍失败时请使用「重置实例」。" }
-        return stopped
+        let storageFinished = stopped ? await finishInstanceStorage() : false
+        if stopped && !storageFinished {
+            statusMessage = "设备已停止，数据保存尚未完成；请重试停止"
+            errorMessage = instanceStorageMessage
+        } else {
+            statusMessage = stopped ? "已停止；本应用创建的核心和 helper 已结束" : "停止尚未确认，请重试停止"
+            if !stopped { errorMessage = esp32Bridge.lastFailure ?? "设备进程尚未确认退出。可再次点击「停止模拟器」重试；仍失败时请使用「重置实例」。" }
+        }
+        return stopped && storageFinished
     }
 
     private func observeTermination(of process: Process) {
@@ -824,8 +883,13 @@ final class StandaloneRuntimeModel {
                 self.revision &+= 1
                 let token = self.revision
                 let stopped = await self.stopOwnedHelper(expected: completed)
-                if stopped { await self.finishInstanceStorage() }
+                let storageFinished = stopped ? await self.finishInstanceStorage() : false
                 guard token == self.revision else { return }
+                if stopped && !storageFinished {
+                    self.statusMessage = "设备已停止，数据保存尚未完成；请重试停止"
+                    self.errorMessage = self.instanceStorageMessage
+                    return
+                }
                 if stopped, let guestPower {
                     await self.continueAfterGuestPower(guestPower)
                     return
@@ -871,26 +935,36 @@ final class StandaloneRuntimeModel {
     }
 
     @discardableResult private func finishInstanceStorage() async -> Bool {
-        guard let directory = storageSession, let instanceID else { return true }
-        storageSession = nil
+        if let storageFinishing { return await storageFinishing.value }
+        guard let directory = storageSession, let instanceID else {
+            esp32Bridge.archiveStoppedState()
+            return true
+        }
         operationCount += 1
         defer { operationCount -= 1 }
-        do {
-            let data = try await runHelper(["instance-storage-finish", "--session", directory.path,
-                "--instance-id", instanceID.uuidString.lowercased()])
-            let result = try JSONDecoder().decode(SimulatorJSON.self, from: data)
-            instanceStorageMessage = result["committed"]?.bool == true
-                ? (result["norPersistent"]?.bool == true
-                    ? "本次数据和设备配置已保存。" : "本次 NAND 数据已保存；NOR 配置尚未持久化。")
-                : "本次数据未提交，保留上一快照。\(result["reason"]?.string ?? "请查看会话诊断。")"
-            return true
-        } catch {
-            // A completed process is not proof that its snapshot receipt was
-            // published. Keep the binding so Stop/Run can retry idempotently.
-            if storageSession == nil { storageSession = directory }
-            instanceStorageMessage = "数据盘提交未完成，已保留已有快照：\(error.localizedDescription)"
-            return false
+        let task = Task { @MainActor [self] in
+            do {
+                let data = try await runHelper(["instance-storage-finish", "--session", directory.path,
+                    "--instance-id", instanceID.uuidString.lowercased()])
+                let result = try JSONDecoder().decode(SimulatorJSON.self, from: data)
+                instanceStorageMessage = result["committed"]?.bool == true
+                    ? (result["norPersistent"]?.bool == true
+                        ? "本次数据和设备配置已保存。" : "本次 NAND 数据已保存；NOR 配置尚未持久化。")
+                    : "本次数据未提交，保留上一快照。\(result["reason"]?.string ?? "请查看会话诊断。")"
+                storageSession = nil
+                esp32Bridge.archiveStoppedState()
+                return true
+            } catch {
+                // Keep the binding and radio receipt until the storage helper
+                // publishes its result, so Stop can retry the same transaction.
+                instanceStorageMessage = "数据盘提交未完成，已保留已有快照：\(error.localizedDescription)"
+                return false
+            }
         }
+        storageFinishing = task
+        let finished = await task.value
+        storageFinishing = nil
+        return finished
     }
 
     private func stopOwnedHelper(expected: Process? = nil) async -> Bool {
@@ -898,7 +972,7 @@ final class StandaloneRuntimeModel {
         runtimeSession.detach()
         if let stopping { return await stopping.value }
         let process = helper
-        guard process != nil || guestBroker != nil else { return true }
+        guard process != nil || guestBroker != nil else { return await esp32Bridge.stop() }
         // Keep ownership and busy state until every concurrent caller observes
         // the same completed teardown. Capture this helper's output, never a
         // mutable handle that a later launch could replace.
@@ -911,7 +985,8 @@ final class StandaloneRuntimeModel {
             let helperStopped: Bool
             if let process { helperStopped = await StandaloneProcessReaper.stop(process) }
             else { helperStopped = true }
-            let stopped = guestStopped && helperStopped
+            let radioStopped = guestStopped && helperStopped ? await esp32Bridge.stop() : false
+            let stopped = guestStopped && helperStopped && radioStopped
             if stopped, helper === process {
                 try? output?.close()
                 helperOutput = nil
@@ -973,7 +1048,7 @@ nonisolated enum StandalonePython {
             if process.isRunning { owner.cancel(); process.waitUntilExit() }
         }
         // Importing an arbitrary full OTA hashes and validates every member.
-        let timeout = command == "library-import" ? 300.0
+        let timeout = command == "esp32-flash" ? 2400.0 : command == "library-import" ? 300.0
             : command == "sessions-cleanup" ? 90.0
             : ["prepare", "prepare-bundled", "library-probe", "instance-reset"].contains(command) ? 45.0 : 15.0
         let deadline = StandaloneCommandDeadline()

@@ -19,15 +19,18 @@ from .virtual_peer import COMMANDS as GUEST_COMMANDS, supports_peer
 
 
 def create_minative_session(root, plan, *, instance_id=None, library_root=None,
-                            virtual_key_file=None, virtual_key_sha256=None, virtual_serial=None, virtual_address=None, skip_oobe=True):
+                            virtual_key_file=None, virtual_key_sha256=None, virtual_serial=None, virtual_address=None, skip_oobe=True, bluetooth_mode="virtual", esp32_ready_file=None):
     descriptor = create_session(root)
     root = Path(descriptor["directory"])
+    if bluetooth_mode == 'esp32' and instance_id is None:
+        raise ValueError('ESP32 蓝牙需要独立实例存储')
     if instance_id is not None:
         from .instance_storage import prepare_session_storage
         from .minative import with_instance_storage
         storage = prepare_session_storage(library_root, root, instance_id, plan,
             virtual_key_file=virtual_key_file, virtual_key_sha256=virtual_key_sha256,
-            virtual_serial=virtual_serial, virtual_address=virtual_address)
+            virtual_serial=virtual_serial, virtual_address=virtual_address,
+            bluetooth_mode=bluetooth_mode, esp32_ready_file=esp32_ready_file)
         descriptor["instanceStorage"] = storage
         if storage["available"]:
             plan = with_instance_storage(plan, storage)

@@ -107,6 +107,14 @@ def native_invocation(arguments):
     oobe = arguments[-1:] if arguments and arguments[-1] in ("--skip-oobe", "--no-skip-oobe") else []
     if oobe:
         arguments = arguments[:-1]
+    physical = arguments[-4:] if len(arguments) >= 4 and arguments[-4] == '--bluetooth-mode' else []
+    if physical:
+        if physical[:3] != ['--bluetooth-mode', 'esp32', '--esp32-ready-file']:
+            raise ValueError('Invalid physical Bluetooth invocation')
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from azki_simulator.esp32 import read_ready
+        read_ready(physical[3])
+        arguments = arguments[:-4]
     settings = arguments[-2:] if len(arguments) >= 2 and arguments[-2] == "--instance-settings" else []
     if settings:
         arguments = arguments[:-2]
@@ -150,6 +158,8 @@ def native_invocation(arguments):
                     or (len(nor) == 5 and nor[4] != "--instance-nor-initialize")):
                 raise ValueError("Native NOR arguments differ from the exact private profile file")
             command += nor
+    if physical and (virtual or len(core_arguments) not in (20, 21)):
+        raise ValueError('Physical Bluetooth requires separate persistent NOR and no virtual identity')
     if virtual:
         if (len(core_arguments) not in (20, 21)
                 or virtual[::2] != ["--virtual-peer-state", "--virtual-peer-state-sha256", "--virtual-peer-output"]
@@ -162,7 +172,7 @@ def native_invocation(arguments):
         if len(core_arguments) < 16 or settings[1] != str(run.parent / "instance-data/instance-settings.json"):
             raise ValueError("Native instance settings differ from the private session file")
         command += settings
-    return duration, metadata, parent, command + oobe + debugger + (["--verbose-logs"] if verbose_logs else [])
+    return duration, metadata, parent, command + physical + oobe + debugger + (["--verbose-logs"] if verbose_logs else [])
 
 
 def await_native_go(parent, stopped, *, descriptor=0, timeout=2):

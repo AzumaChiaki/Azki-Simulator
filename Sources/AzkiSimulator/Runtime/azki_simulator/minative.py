@@ -936,6 +936,8 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
                          nor_capability=runtime_capabilities.get("norPersistence"), ap_sha256=ap["sha256"],
                          virtual_capability=runtime_capabilities.get("virtualPeer"))
         identity["instanceStorage"] = binding
+        if binding.get('physicalBluetooth'):
+            identity['physicalBluetooth'] = binding['physicalBluetooth']
     if bootstrap is not None:
         identity["bootstrap"] = pin(_path(bootstrap), MAX_JSON)
     if storage == "yaffs":
@@ -995,6 +997,8 @@ def revalidate_plan(plan):
         observed = _dependency_link_target(mapping["logicalPath"])
         if any(observed[key] != mapping[key] for key in ("logicalPath", "chain", "realPath")):
             raise MError("identity_changed", "Dependency path mapping changed")
+    if identity.get('physicalBluetooth') != (identity.get('instanceStorage') or {}).get('physicalBluetooth'):
+        raise MError('invalid_plan', 'Physical Bluetooth differs from its instance storage')
     if identity.get("instanceStorage"):
         from .instance_storage import validate_binding
         capabilities = identity.get("runtimeCapabilities", {})
@@ -1009,6 +1013,8 @@ def with_instance_storage(plan, binding):
     """Attach the already prepared storage transaction without rereading Engine files."""
     result = _decode(_canonical(plan))
     result["identity"]["instanceStorage"] = binding
+    if binding.get('physicalBluetooth'):
+        result['identity']['physicalBluetooth'] = binding['physicalBluetooth']
     result["spec"]["instance_storage"] = binding
     result["approvalDigest"] = _digest(result["identity"])
     return result
@@ -1180,6 +1186,9 @@ class MinativeAdapter:
         if self.plan["identity"].get("instanceStorage"):
             from .instance_storage import instance_arguments
             command += instance_arguments(self.plan["identity"]["instanceStorage"], run_directory=self.run)
+        if self.plan['identity'].get('physicalBluetooth'):
+            command += ['--bluetooth-mode', 'esp32', '--esp32-ready-file',
+                        self.plan['identity']['physicalBluetooth']['readyFile']]
         command += ["--skip-oobe" if self.plan.get("skipOOBE", True) else "--no-skip-oobe"]
         return {"command": command,
                 "env": env, "cwd": spec["project"], "runnerMetadata": str(self.runner_metadata),

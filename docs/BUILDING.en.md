@@ -6,7 +6,7 @@
 
 - Apple Silicon Mac running macOS 15 or later.
 - Full Xcode with Swift 6.2 or later. Command Line Tools alone may lack the SwiftUI macro plugins.
-- Homebrew build dependencies: `python@3.12 meson ninja pkgconf glib gettext libffi pcre2 zstd dtc`.
+- Homebrew build dependencies: `python@3.12 meson ninja pkgconf glib gettext libffi pcre2 zstd dtc openssl@3 rust`.
 - Internet access for the initial download of public upstream sources and Python build dependencies.
 
 End users do not need these development dependencies.

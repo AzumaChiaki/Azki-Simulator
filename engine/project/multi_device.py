@@ -250,6 +250,8 @@ def main():
     parser.add_argument('--instance-settings', type=Path)
     parser.add_argument('--skip-oobe', action=argparse.BooleanOptionalAction, default=True,
         help='Complete first-run setup locally (default); --no-skip-oobe preserves the firmware setup flow. Existing instance settings are kept.')
+    parser.add_argument('--bluetooth-mode', choices=('virtual', 'esp32'), default='virtual')
+    parser.add_argument('--esp32-ready-file', type=Path)
     parser.add_argument('--virtual-peer-state',type=Path)
     parser.add_argument('--virtual-peer-state-sha256')
     parser.add_argument('--virtual-peer-output',type=Path)
@@ -258,6 +260,13 @@ def main():
     parser.add_argument('--gdb-wait',action='store_true',help='With --gdb: hold the CPU at reset until the debugger continues')
     args=parser.parse_args()
     virtual_requested=any((args.virtual_peer_state,args.virtual_peer_state_sha256,args.virtual_peer_output))
+    physical = None
+    if args.bluetooth_mode == 'esp32':
+        if virtual_requested or args.esp32_ready_file is None:
+            parser.error('Physical Bluetooth excludes virtual peer state and requires a ready controller')
+        physical = json.loads(args.esp32_ready_file.read_text())
+        if not physical.get('ready') or not Path(physical['hciSocket']).is_socket():
+            parser.error('Physical controller is no longer ready')
     if virtual_requested and (not all((args.virtual_peer_state,args.virtual_peer_state_sha256,args.virtual_peer_output)) or args.trace):
         parser.error('Virtual peer requires all private state arguments and an exact supported profile; instruction traces are disabled')
     instance_requested = any((args.instance_data_image, args.instance_spare_image,
@@ -359,7 +368,7 @@ def main():
         image_path.write_bytes(checked_member(package, sensor_records[0], verify_sha=False))
         image_path.chmod(0o600)
         args.sensor_image = image_path
-    sys.argv=[str(BACKEND/'run.py'),'--bluetooth','virtual' if virtual_requested else 'reject',
+    sys.argv=[str(BACKEND/'run.py'),'--bluetooth','hci' if physical else 'virtual' if virtual_requested else 'reject',
         '--firmware',profile['ap_path'],'--resource',str(resource),'--board-profile',str(board_path),
         '--qemu',str(BACKEND/'build/qemu-system-arm'),'--log-dir',str(logdir)]
     if profile['model'] == 'miwear.watch.p65':
@@ -388,6 +397,8 @@ def main():
             sys.argv.append('--instance-nor-initialize')
     if virtual_requested:
         sys.argv += ['--virtual-peer-state',str(args.virtual_peer_state),'--virtual-peer-state-sha256',args.virtual_peer_state_sha256,'--virtual-peer-output',str(args.virtual_peer_output)]
+    if physical:
+        sys.argv += ['--hci-socket', physical['hciSocket'], '--physical-controller-address', physical['controllerAddress'], '--physical-model', profile['model']]
     if not args.headless: sys.argv+=['--window']
     if args.trace: sys.argv+=['--trace']
     if args.verbose_logs: sys.argv+=['--verbose-logs']

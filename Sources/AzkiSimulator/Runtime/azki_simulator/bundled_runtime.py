@@ -130,7 +130,7 @@ def _materialize(engine, prepared):
 
 
 def prepare_profile(engine_root, library_root, profile_id, session_root, *, reservation_nonce=None, instance_id=None,
-                    virtual_key_file=None, virtual_key_sha256=None, virtual_serial=None, virtual_address=None, skip_oobe=True):
+                    virtual_key_file=None, virtual_key_sha256=None, virtual_serial=None, virtual_address=None, skip_oobe=True, bluetooth_mode="virtual", esp32_ready_file=None):
     """Create static inputs and a new local session; never start a process.
 
     session_root is a new private container. The returned session directory is
@@ -222,7 +222,8 @@ def prepare_profile(engine_root, library_root, profile_id, session_root, *, rese
             reservation.check()
         descriptor = create_minative_session(container / "session", plan, instance_id=instance_id, library_root=library_root,
             virtual_key_file=virtual_key_file, virtual_key_sha256=virtual_key_sha256,
-            virtual_serial=virtual_serial, virtual_address=virtual_address, skip_oobe=skip_oobe)
+            virtual_serial=virtual_serial, virtual_address=virtual_address, skip_oobe=skip_oobe,
+            bluetooth_mode=bluetooth_mode, esp32_ready_file=esp32_ready_file)
         if reservation is not None:
             reservation.check()
         return {**descriptor, "ok": True, "version": 1, "profileID": profile_id,

@@ -21,6 +21,8 @@ final class SimulatorInstanceContext: Identifiable {
         runtime.selectedProfileID = record.selectedProfileID
         runtime.virtualIdentity = record.virtualIdentity
         runtime.skipOOBE = record.skipOOBE ?? true
+        runtime.bluetoothMode = record.bluetoothMode ?? .virtual
+        runtime.esp32Port = record.esp32Port ?? ""
         let session = runtime.runtimeSession
         bluetooth = BluetoothExternalSession { [weak session] request in
             guard let session else { throw SimulatorError.disconnected }
@@ -265,6 +267,24 @@ final class SimulatorInstanceLibrary {
         try store.save(candidate)
         instance.record = candidate[index]
         instance.runtime.skipOOBE = enabled
+    }
+
+    func setBluetooth(_ id: UUID, mode: SimulatorBluetoothMode, port: String) async throws {
+        guard storageAvailable, let instance = instances.first(where: { $0.id == id }),
+              !instance.runtime.isBusy, !instance.runtime.isServing, !instance.runtime.runtimeSession.isAttached else {
+            throw SimulatorInstanceStoreError.invalid("停止设备后可修改蓝牙连接")
+        }
+        if !port.isEmpty { try SimulatorSerialDevice.validatePath(port) }
+        guard await instance.runtime.stop() else { throw SimulatorError.transport("旧连接尚未释放") }
+        instance.bluetooth.stop()
+        var candidate = instances.map(\.record)
+        guard let index = candidate.firstIndex(where: { $0.id == id }) else { return }
+        candidate[index].bluetoothMode = mode
+        candidate[index].esp32Port = port.isEmpty ? nil : port
+        try store.save(candidate)
+        instance.record = candidate[index]
+        instance.runtime.bluetoothMode = mode
+        instance.runtime.esp32Port = port
     }
 
     /// Names of instances whose stop could not be confirmed (empty on success).

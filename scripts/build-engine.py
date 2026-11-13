@@ -29,7 +29,11 @@ ROOT = Path(__file__).resolve().parents[1]
 INPUT = ROOT / 'engine'
 QEMU_VERSION = '10.1.0'
 PYTHON_VERSION = '3.12.12'
-PACKAGES = {'pillow': '12.3.0', 'littlefs-python': '0.19.0'}
+PACKAGES = {'pillow': '12.3.0', 'littlefs-python': '0.19.0',
+    'pyserial': '3.5', 'esptool': '5.6.0', 'cryptography': '50.0.2', 'cffi': '2.1.1',
+    'pycparser': '3.12', 'reedsolo': '1.7.0', 'PyYAML': '6.0.3', 'intelhex': '2.3.0',
+    'rich_click': '1.9.9', 'click': '8.5.1', 'esp-pylib': '1.2.1', 'rich': '15.0.0',
+    'websockets': '17.4', 'markdown-it-py': '4.3.0', 'pygments': '2.21.0', 'mdurl': '0.1.2'}
 MAGIC = {bytes.fromhex(v) for v in ('feedface','cefaedfe','feedfacf','cffaedfe','cafebabe','bebafeca','cafebabf','bfbafeca')}
 
 
@@ -415,8 +419,9 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
     env['PATH']=str(builder.parent)+os.pathsep+env['PATH']
     if args.tools_dir:env['PATH']=str(args.tools_dir)+os.pathsep+env['PATH']
     prefix=Path(output([brew,'--prefix']))
-    env['PKG_CONFIG_PATH']=os.pathsep.join(str(prefix/'opt'/f/'lib/pkgconfig') for f in ('glib','libffi','pcre2','zstd','dtc'))
+    env['PKG_CONFIG_PATH']=os.pathsep.join(str(prefix/'opt'/f/'lib/pkgconfig') for f in ('glib','libffi','pcre2','zstd','dtc','openssl@3'))
     env['PKG_CONFIG_PATH']+=os.pathsep+sdk+'/usr/lib/pkgconfig'
+    env['OPENSSL_DIR']=output([brew,'--prefix','openssl@3'])
     env['CPATH']=str(prefix/'include'); env['LIBRARY_PATH']=str(prefix/'lib')
     downloads=cache/'downloads'; sources=cache/'source'; sources.mkdir(exist_ok=True)
     delivery=cache/'corresponding-source';delivery.mkdir(exist_ok=True)
@@ -458,7 +463,7 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
     for package,version in PACKAGES.items():
         # Reuse a previously built wheel for this exact package/version so the
         # PyPI metadata fetch, sdist download and native build are all skipped.
-        cached=[p for p in wheels.glob('*.whl') if p.name.lower().startswith(package.lower()+'-') and version in p.name]
+        cached=[p for p in wheels.glob('*.whl') if p.name.lower().replace('_','-').startswith(package.lower().replace('_','-')+'-') and version in p.name]
         if cached:
             print(f'Reusing cached wheel {cached[0].name}', flush=True)
             continue
@@ -512,7 +517,7 @@ def build_engine(work, engine, source_output, jobs=None, build_python=None, tool
         d=engine/'licenses'/name;d.mkdir(exist_ok=True);shutil.copy2(path,d/'LICENSE')
     formulas=relocate(engine,brew,delivery)
     # Import smoke checks exercise newly built host libraries, never firmware.
-    smoke="import sys; from pathlib import Path; assert Path(sys.prefix).resolve()==Path(sys.executable).resolve().parent.parent; sys.path.insert(0,sys.argv[1]); import PIL.Image, littlefs, ctypes, socket, zlib; print('Engine Python imports ready')"
+    smoke="import sys; from pathlib import Path; assert Path(sys.prefix).resolve()==Path(sys.executable).resolve().parent.parent; sys.path.insert(0,sys.argv[1]); import PIL.Image, littlefs, ctypes, socket, zlib, serial, esptool, cryptography; print('Engine Python imports ready')"
     run([engine/'python/bin/python3.12','-I','-S','-B','-c',smoke,site],env={**env,'PYTHONDONTWRITEBYTECODE':'1'})
     run([build/'qemu-system-arm','--version'],env=env)
     # Startup validation requires every directory on disk to be implied by the

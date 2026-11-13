@@ -55,6 +55,8 @@ def main():
             library.add_argument("--session-root", type=Path, required=True)
             library.add_argument("--reservation-nonce", help="One-use nonce for an already host-reserved private root")
             library.add_argument("--instance-id", help="Stable native instance UUID; enables only exact-core-declared storage")
+            library.add_argument('--bluetooth-mode', choices=('virtual', 'esp32'), default='virtual')
+            library.add_argument('--esp32-ready-file', type=Path)
             library.add_argument("--virtual-key-file", type=Path, help="Private native-generated ephemeral P-256 handoff")
             library.add_argument("--virtual-key-sha256", help="Exact native-generated handoff digest")
             library.add_argument("--virtual-serial", help="Requested synthetic serial for the next boot")
@@ -84,6 +86,19 @@ def main():
             library.add_argument("--auto", action="store_true",
                                  help="Deduplicate, share erased images and clean sessions without pruning")
             library.add_argument("--dry-run", action="store_true")
+    for action in ('esp32-devices', 'esp32-bridge', 'esp32-flash'):
+        esp = commands.add_parser(action)
+        esp.add_argument('--engine-root', type=Path, required=True)
+        esp.add_argument('--library-root', type=Path)
+        if action != 'esp32-devices':
+            esp.add_argument('--port', required=True)
+        if action == 'esp32-bridge':
+            esp.add_argument('--state-root', type=Path, required=True)
+            esp.add_argument('--expected-address')
+        if action == 'esp32-flash':
+            esp.add_argument('--backup-root', type=Path, required=True)
+            esp.add_argument('--operation', choices=('backup','install','restore'), required=True)
+            esp.add_argument('--backup', type=Path)
     commands.add_parser("discover", help="List unconnected same-user session candidates; never auto-connect")
     power = commands.add_parser("power", help="Bounded core shutdown/cold restart/switch; never live reload")
     power.add_argument("session", type=Path)
@@ -125,7 +140,18 @@ def main():
                                           "inspect-package", "stage-package", "install", "uninstall"])
     call.add_argument("--arguments", default="{}", help="JSON object")
     args = parser.parse_args()
-    if args.action in BUNDLED_ACTIONS:
+    if args.action.startswith('esp32-'):
+        from azki_simulator import esp32
+        try:
+            if args.action == 'esp32-devices':
+                result = esp32.devices(args.engine_root)
+            elif args.action == 'esp32-bridge':
+                result = esp32.bridge(args.engine_root, args.port, args.state_root, args.expected_address)
+            else:
+                result = esp32.flash(args.engine_root, args.port, args.backup_root, args.operation, args.backup)
+        except Exception as error:
+            result = {'ok': False, 'error': str(error)}
+    elif args.action in BUNDLED_ACTIONS:
         try:
             result = bundled_action(args)
         except Exception as error:  # Every failure is one JSON answer, never a trace.
@@ -280,7 +306,9 @@ def bundled_action(args):
                            virtual_key_sha256=getattr(args, "virtual_key_sha256", None),
                            virtual_serial=getattr(args, "virtual_serial", None),
                            virtual_address=getattr(args, "virtual_address", None),
-                           skip_oobe=getattr(args, "skip_oobe", True))
+                           skip_oobe=getattr(args, "skip_oobe", True),
+                           bluetooth_mode=getattr(args, 'bluetooth_mode', 'virtual'),
+                           esp32_ready_file=getattr(args, 'esp32_ready_file', None))
 
 
 if __name__ == "__main__":

@@ -23,3 +23,12 @@ Firmware/
 instances/
 .workbuddy
 .build-debug
+
+# Authored ESP32 controller source; device images remain private elsewhere.
+!engine/project/backend/esp32-controller/firmware/
+!engine/project/backend/esp32-controller/firmware/CMakeLists.txt
+!engine/project/backend/esp32-controller/firmware/sdkconfig
+!engine/project/backend/esp32-controller/firmware/sdkconfig.defaults
+!engine/project/backend/esp32-controller/firmware/main/
+!engine/project/backend/esp32-controller/firmware/main/CMakeLists.txt
+!engine/project/backend/esp32-controller/firmware/main/main.c

@@ -9,6 +9,8 @@ nonisolated struct SimulatorInstanceRecord: Codable, Equatable, Identifiable, Se
     var selectedProfileID: String?
     var virtualIdentity: SimulatorVirtualIdentity?
     var skipOOBE: Bool?
+    var bluetoothMode: SimulatorBluetoothMode?
+    var esp32Port: String?
     let createdAt: Date
 
     init(id: UUID = UUID(), name: String, model: String, selectedProfileID: String? = nil, createdAt: Date = Date(),

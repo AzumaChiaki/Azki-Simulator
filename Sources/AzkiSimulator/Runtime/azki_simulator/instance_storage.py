@@ -1257,12 +1257,21 @@ def public_instance_identity(library_root, instance_id):
 
 
 def prepare_session_storage(library_root, session_root, instance_id, plan, *,
-                            virtual_key_file=None, virtual_key_sha256=None, virtual_serial=None, virtual_address=None):
+                            virtual_key_file=None, virtual_key_sha256=None, virtual_serial=None, virtual_address=None,
+                            bluetooth_mode="virtual", esp32_ready_file=None):
     """Snapshot accepted NAND into a new private session; never execute a core.
 
     The host creates library/instances/<uuid> mode 0700. Accepted revisions stay
     outside the guest grant. Working disks and private state are session copies.
     """
+    if bluetooth_mode not in ('virtual', 'esp32'):
+        raise ValueError('Unknown Bluetooth transport')
+    physical = None
+    if bluetooth_mode == 'esp32':
+        from .esp32 import read_ready
+        physical = read_ready(esp32_ready_file)
+        if any((virtual_key_file, virtual_key_sha256, virtual_serial, virtual_address)):
+            raise ValueError('ESP32 实例不能使用虚拟蓝牙身份')
     instance_id = _uuid(instance_id)
     session_root = _path(session_root)
     base = {"available": False, "instanceID": instance_id, "kind": "nand-data-and-oob",
@@ -1270,6 +1279,8 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
             "virtualPeerReason": "当前核心或固件未启用已核验的虚拟通信"}
     capability = plan["identity"].get("runtimeCapabilities", {}).get("nandPersistence")
     if capability is None:
+        if physical:
+            raise ValueError('ESP32 蓝牙需要此核心支持独立实例存储')
         return {**base, "reason": "当前核心未声明已绑定身份的 NAND 写回能力；本次使用原临时数据盘"}
     firmware = _firmware(plan, capability)
     identity_model = (virtual_profile(firmware.profile) or (None, firmware.model))[1]
@@ -1287,9 +1298,23 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
             raise ValueError("此实例的数据属于 " + store.info["model"] + "，不能用 " + firmware.model
                              + " 硬件预设启动；请换回原硬件预设，或新建实例")
         old = store.head()
+        transport = store.info.get('bluetoothTransport', 'virtual' if old else None)
+        if transport is not None and transport != bluetooth_mode:
+            raise ValueError('此实例已绑定另一种蓝牙方式，请新建实例选择 ESP32 或虚拟蓝牙')
+        if physical:
+            if not firmware.model.startswith('miwear.watch.q66') or not firmware.nor_bytes:
+                raise ValueError('ESP32 目前支持具有独立 NOR 存储的 Q66 固件')
+            previous = store.info.get('controllerAddress')
+            if previous is not None and previous != physical['controllerAddress']:
+                raise ValueError('此实例绑定了另一台 ESP32，请选择原控制器或新建实例')
+            if old and VIRTUAL_SHA in old[1]:
+                raise ValueError('虚拟蓝牙身份不能用于物理控制器')
+            store.info['controllerAddress'] = physical['controllerAddress']
+        store.info['bluetoothTransport'] = bluetooth_mode
+        _atomic_json(store.root / 'instance.json', store.info)
         virtual_capability = plan["identity"].get("runtimeCapabilities", {}).get("virtualPeer")
         virtual_enabled = False
-        if virtual_capability is not None:
+        if virtual_capability is not None and physical is None:
             from .virtual_peer import checked_capability
             checked_capability(virtual_capability, plan["identity"]["qemu"]["sha256"])
             virtual_key = _capability_profile_id(virtual_capability.get("profiles", {}),
@@ -1375,6 +1400,9 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
                            virtualPeerStateSHA256=digest, virtualPeerEnabled=virtual_enabled)
             if virtual_enabled:
                 binding["virtualPeerReason"] = "本实例的合成通信身份与 NAND、OOB、NOR 在同一快照提交"
+        binding['bluetoothTransport'] = bluetooth_mode
+        if physical:
+            binding['physicalBluetooth'] = physical
         if carry_notes:
             binding["reason"] = binding["reason"] + "。" + "；".join(carry_notes)
             binding["carryOver"] = carry_notes
@@ -1473,6 +1501,12 @@ def validate_binding(binding, *, project, profile_id, model, qemu_sha256, capabi
         virtual_descriptor = virtual_profile(profile_id)
         if not has_state or nor is None or virtual_descriptor is None:
             raise ValueError("Virtual peer requires exact profile and joint NOR storage")
+    physical = binding.get('physicalBluetooth')
+    if physical:
+        from .esp32 import read_ready
+        if (enabled or has_state or binding.get('bluetoothTransport') != 'esp32'
+                or not binding.get('norPersistent') or (initial and read_ready(physical['readyFile']) != physical)):
+            raise ValueError('Physical Bluetooth binding changed or contains virtual state')
     if _json(expected / "instance-storage.json") != binding:
         raise ValueError("Instance binding record changed")
     return firmware
@@ -1553,6 +1587,14 @@ def _stopped_health(session, plan, binding):
             or result.get("nor_initialized") is not binding["norInitialize"]
             or result.get("instance_nor_sha256") != binding["norSHA256"]):
         return False, "nor-writeback-result-differs-from-instance"
+    if binding.get('physicalBluetooth'):
+        try:
+            closed = _json(Path(binding['physicalBluetooth']['readyFile']).parent / 'closed.json')
+        except (OSError, ValueError):
+            return False, 'physical-controller-close-receipt-missing'
+        if (closed.get('cleanupComplete') is not True or closed.get('stopConfirmed') is not True
+                or closed.get('leaseReleased') is not True or closed.get('firstError') is not None):
+            return False, 'physical-controller-cleanup-unconfirmed'
     return True, "core-exited-and-synchronous-storage-writes-complete; guest-filesystem-clean-unverified"
 
 
