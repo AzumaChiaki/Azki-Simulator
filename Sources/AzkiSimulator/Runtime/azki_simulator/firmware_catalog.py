@@ -48,7 +48,7 @@ EXECUTION_PROFILES = INCLUDED_PROFILE_IDS
 # every other profile is "generated": the sandboxed runner derives storage from the pinned AP/OTA.
 PRODUCT_NAMES = {
     "n66": "小米手环 9", "n67": "小米手环 9 Pro", "o66": "小米手环 10", "p67": "小米手环 10 Pro", "q66": "小米手环 11",
-    "p65": "红米手表6", "q65": "红米手表7"}
+    "p65": "红米手表6", "q65": "红米手表7", "o62m": "XRing 手表（O62M）"}
 BRANCH_NAMES = {
     "cn": "标准版", "nfc": "NFC 版", "tc": "陶瓷版", "lj": "耀影金版", "glt": "GLT", "u": "U",
     "ys": "原神定制版", "": ""}
@@ -540,7 +540,7 @@ class FirmwareCatalog:
         runnable after a lost or damaged index; extracted members are kept as
         unnamed objects and re-derived on the next import of their package.
         """
-        from .firmware_probe import ProbeError, ota_recipe
+        from .firmware_probe import ProbeError, archive_recipe
         objects_directory = _owned_directory(self.library_root / "objects", create=True)
         index = {"version": 1, "generation": 0, "objects": {}, "imports": []}
         names = []
@@ -559,11 +559,17 @@ class FirmwareCatalog:
                     continue
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=objects_directory)
                 try:
-                    if os.pread(fd, 4, 0) != b"PK\x03\x04":
+                    if os.pread(fd, 4, 0) not in (b"PK\x03\x04", b"\x60ZZ~"):
                         continue
                     try:
-                        generic = ota_recipe(fd, size)
+                        generic = archive_recipe(fd, size)
                     except (ProbeError, MError, ValueError, OSError, zlib.error):
+                        continue
+                    if not generic["bootablePackage"]:
+                        declared = generic.get("declaredModels") or []
+                        generic["displayModel"] = (declared[0] if "." in declared[0] else "miwear.watch." + declared[0]) if declared else "firmware.archive.unknown"
+                        index["imports"].append({"sha256": name, "inputKind": "archive", "profileIDs": [],
+                            "importedAtUnix": int(time.time()), "archive": generic})
                         continue
                     ap = next((record for record in generic["partitions"]
                                if record["name"].rsplit("/", 1)[-1] == "vela_ap.bin"), None)
@@ -643,7 +649,7 @@ class FirmwareCatalog:
         # intentionally not represented as a bundled profile. q66ys shares the
         # q66 hardware family and is likewise user-supplied only.
         return sorted({profile["model"] for profile in self.profiles.values()} |
-                      {"miwear.watch.p65", "miwear.watch.q65", "miwear.watch.q66ys"})
+                      {"miwear.watch.p65", "miwear.watch.q65", "miwear.watch.q66ys", "miwear.watch.o62m"})
 
     def hardware_presets(self):
         """Instance hardware presets for the UI: model metadata, no firmware version."""
@@ -654,6 +660,7 @@ class FirmwareCatalog:
                                                "width": profile["width"], "height": profile["height"]})
         rows.setdefault("miwear.watch.p65", {"model": "miwear.watch.p65", "displayName": "红米手表6", "width": 432, "height": 514})
         rows.setdefault("miwear.watch.q65", {"model": "miwear.watch.q65", "displayName": "红米手表7", "width": 432, "height": 514})
+        rows.setdefault("miwear.watch.o62m", {"model": "miwear.watch.o62m", "displayName": "XRing 手表（O62M）", "width": 466, "height": 466})
         # q66ys shares the q66 body (212x520) and inherits every q66 behavior
         # by prefix; only its identity differs. It sits right below the
         # ceramic (tc) edition, ahead of the alphabetical q66u placement.
@@ -699,7 +706,7 @@ class FirmwareCatalog:
                 sources[digest] = {"version": generic["version"], "ap": generic["apSHA256"],
                                    "apBytes": generic["apBytes"], "declaredModels": generic.get("declaredModels", []),
                                    "boundModel": generic.get("boundModel"),
-                                   "recipe": recipe}
+                                   "recipe": recipe, "package": generic.get("package", {})}
             elif digest in self.imports and self.imports[digest]["kind"] == "ota":
                 profile = self.profiles[sorted(self.imports[digest]["profileIDs"])[0]]
                 ap = profile["assets"]["ap"]
@@ -723,7 +730,7 @@ class FirmwareCatalog:
                 "availability": {"ready": ready, "assetsReady": ready,
                                  "reason": ("" if ready else "导入的固件文件已缺失，请重新导入"),
                                  "missingRoles": [] if ready else ["ota"], "verification": "checked_at_launch"},
-                "source": "imported"}
+                "source": "imported", **source.get("package", {})}
 
     def imported_id(self, profile_id):
         """True when this ID names firmware the user imported.
@@ -776,13 +783,37 @@ class FirmwareCatalog:
                 items.append(self._generic_item(model, digest, source, index))
         return items
 
+    def _archive_item(self, digest, package, index):
+        model, version = package["displayModel"], package["version"]
+        profile_id = model + "@" + version + "@" + digest[:12]
+        try:
+            width, height = _geometry(model)
+        except MError:
+            width, height = 0, 0
+        present = self._object_path(digest, index["objects"].get(digest, {}).get("bytes", -1), index) is not None
+        kind = package["packageKind"]
+        reason = ("增量升级包，需要对应基础版本，不能独立启动" if kind == "incremental" else
+                  "已保存固件；此型号或容器尚无运行后端")
+        if not present:
+            reason = "导入的固件文件已缺失，请重新导入"
+        return {"id": profile_id, "displayName": model + " · " + version,
+                "device": model, "model": model, "firmwareVersion": version,
+                "otaSHA256": digest, "width": width, "height": height,
+                "availability": {"ready": False, "assetsReady": present, "reason": reason,
+                                 "missingRoles": [] if present else ["ota"], "verification": "archive_only"},
+                "source": "imported", "packageKind": kind, "container": package["container"],
+                "baseVersion": package.get("baseVersion"), "metadataSource": package["metadataSource"],
+                "structure": package["structure"]}
+
     def list_items(self):
         """Every runnable entry is firmware the user imported.
 
         The bundled catalog is device metadata (models, screen geometry, storage
         kind); it never contributes a locked firmware version to this list.
         """
-        return self._generic_items(self._index())
+        index = self._index()
+        return self._generic_items(index) + [self._archive_item(item["sha256"], item["archive"], index)
+            for item in index["imports"] if item.get("inputKind") == "archive" and isinstance(item.get("archive"), dict)]
 
     def resolve_generic(self, profile_id):
         """Runner recipe for imported firmware on the profile's hardware preset."""
@@ -806,7 +837,7 @@ class FirmwareCatalog:
         recipe = {"id": profile_id, "model": model, "version": version, "ap": source["recipe"]["ap"],
                   "ota_sha256": digest, "partitions": source["recipe"]["partitions"],
                   "family": source["recipe"].get("family", "")}
-        storage = "romfs" if any(p.get("name") == "vela_resource.bin" for p in recipe["partitions"]) else "yaffs"
+        storage = "emmc" if model == "miwear.watch.o62m" else "romfs" if any(p.get("name") == "vela_resource.bin" for p in recipe["partitions"]) else "yaffs"
         return {"version": 1, "profileID": profile_id, "item": item, "recipe": recipe, "storageKind": storage,
                 "assets": {"ap": {"path": str(ap_path), "sha256": source["ap"], "bytes": source["apBytes"], "source": "imported"},
                            "ota": {"path": str(ota_path), "sha256": digest, "bytes": ota_bytes, "source": "imported"}},
@@ -889,23 +920,23 @@ class FirmwareCatalog:
             # version list or license record decides what may be imported: any
             # complete OTA is inventoried structurally, and the run itself is what
             # reports whether the firmware works on the instance hardware preset.
-            from .firmware_probe import ProbeError, ota_recipe
+            from .firmware_probe import ProbeError, archive_recipe
             input_fd = os.open("input", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=stage_fd)
             try:
-                # A complete OTA is either a plain ZIP or the BES full-package
-                # envelope (0x60ZZ~ header, embedded per-member ZIP chain).
-                _need(os.pread(input_fd, 4, 0) in (b"PK\x03\x04", b"\x60ZZ~"), "unknown_firmware",
-                      "请导入完整 OTA 固件包（ZIP 或 BES 整包 bin，包含 vela_ap.bin 和资源）；单独的 AP 文件缺少启动所需的资源",
-                      sha256=actual["sha256"])
                 try:
-                    generic = ota_recipe(input_fd, actual["bytes"])
+                    generic = archive_recipe(input_fd, actual["bytes"], source.name)
                 except (ProbeError, MError, ValueError, OSError, zlib.error) as error:
                     raise CatalogError("unknown_firmware", "固件包结构无法识别：" + str(error)[:240],
                                        {"sha256": actual["sha256"]}) from error
             finally:
                 os.close(input_fd)
-            ap_record = next(r for r in generic["partitions"] if r["name"].rsplit("/", 1)[-1] == "vela_ap.bin")
-            entry = {"kind": "ota", "profileIDs": [], "members": [{"asset": generic["ap"]["sha256"], "record": ap_record}]}
+            ap_record = next((r for r in generic["partitions"] if r["name"].rsplit("/", 1)[-1] == "vela_ap.bin"), None)
+            declared = generic.get("declaredModels") or []
+            known = [m if "." in m else "miwear.watch." + m for m in declared]
+            archival = not generic["bootablePackage"] or (bool(declared) and not any(m in self.hardware_models for m in known))
+            entry = {"kind": "archive" if archival else "ota", "profileIDs": [], "members": []}
+            if not archival:
+                entry["members"] = [{"asset": generic["ap"]["sha256"], "record": ap_record}]
             # Model binding only. The user's selected preset owns visibility:
             # the import is bound to that model and appears nowhere else. No
             # firmware capability is validated here — the structural inventory
@@ -919,6 +950,14 @@ class FirmwareCatalog:
                 entry["profileIDs"] = [model + "@" + generic["version"] + "@" + actual["sha256"][:12]]
             candidates = ([model + "@" + generic["version"] + "@" + actual["sha256"][:12]] if bound_model else
                           self._candidate_models(generic, actual["sha256"]))
+            if archival:
+                identified_model = generic.get("archiveModel") or (known[0] if known else None)
+                archive_model = identified_model or bound_model or "firmware.archive.unknown"
+                if identified_model:
+                    bound_model = None
+                generic["displayModel"] = archive_model
+                candidates = [archive_model + "@" + generic["version"] + "@" + actual["sha256"][:12]]
+                entry["profileIDs"] = candidates
             _need(existing_total + actual["bytes"] + sum(member["record"]["size"] for member in entry.get("members", [])) <= MAX_LIBRARY,
                   "library_quota", "固件包的临时展开将超过私有库容量限制")
             os.replace("input", actual["sha256"], src_dir_fd=stage_fd, dst_dir_fd=stage_fd)
@@ -953,9 +992,14 @@ class FirmwareCatalog:
                       "generic": {"version": generic["version"], "family": generic["family"],
                                   "declaredModels": generic["declaredModels"],
                                   "boundModel": bound_model,
-                                  "apSHA256": generic["ap"]["sha256"], "apBytes": generic["ap"]["size"],
+                                  "apSHA256": generic["ap"].get("sha256"), "apBytes": generic["ap"].get("size", 0),
                                   "recipe": {"ap": generic["ap"], "partitions": generic["partitions"],
                                              "family": generic["family"]}}}
+            if archival:
+                record["archive"] = generic
+            else:
+                record["generic"]["package"] = {key: generic[key] for key in
+                    ("container", "packageKind", "metadataSource")}
             # Re-importing the same bytes replaces, never duplicates, its record.
             index["imports"] = [item for item in index["imports"]
                                 if not (isinstance(item, dict) and item.get("sha256") == actual["sha256"])] + [record]
@@ -968,12 +1012,15 @@ class FirmwareCatalog:
             # the Swift decoder rejects a receipt whose items do not cover its
             # candidates, so build the bound item directly instead of relying
             # on the catalog listing's filtering.
-            source_view = {"version": generic["version"], "ap": generic["ap"]["sha256"],
-                           "apBytes": generic["ap"]["size"], "declaredModels": generic["declaredModels"],
+            source_view = {"version": generic["version"], "ap": generic["ap"].get("sha256"),
+                           "apBytes": generic["ap"].get("size", 0), "declaredModels": generic["declaredModels"],
                            "boundModel": bound_model,
+                           "package": {key: generic[key] for key in ("container", "packageKind", "metadataSource")},
                            "recipe": {"ap": generic["ap"], "partitions": generic["partitions"],
                                       "family": generic["family"]}}
-            if bound_model:
+            if archival:
+                items = [self._archive_item(actual["sha256"], generic, index)]
+            elif bound_model:
                 items = [self._generic_item(bound_model, actual["sha256"], source_view, index)]
             else:
                 items = [item for item in self._generic_items(index, only=actual["sha256"])

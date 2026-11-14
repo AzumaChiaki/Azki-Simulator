@@ -24,7 +24,7 @@ import uuid
 import zlib
 
 MAX_MESSAGE = 65536
-DISPLAY_GEOMETRIES = frozenset(((192, 490), (212, 520), (336, 480), (432, 514)))
+DISPLAY_GEOMETRIES = frozenset(((192, 490), (212, 520), (336, 480), (432, 514), (466, 466)))
 MAX_FRAME = 32 + 432 * 514 * 3
 FRAME_PIXEL_BYTES = {1: 2, 2: 3}  # LE RGB565; packed R,G,B RGB888
 MAX_LOG = 16 * 1024 * 1024

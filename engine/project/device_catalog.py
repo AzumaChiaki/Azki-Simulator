@@ -63,6 +63,15 @@ def zip_member_records(source):
 def inspect_ap(path):
     data = Path(path).read_bytes()
     info = dict(sha256=hashlib.sha256(data).hexdigest(), size=len(data))
+    if len(data) >= 64:
+        stack, reset = struct.unpack_from('<II', data)
+        if (0x60000000 <= stack < 0x62000000 and reset & 1
+                and 0x605c0000 <= (reset & ~1) < 0x605c0000 + len(data)):
+            info.update(chip='xring', image_format='xring-vector-table',
+                        vector_sp=stack, vector_reset=reset,
+                        reset_sp=stack, reset_entry=reset,
+                        backend_requirement='XRing O62M 3.1.115 TEE/AP and complete eMMC OTA')
+            return info
     match = re.search(rb'(?<![A-Z_])CHIP=([^\r\n\x00 ]+)', data)
     if not match:
         info.update(chip='unidentified', image_format='vector-table-candidate',

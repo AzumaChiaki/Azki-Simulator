@@ -137,7 +137,7 @@ import SwiftUI
                 .help(logsPresented.wrappedValue ? "隐藏实时日志" : "显示实时日志")
                 .accessibilityIdentifier("simulator.logs")
                 Button("导入固件", systemImage: "square.and.arrow.down") { onImport() }
-                    .help("选择完整 OTA 包导入到固件库")
+                    .help("选择固件包导入到固件库")
                     .disabled(!SimulatorInstanceActions.importFirmware(instance))
                     .accessibilityIdentifier("simulator.import-firmware")
                 Button("截图", systemImage: "camera") { SimulatorInstanceActions.screenshot(instance) }

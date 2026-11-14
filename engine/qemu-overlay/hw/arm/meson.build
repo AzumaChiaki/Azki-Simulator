@@ -89,3 +89,5 @@ hw_common_arch += {'arm': arm_common_ss}
 arm_ss.add(when: 'CONFIG_ARM_V7M', if_true: files('best1503.c'))
 arm_ss.add(when: 'CONFIG_ARM_V7M', if_true: files('azki-q65.c'))
 arm_ss.add(when: 'CONFIG_ARM_V7M', if_true: files('azki-p65.c'))
+
+arm_ss.add(when: 'CONFIG_ARM_V7M', if_true: files('azki-marconi-probe.c', 'dfs_config.c'))

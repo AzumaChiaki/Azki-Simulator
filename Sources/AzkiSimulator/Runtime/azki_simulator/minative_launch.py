@@ -118,7 +118,7 @@ def native_invocation(arguments):
     settings = arguments[-2:] if len(arguments) >= 2 and arguments[-2] == "--instance-settings" else []
     if settings:
         arguments = arguments[:-2]
-    if len(arguments) not in (8, 16, 20, 21, 26, 27) or arguments[0] != "--native":
+    if len(arguments) not in (8, 10, 11, 16, 20, 21, 26, 27) or arguments[0] != "--native":
         raise ValueError("Invalid native guest invocation")
     virtual = arguments[-6:] if len(arguments) in (26, 27) else []
     core_arguments = arguments[:-6] if virtual else arguments
@@ -140,6 +140,13 @@ def native_invocation(arguments):
                "--headless", "--log-dir", str(run)]
     if duration:
         command += ["--seconds", str(duration)]
+    if len(core_arguments) in (10, 11):
+        emmc = core_arguments[8:]
+        if (not profile.startswith("miwear.watch.o62m@")
+                or emmc[:2] != ["--instance-emmc-image", str(run.parent / "instance-data/emmc.img")]
+                or (len(emmc) == 3 and emmc[2] != "--instance-emmc-initialize")):
+            raise ValueError("XRing eMMC must be the private session disk")
+        command += emmc
     if len(core_arguments) >= 16:
         extra = core_arguments[8:16]
         if (extra[::2] != ["--instance-data-image", "--instance-spare-image",
@@ -216,7 +223,8 @@ def main():
     # create files with default modes, so make them private at the source.
     os.umask(0o077)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (FSIZE_LIMIT, FSIZE_LIMIT))
+    file_limit = (4 << 30) if "--instance-emmc-image" in command else FSIZE_LIMIT
+    resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
     if duration:
         cpu_budget = duration * CPU_FACTOR + 30
         resource.setrlimit(resource.RLIMIT_CPU, (cpu_budget, cpu_budget + 5))

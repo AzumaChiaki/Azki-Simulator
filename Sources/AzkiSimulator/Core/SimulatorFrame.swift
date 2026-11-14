@@ -5,13 +5,13 @@ import Accelerate
 /// Finite display contract for the imported Xiaomi Band profiles. A generic
 /// codec fixture may be smaller; live sessions and input accept only these pairs.
 nonisolated enum SimulatorDisplayGeometry: CaseIterable, Equatable, Sendable {
-    case pixels192x490, pixels212x520, pixels336x480, pixels432x514
+    case pixels192x490, pixels212x520, pixels336x480, pixels432x514, pixels466x466
 
     var width: Int {
-        switch self { case .pixels192x490: 192; case .pixels212x520: 212; case .pixels336x480: 336; case .pixels432x514: 432 }
+        switch self { case .pixels192x490: 192; case .pixels212x520: 212; case .pixels336x480: 336; case .pixels432x514: 432; case .pixels466x466: 466 }
     }
     var height: Int {
-        switch self { case .pixels192x490: 490; case .pixels212x520: 520; case .pixels336x480: 480; case .pixels432x514: 514 }
+        switch self { case .pixels192x490: 490; case .pixels212x520: 520; case .pixels336x480: 480; case .pixels432x514: 514; case .pixels466x466: 466 }
     }
     var size: CGSize { CGSize(width: width, height: height) }
     init?(width: Int, height: Int) {

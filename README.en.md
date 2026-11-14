@@ -12,9 +12,14 @@ A standalone wearable-device simulator for Apple Silicon Macs. Its native SwiftU
 - Storage management: APFS copy-on-write snapshots, a shared erased-NAND template, automatic deduplication and session cleanup, with per-instance space accounting. Open it from the toolbar, the Storage menu, or Settings → Storage; see [storage notes](docs/STORAGE.md).
 - Install quick apps and watchfaces; configure synthetic serial numbers, virtual Bluetooth addresses and initial setup options.
 - ESP32 USB serial Bluetooth bridging, full-flash backup, firmware installation and restore for separate Q66 instances; see [ESP32 notes](docs/ESP32.md).
+- XRing O62M: original TEE/AP boot, a 466×466 display, mouse touch input and private eMMC storage.
 - Edit raw PMU ADC inputs. Confirmed purposes are labelled; uncalibrated values do not imply physical units.
 
 The catalog provides hardware presets for the Xiaomi Smart Band 9, 9 Pro, 10, 10 Pro and 11 families. Any complete OTA package can be imported, not only catalog versions; an instance boots the selected firmware on its own hardware preset, and reports the reason at launch when the firmware is incompatible (chip, resource layout, or a device family that differs from the preset). Runtime behavior still depends on the implemented hardware and storage layout. Firmware switching uses a cold restart.
+
+Firmware imports support ZIP, BES, AOTA, band-update containers, MIDR full packages and legacy raw images from [MiWearFirmwareArchives](https://github.com/AstralSightStudios/MiWearFirmwareArchives). Full and incremental packages are distinguished. Incremental packages can be stored and inspected but cannot boot independently; firmware for unsupported hardware retains its parsed metadata. Legacy raw images use archive filenames for model and version metadata, with their unparsed internal format stated in diagnostics.
+
+XRing currently supports the complete O62M 3.1.115 OTA. Create an “XRing 手表（O62M）” instance and import the package. On fresh storage, skipping initial setup writes the firmware’s system properties; existing disks are preserved. Each instance uses a 4 GiB sparse eMMC image and saves actual changes on normal stop. Support is experimental: the first page transition can pause and downward return navigation is not verified. Audio, Bluetooth and quick-app installation are not connected for this model.
 
 External Bluetooth remains experimental. Successful pairing and communication with phone system settings or Mi Fitness are not guaranteed.
 

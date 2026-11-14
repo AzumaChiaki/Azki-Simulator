@@ -312,9 +312,8 @@ final class StandaloneRuntimeModel {
         defer { operationCount -= 1 }
         let receipt: FirmwareImportReceipt
         do {
-            // Bind the import to the user's selected hardware profile: the
-            // imported OTA becomes visible only under that model, with no
-            // firmware capability validation beyond the structural inventory.
+            // Runnable imports use the selected hardware preset. Archive-only
+            // packages retain their own model identity.
             var arguments = ["library-import", "--input", url.path]
             if let model = selectedFirmware?.model { arguments += ["--model", model] }
             receipt = try FirmwareImportReceipt.decode(await runHelper(arguments))
@@ -346,6 +345,19 @@ final class StandaloneRuntimeModel {
             guard token == revision, !Task.isCancelled, !isStopping else { return }
             applyCatalog(catalog)
             importCandidateIDs = receipt.candidateIDs
+            if receipt.inputKind == .archive {
+                let diagnosticRevision = revision
+                statusMessage = "固件已保存到固件库；此文件不能独立启动。"
+                do {
+                    let diagnostic = try FirmwareDiagnostic.decode(await runHelper(["library-probe", "--input", url.path]))
+                    guard diagnosticRevision == revision, !Task.isCancelled, !isStopping else { return }
+                    importDiagnostic = diagnostic
+                } catch {
+                    guard diagnosticRevision == revision, !Task.isCancelled else { return }
+                    importDiagnosticError = error.localizedDescription
+                }
+                return
+            }
             let candidates = receipt.candidateIDs.filter { id in selectableFirmwareItems.contains { $0.id == id } }
             selectedProfileID = candidates.count == 1 ? candidates.first : nil
             if candidates.isEmpty {
@@ -452,7 +464,8 @@ final class StandaloneRuntimeModel {
                 .appendingPathComponent("azki-b-" + UUID().uuidString.lowercased().prefix(12), isDirectory: true)
             var arguments = ["prepare-bundled", "--profile-id", profileID, "--session-root", root.path]
             if let instanceID { arguments += ["--instance-id", instanceID.uuidString.lowercased()] }
-            if bluetoothMode == .virtual, let virtualIdentity, instanceID != nil {
+            if bluetoothMode == .virtual, modelConstraint != "miwear.watch.o62m",
+               !profileID.hasPrefix("miwear.watch.o62m@"), let virtualIdentity, instanceID != nil {
                 arguments += ["--virtual-serial", virtualIdentity.serial, "--virtual-address", virtualIdentity.address]
             }
             if bluetoothMode == .esp32 {
@@ -479,9 +492,11 @@ final class StandaloneRuntimeModel {
             sessionURL = receipt.root
             if receipt.instanceStorage?["available"]?.bool == true {
                 storageSession = receipt.root
-                instanceStorageMessage = receipt.instanceStorage?["norPersistent"]?.bool == true
-                    ? "独立数据盘和设备配置已启用；切换固件会保留数据盘。"
-                    : "独立 NAND 数据盘已启用；NOR 配置尚未持久化。"
+                instanceStorageMessage = receipt.instanceStorage?["kind"]?.string == "xring-emmc"
+                    ? "独立 eMMC 数据盘已启用；正常停止后保存。"
+                    : receipt.instanceStorage?["norPersistent"]?.bool == true
+                        ? "独立数据盘和设备配置已启用；切换固件会保留数据盘。"
+                        : "独立 NAND 数据盘已启用；NOR 配置尚未持久化。"
             } else {
                 instanceStorageMessage = receipt.instanceStorage?["reason"]?.string ?? "此核心未提供用户数据写回；重启恢复初始数据。"
             }
@@ -492,6 +507,7 @@ final class StandaloneRuntimeModel {
             let stopped = await esp32Bridge.stop()
             if stopped, storageSession == nil { esp32Bridge.archiveStoppedState() }
             errorMessage = error.localizedDescription + (stopped ? "" : "\n" + (esp32Bridge.lastFailure ?? "ESP32 清理尚未确认"))
+            NSLog("[AzkiRun] prepare failed: %@", errorMessage ?? error.localizedDescription)
             return false
         }
     }
@@ -837,6 +853,7 @@ final class StandaloneRuntimeModel {
             // A cancelled/older attempt must not overwrite a later session's UI.
             guard token == revision else { return }
             errorMessage = message
+            NSLog("[AzkiRun] start failed: %@", message)
             statusMessage = stopped ? "启动失败，核心已停止；原文件保持不变。可修正后重新运行"
                 : "启动失败；设备进程尚未确认退出，请重试停止或使用「重置实例」"
         }

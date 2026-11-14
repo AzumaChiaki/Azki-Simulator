@@ -603,6 +603,13 @@ class Firmware:
     def validate(self):
         if not ID.fullmatch(self.model) or not ID.fullmatch(self.profile):
             raise ValueError("Invalid model/profile")
+        if self.data_format == "xring-emmc":
+            from .xring_storage import EMMC_BYTES, MODEL
+            if (self.model != MODEL or type(self.data_bytes) is not int or self.data_bytes != EMMC_BYTES
+                    or type(self.data_offset) is not int or self.data_offset != 0
+                    or any(value for key, value in asdict(self).items() if key.startswith("nor_"))):
+                raise ValueError("Unsupported XRing eMMC geometry")
+            return
         if (type(self.data_offset) is not int or type(self.data_bytes) is not int
                 or self.data_offset < 0 or self.data_bytes <= 0
                 or (self.data_offset | self.data_bytes) % BLOCK
@@ -661,6 +668,8 @@ class Firmware:
 
     @property
     def images(self):
+        if self.data_format == "xring-emmc":
+            return [("emmc.img", self.data_bytes, None, "emmcImage")]
         images = [("nand-data.bin", self.data_bytes, "dataSHA256", "dataImage"),
                   ("nand-spare.bin", self.data_bytes // 2048 * 64, "spareSHA256", "spareImage")]
         if self.nor_bytes:
@@ -782,6 +791,13 @@ class InstanceStorage:
             raise ValueError("此实例还有一次未完成的运行记录；请重置该实例后再启动")
         # prepare_session_storage already verified HEAD under this same held lock.
         old = self.head() if _previous_head is _UNREAD_HEAD else _previous_head
+        if firmware.data_format == "xring-emmc":
+            if synthetic_seed is not None or virtual_state is not None or rebuild_identity:
+                raise ValueError("XRing eMMC does not accept NAND/virtual identity seeds")
+            from .xring_storage import begin
+            return begin(self, firmware, old)
+        if old and old[2].data_format == "xring-emmc":
+            raise ValueError("XRing eMMC cannot be reinterpreted as NAND")
         if rebuild_identity and (old is None or virtual_state is None):
             raise ValueError("Identity rebuild requires a retained snapshot and fresh synthetic identity")
         # Firmware is never locked to an instance. Any version for the same
@@ -965,7 +981,9 @@ class InstanceStorage:
             if success:
                 for fd in fds: os.fsync(fd)
                 metadata = _json(folder / "revision.json")
-                metadata.update({key: _initial_pin(folder / name) for name, _, key, _ in firmware.images})
+                metadata.update({key: _initial_pin(folder / name) for name, _, key, _ in firmware.images if key is not None})
+                if firmware.data_format == "xring-emmc":
+                    metadata["committed"] = True
                 if VIRTUAL_SHA in pending:
                     metadata[VIRTUAL_SHA] = _virtual_read(folder / VIRTUAL_STATE)[2]
                 elif (folder / VIRTUAL_STATE).exists() or (folder / VIRTUAL_STATE).is_symlink():
@@ -1008,8 +1026,11 @@ class InstanceStorage:
                         or binding.get("sessionRoot") != str(session)
                         or binding.get("instanceID") != self.root.parent.name
                         or binding.get("model") != firmware.model or binding.get("profileID") != firmware.profile
-                        or binding.get("dataImage") != str(session / "instance-data/nand-data.bin")
-                        or binding.get("spareImage") != str(session / "instance-data/nand-spare.bin")
+                        or (firmware.data_format == "xring-emmc" and
+                            binding.get("emmcImage") != str(session / "instance-data/emmc.img"))
+                        or (firmware.data_format != "xring-emmc" and (
+                            binding.get("dataImage") != str(session / "instance-data/nand-data.bin")
+                            or binding.get("spareImage") != str(session / "instance-data/nand-spare.bin")))
                         or (firmware.nor_bytes and binding.get("norImage") != str(session / "instance-data/nor-config.bin"))):
                     raise ValueError("Pending work disks do not belong to this instance transaction")
                 broker = session / "native-broker"
@@ -1264,6 +1285,11 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
     The host creates library/instances/<uuid> mode 0700. Accepted revisions stay
     outside the guest grant. Working disks and private state are session copies.
     """
+    from .xring_storage import is_plan, prepare as prepare_emmc
+    if is_plan(plan):
+        if bluetooth_mode != "virtual" or any((virtual_key_file, virtual_key_sha256, virtual_serial, virtual_address)):
+            raise ValueError("XRing 当前不支持外接或虚拟蓝牙身份")
+        return prepare_emmc(library_root, session_root, instance_id, plan)
     if bluetooth_mode not in ('virtual', 'esp32'):
         raise ValueError('Unknown Bluetooth transport')
     physical = None
@@ -1420,6 +1446,9 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
 
 def validate_binding(binding, *, project, profile_id, model, qemu_sha256, capability, initial=True,
                      nor_capability=None, ap_sha256=None, virtual_capability=None):
+    if isinstance(binding, dict) and binding.get("kind") == "xring-emmc":
+        from .xring_storage import validate
+        return validate(binding, project=project, profile_id=profile_id, model=model, qemu_sha256=qemu_sha256)
     if not isinstance(binding, dict) or binding.get("available") is not True:
         raise ValueError("Expected an enabled instance storage binding")
     _uuid(binding.get("instanceID"))
@@ -1513,6 +1542,9 @@ def validate_binding(binding, *, project, profile_id, model, qemu_sha256, capabi
 
 
 def instance_arguments(binding, *, run_directory=None):
+    if binding.get("kind") == "xring-emmc":
+        from .xring_storage import arguments
+        return arguments(binding)
     arguments = ["--instance-data-image", binding["dataImage"],
                  "--instance-spare-image", binding["spareImage"],
                  "--instance-data-sha256", binding["dataSHA256"],
@@ -1572,6 +1604,12 @@ def _stopped_health(session, plan, binding):
             or result.get("diagnostic_errors") or result.get("outcome") not in
             ("time_limit", "interrupted", "window_closed", "qemu_stopped", "guest_poweroff", "guest_reboot")):
         return False, "guest-or-storage-health-unconfirmed"
+    if binding.get("kind") == "xring-emmc":
+        if (result.get("emmc_writeback") is not True or result.get("emmc_image") != binding["emmcImage"]
+                or type(result.get("emmc_bytes")) is not int or result["emmc_bytes"] != binding["emmcBytes"]
+                or result.get("emmc_initialized") is not binding["emmcInitialize"]):
+            return False, "emmc-writeback-result-differs-from-instance"
+        return True, "core-exited-and-emmc-writeback-complete; guest-filesystem-clean-unverified"
     if (result.get("data_writeback") is not True or result.get("data_image") != binding["dataImage"]
             or result.get("data_spare_image") != binding["spareImage"]):
         return False, "writeback-result-differs-from-instance"
@@ -1694,7 +1732,7 @@ def finish_session_storage(library_root, session_root, instance_id):
                         or head[1].get("previous") != binding["previousRevision"]
                         or head[1].get(VIRTUAL_SHA) != virtual_sha
                         or any(head[1].get(key) != _initial_pin(Path(binding[role]))
-                               for _, _, key, role in firmware.images)):
+                               for _, _, key, role in firmware.images if key is not None)):
                     raise ValueError("找不到这次运行对应的数据提交记录；已保存的快照保持不变")
             elif (head_id != binding["previousRevision"] or
                   (store.root / "revisions" / binding["transactionID"]).exists()):
@@ -1719,6 +1757,10 @@ def finish_session_storage(library_root, session_root, instance_id):
                     cloned = _clone_file(source, target)
                 except (OSError, ValueError):
                     cloned = False
+                if not cloned and firmware.data_format == "xring-emmc":
+                    from .xring_storage import copy_image
+                    copy_image(Path(binding[role]), target)
+                    cloned = True
                 if not cloned:
                     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                     try:

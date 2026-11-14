@@ -1,0 +1,17 @@
+#ifndef O62M_RESOURCE_ATTRIBUTE_DEFS_V1_H
+#define O62M_RESOURCE_ATTRIBUTE_DEFS_V1_H
+#include "clock-controls.h"
+/* Exact resource-ID consumer fields; names/polarity/permission effects unknown. */
+#define O62M_RESOURCE_ATTRIBUTE_COUNT 2u
+static const O62MClockControlDef o62m_resource_attribute_defs[O62M_RESOURCE_ATTRIBUTE_COUNT] = {
+    { UINT64_C(0x5a200000), {
+        0x1u, 0x2u, 0x4u, 0x8u, 0x10u, 0x20u, 0x40u, 0x80u,
+        0x100u, 0x200u, 0x400u, 0x800u, 0x1000u, 0x2000u, 0x4000u, 0x8000u
+    } },
+    { UINT64_C(0x5a220000), {
+        0x1u, 0x2u, 0xcu, 0x30u, 0x40u, 0x80u, 0x100u, 0x200u,
+        0x400u, 0x800u, 0x1000u, 0x2000u, 0x4000u, 0x8000u,
+        0x10000u, 0x20000u, 0x40000u, 0x80000u, 0x100000u, 0x200000u
+    } },
+};
+#endif

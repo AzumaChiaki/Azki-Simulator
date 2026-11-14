@@ -680,7 +680,7 @@ nonisolated enum StandaloneProcessSandbox {
         if let run = guestRun {
             guard run.deletingLastPathComponent() == session, StandaloneBrokerConfiguration.validRun(run.lastPathComponent),
                   let profile = plan["profileID"] as? String, StandaloneRunLimits.validProfileID(profile),
-                  let storage = identity["storageKind"] as? String, storage == "romfs" || storage == "yaffs",
+                  let storage = identity["storageKind"] as? String, storage == "romfs" || storage == "yaffs" || storage == "emmc",
                   identity["profile"] is [String: Any],
                   let spec = plan["spec"] as? [String: Any],
                   spec["bootstrap"] as? String == runtime.engine.appendingPathComponent("bootstrap.py").path,
@@ -720,7 +720,23 @@ nonisolated enum StandaloneProcessSandbox {
                                  "(allow file-read-metadata (literal \(quote(socket))))"]
                 physicalArguments = ["--bluetooth-mode", "esp32", "--esp32-ready-file", readyPath]
             }
-            if let binding = identity["instanceStorage"] as? [String: Any], binding["available"] as? Bool == true {
+            if let binding = identity["instanceStorage"] as? [String: Any], binding["available"] as? Bool == true,
+               binding["kind"] as? String == "xring-emmc" {
+                let disk = session.appendingPathComponent("instance-data/emmc.img")
+                guard storage == "emmc", profile.hasPrefix("miwear.watch.o62m@"),
+                      binding["sessionRoot"] as? String == session.path,
+                      binding["profileID"] as? String == profile,
+                      binding["emmcImage"] as? String == disk.path,
+                      binding["emmcBytes"] as? Int == 4 * 1024 * 1024 * 1024,
+                      let initialize = binding["emmcInitialize"] as? Bool else {
+                    throw SimulatorError.transport("XRing 实例存储与启动计划不匹配")
+                }
+                try StandaloneSandboxFiles.validateRegular(disk, expectedBytes: 4 * 1024 * 1024 * 1024,
+                    limit: 4 * 1024 * 1024 * 1024)
+                instanceWrites.append(disk)
+                instanceArguments = ["--instance-emmc-image", disk.path]
+                if initialize { instanceArguments.append("--instance-emmc-initialize") }
+            } else if let binding = identity["instanceStorage"] as? [String: Any], binding["available"] as? Bool == true {
                 guard let capabilities = identity["runtimeCapabilities"] as? [String: Any],
                       let capability = capabilities["nandPersistence"] as? [String: Any],
                       capability["schema"] as? Int == 1,
@@ -774,6 +790,11 @@ nonisolated enum StandaloneProcessSandbox {
                     settingsArguments = ["--instance-settings", settings.path]
                     instanceReads.append(settings)
                 }
+            }
+            if storage == "emmc" {
+                let builder = project.appendingPathComponent("backend/build/xring-ui-db")
+                guard pinned(builder) else { throw SimulatorError.transport("XRing 存储初始化工具缺失") }
+                guestExecutables.append(builder)
             }
             if storage == "yaffs" {
                 // The YAFFS image builders run inside the same sandbox and the

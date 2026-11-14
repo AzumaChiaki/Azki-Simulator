@@ -43,7 +43,7 @@ import SwiftUI
 
     @ViewBuilder private var firmwareSelection: some View {
         if runtime.selectableFirmwareItems.isEmpty {
-            Text(runtime.hasLoadedCatalog ? "尚未导入固件；使用「导入固件…」选择完整 OTA 包" : "正在读取固件库")
+            Text(runtime.hasLoadedCatalog ? "尚未导入固件；使用「导入固件…」选择固件包" : "正在读取固件库")
         } else {
             Picker("已导入固件", selection: firmwareSelectionBinding) {
                 Text("选择启动固件…").tag(Optional<String>.none)
@@ -80,7 +80,12 @@ import SwiftUI
 
     @ViewBuilder private var selectedFirmwareDetails: some View {
         if let item = runtime.selectedFirmware {
-            LabeledContent("型号", value: "\(item.model) · \(item.width) × \(item.height)")
+            LabeledContent("型号", value: item.width > 0
+                ? "\(item.model) · \(item.width) × \(item.height)" : item.model)
+            if let kind = item.packageKind {
+                LabeledContent("固件类型", value: kind == "incremental" ? "增量包" : kind == "full" ? "完整包" : "固件资料")
+            }
+            if let base = item.baseVersion { LabeledContent("基础版本", value: base) }
             if !item.availability.ready {
                 Text(item.availability.reason.isEmpty ? "此固件尚缺少完整运行资源" : item.availability.reason)
             }

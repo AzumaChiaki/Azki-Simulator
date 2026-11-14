@@ -89,6 +89,9 @@ def _attach_nor_geometry(board, profile, ap_data, factory_bytes):
 
 def board_profile(profile, resource_bytes, storage_kind='romfs'):
     ap=profile['ap']
+    if profile['model'] == 'miwear.watch.o62m':
+        from backend.src.xring_media import board_profile as xring_board
+        return xring_board(profile)
     if profile['model'] == 'miwear.watch.q65':
         from backend.src.q65_runner import board_profile as q65_board
         return q65_board(profile)
@@ -247,6 +250,8 @@ def main():
     parser.add_argument('--instance-nor-image', type=Path)
     parser.add_argument('--instance-nor-sha256')
     parser.add_argument('--instance-nor-initialize', action='store_true')
+    parser.add_argument('--instance-emmc-image', type=Path)
+    parser.add_argument('--instance-emmc-initialize', action='store_true')
     parser.add_argument('--instance-settings', type=Path)
     parser.add_argument('--skip-oobe', action=argparse.BooleanOptionalAction, default=True,
         help='Complete first-run setup locally (default); --no-skip-oobe preserves the firmware setup flow. Existing instance settings are kept.')
@@ -286,6 +291,11 @@ def main():
         return 0
     try:
         profile=select(args.device)
+        if profile['model'] == 'miwear.watch.o62m':
+            from backend.src.xring_runner import run
+            return run(profile, args)
+        if args.instance_emmc_image or args.instance_emmc_initialize:
+            raise ValueError('eMMC instance storage is only supported by XRing')
         if profile['model'] == 'miwear.watch.q65':
             from backend.src.q65_runner import run
             return run(profile, args)

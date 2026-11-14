@@ -1,0 +1,15 @@
+#ifndef O62M_MBED_CONFIG_V1_H
+#define O62M_MBED_CONFIG_V1_H
+#define MBEDTLS_SHA256_C
+#define MBEDTLS_DEPRECATED_REMOVED
+#define mbedtls_sha256_context O62MPrivateSha256V1
+#define mbedtls_sha256_init o62m_sha256_init_v1
+#define mbedtls_sha256_free o62m_sha256_free_v1
+#define mbedtls_sha256_clone o62m_sha256_clone_v1
+#define mbedtls_sha256_starts_ret o62m_sha256_starts_v1
+#define mbedtls_sha256_update_ret o62m_sha256_update_v1
+#define mbedtls_sha256_finish_ret o62m_sha256_finish_v1
+#define mbedtls_internal_sha256_process o62m_sha256_process_v1
+#define mbedtls_sha256_ret o62m_sha256_bytes_v1
+#define mbedtls_platform_zeroize o62m_sha256_zeroize_v1
+#endif

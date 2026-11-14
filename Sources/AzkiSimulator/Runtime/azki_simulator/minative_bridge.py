@@ -189,12 +189,14 @@ class MinativeSessionBridge(SessionBridge):
         return set_raw(self.adapter, arguments)
 
     def live_get(self, arguments):
-        if self.plan["identity"]["profile"]["model"] == "miwear.watch.q65":
+        if self.plan["identity"]["profile"]["model"] in ("miwear.watch.q65", "miwear.watch.o62m"):
             if arguments:
                 raise MError("invalid_live", "live-get takes no arguments")
             return {"supported": {key: False for key in
                 ("steps", "heartRate", "charger", "batteryLevel", "batteryRaw", "temperature", "clock")},
-                "notes": {"settings": "Q65 暂未接入手环专属的实时输入和实例设置。"}, "state": {}}
+                "notes": {"settings": "此手表暂未接入手环专属的实时输入和实例设置。"},
+                "state": {key: None for key in
+                    ("walkSteps", "walked", "cadence", "heartRate", "worn", "charger", "batteryRaw", "temperatureC", "clock")}}
         return live_get(self.adapter, arguments)
 
     def live_set(self, arguments):

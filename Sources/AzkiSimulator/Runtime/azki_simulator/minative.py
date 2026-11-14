@@ -29,7 +29,7 @@ MAX_JSON = 4 * 1024 * 1024
 MAX_ASSET = 768 * 1024 * 1024
 MAX_FRAME_FILE = 8 * 1024 * 1024
 FRAME_HEADER = struct.Struct("<8s6I")
-GEOMETRIES = {(192, 490), (212, 520), (336, 480), (432, 514)}
+GEOMETRIES = {(192, 490), (212, 520), (336, 480), (432, 514), (466, 466)}
 RUNTIME_FILES = (
     "multi_device.py", "device_catalog.py", "firmware_resources.py",
     "legacy_ui_seed.py", "backend/src/legacy_ui_db.c",
@@ -283,6 +283,8 @@ def _geometry(model):
         return 336, 480
     if model == "q66" or model.startswith(("miwear.watch.o66", "miwear.watch.q66")):
         return 212, 520
+    if model == "miwear.watch.o62m":
+        return 466, 466
     if model in ("miwear.watch.p65", "miwear.watch.q65"):
         return 432, 514
     raise MError("unsupported_profile", "Model is outside the Mi Band scope")
@@ -579,7 +581,7 @@ def _catalog(project):
         raise MError("invalid_catalog", "Catalog is missing a scoped profile")
     for key in ids:
         row = known[key]
-        chip = "best1502p" if row.get("model") in ("miwear.watch.p65", "miwear.watch.q65") else "best1503"
+        chip = "xring" if row.get("model") == "miwear.watch.o62m" else "best1502p" if row.get("model") in ("miwear.watch.p65", "miwear.watch.q65") else "best1503"
         if (row.get("ap", {}).get("chip") != chip
                 or "@".join(key.split("@")[:2]) != str(row.get("model")) + "@" + str(row.get("version"))):
             raise MError("invalid_catalog", "Profile and supported board identity disagree")
@@ -724,6 +726,8 @@ def _dependency_links(paths, *, pin=_pin):
 
 def board_runtime_capabilities(model, capabilities, manifest=None):
     """Keep isolated-watch ADC opt-in tied to its exact core and machine ABI."""
+    if model == "miwear.watch.o62m":
+        return {}
     if model not in ("miwear.watch.p65", "miwear.watch.q65"):
         return capabilities
     allowed = {"nandPersistence", "norPersistence", "virtualPeer"}
@@ -795,7 +799,7 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
     if not dependency_paths or not bridge_paths:
         raise MError("identity_incomplete", "Explicit interpreter/dependency and bridge identity paths are required")
     profile = rows[profile_id]
-    expected_chip = "best1502p" if profile["model"] in ("miwear.watch.p65", "miwear.watch.q65") else "best1503"
+    expected_chip = "xring" if profile["model"] == "miwear.watch.o62m" else "best1502p" if profile["model"] in ("miwear.watch.p65", "miwear.watch.q65") else "best1503"
     runtime_capabilities = board_runtime_capabilities(profile["model"], runtime_capabilities,
         engine["manifest"] if engine_root is not None else None)
     declarations[str(_path(profile["ap_path"]))] = (profile["ap"]["sha256"], "catalog")
@@ -827,7 +831,7 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
     members = [p for p in profile.get("partitions", []) if p.get("name") == "vela_resource.bin"]
     if len(members) > 1:
         raise MError("invalid_catalog", "Ambiguous ROMFS resource")
-    storage = "romfs" if members else "yaffs"
+    storage = "emmc" if expected_chip == "xring" else "romfs" if members else "yaffs"
     if generated:
         if profile["ap"].get("chip") != expected_chip:
             raise MError("identity_mismatch", "Generated mode requires a BES1503 band profile")
@@ -897,6 +901,10 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
         from .virtual_peer import RUNTIME_FILES as peer_runtime_files
         runtime_files += peer_runtime_files
     runtime = [{**pin(project / name), "path": name} for name in runtime_files]
+    if expected_chip == "xring":
+        runtime += [{**pin(project / name), "path": name} for name in
+                    ("backend/src/xring_board.json", "backend/src/xring_ui_db.c")]
+        runtime_files += ("backend/src/xring_board.json", "backend/src/xring_ui_db.c")
     source_manifest = {"schema": "minative-python-runtime-v1", "files": runtime}
     # Include imported siblings omitted from the upstream evidence fingerprint.
     import_paths = [*project.glob("*.py"), *(project / "backend/src").glob("*.py")]
@@ -946,6 +954,8 @@ def inspect_backend(project, python, profile_id, *, prepared, dependency_paths=(
     # including ROMFS-resource models; the settings tool is pinned for all.
     if (project / "backend/build/instance-props").is_file():
         identity.setdefault("builders", []).append(pin(project / "backend/build/instance-props"))
+    if expected_chip == "xring":
+        identity.setdefault("builders", []).append(pin(project / "backend/build/xring-ui-db"))
     if identity.get("builders"):
         # The builders compile/read these vendored sources inside the sandbox.
         references = project / "references"
@@ -1271,7 +1281,10 @@ class MinativeAdapter:
         if not generated:
             wanted["data_sha256"] = expected["prepared"].get("seed", {}).get("sha256")
         storage_binding = expected.get("instanceStorage")
-        if storage_binding:
+        if storage_binding and storage_binding.get("kind") == "xring-emmc":
+            wanted["emmc_image"] = storage_binding["emmcImage"]
+            wanted["emmc_initialize"] = storage_binding["emmcInitialize"]
+        elif storage_binding:
             wanted["instance_data_sha256"] = storage_binding["dataSHA256"]
             wanted["instance_spare_sha256"] = storage_binding["spareSHA256"]
             if storage_binding.get("norPersistent") is True:
@@ -1296,7 +1309,12 @@ class MinativeAdapter:
                 raise MError("identity_mismatch", "Runner virtual identity differs from this instance")
         elif "virtual_peer_state_sha256" in board:
             raise MError("identity_mismatch", "Runner added an unapproved virtual board binding")
-        if storage_binding:
+        if storage_binding and storage_binding.get("kind") == "xring-emmc":
+            wanted_storage = {"kind": "xring-emmc", **{key: storage_binding[key] for key in
+                ("emmcImage", "emmcBytes", "emmcInitialize")}}
+            if board.pop("instance_storage", None) != wanted_storage:
+                raise MError("identity_mismatch", "Runner XRing eMMC differs from this instance")
+        elif storage_binding:
             wanted_storage = {"schema": 1, **{key: storage_binding[key] for key in
                 ("dataImage", "spareImage", "dataSHA256", "spareSHA256", "dataOffset", "dataBytes")}}
             if (board.pop("instance_storage", None) != wanted_storage

@@ -1,10 +1,4 @@
-"""Version-independent static firmware diagnostics. Never executes/extracts code.
-
-The user's import is the only firmware source of truth: nothing here matches a
-version list, a catalog digest or a member checksum, and nothing here refuses
-to boot a package. Parsing is structural only, so a full OTA is inventoried
-without expanding its members.
-"""
+"""Static firmware container inventory and boot-header diagnostics."""
 from __future__ import annotations
 
 import hashlib
@@ -42,6 +36,12 @@ def inspect_ap(data):
     result = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
               "chip": "unidentified", "headerRecognized": False}
     if len(data) < 128:
+        return result
+    stack, entry = struct.unpack_from("<II", data)
+    if (0x60000000 <= stack <= 0x62000000 and stack % 8 == 0
+            and entry & 1 and 0x605c0000 <= (entry & ~1) < 0x605c0000 + len(data)):
+        result.update(chip="xring", headerRecognized=True, imageBase=0x605c0000,
+                      resetEntry=entry, resetSP=stack)
         return result
     matches = re.finditer(rb"(?<=\n)CHIP=([^\r\n\x00 ]{1,32})(?=[\r\n\x00 ])", data)
     match = next(matches, None)
@@ -138,7 +138,7 @@ def inventory(fd, size):
             need(name.casefold() not in names, "固件包有重复或大小写冲突的路径")
             names.add(name.casefold())
             kind = stat.S_IFMT(entry.external_attr >> 16)
-            need(kind in (0, stat.S_IFREG, stat.S_IFDIR) and not entry.flag_bits & ~0x808
+            need(kind in (0, stat.S_IFREG, stat.S_IFDIR) and not entry.flag_bits & ~0x80e
                  and entry.compress_type in (0, 8), "固件包含链接、加密或不支持的压缩方式")
             need(0 <= entry.file_size <= MAX_INPUT and 0 <= entry.compress_size <= MAX_INPUT
                  and entry.file_size <= max(4096, entry.compress_size * 4096), "固件成员超过大小或压缩比限制")
@@ -161,7 +161,9 @@ def inventory(fd, size):
                 ap_entries.append(entry)
         ranges.sort()
         need(all(a[1] <= b[0] for a, b in zip(ranges, ranges[1:])), "固件成员互相重叠")
-        need(len(ap_entries) == 1, "完整固件必须包含唯一 vela_ap.bin；不能猜测差分包或多设备包")
+        need(len(ap_entries) <= 1, "固件包含多个 AP，无法确定启动镜像")
+        if not ap_entries:
+            return b"", {"members": count, "expandedBytes": expanded, "resourceLayout": "multi-partition"}
         need(ap_entries[0].file_size <= MAX_AP, "AP 超过静态分析大小限制")
         ap_data = bytearray()
         with archive.open(ap_entries[0]) as member:
@@ -189,7 +191,11 @@ def engine_ap(ap_data):
     ap = {"sha256": probe["sha256"], "size": probe["bytes"], "chip": probe["chip"]}
     if "build" in probe:
         ap["build"] = probe["build"]
-    if probe["headerRecognized"]:
+    if probe["chip"] == "xring":
+        ap.update(image_format="xring-vector", image_base=probe["imageBase"],
+                  reset_entry=probe["resetEntry"], reset_sp=probe["resetSP"],
+                  backend_requirement="xring O62M original TEE/AP boot")
+    elif probe["headerRecognized"]:
         ap.update(image_format="bes-header", ap_offset=probe["apOffset"], flash_bytes=probe["flashBytes"],
                   data_alias=probe["dataAlias"], reset_entry=probe["resetEntry"], reset_sp=probe["resetSP"],
                   backend_requirement=probe["chip"] + " peripheral and product storage/panel profile")
@@ -211,7 +217,7 @@ def ota_recipe(fd, size):
         need(len(data) == size, "分析期间固件发生变化")
         return _envelope_recipe(data)
     ap_data, archive = inventory(fd, size)
-    ap = engine_ap(ap_data)
+    ap = engine_ap(ap_data) if ap_data else {}
     records, small = [], {}
     with os.fdopen(os.dup(fd), "rb") as stream, zipfile.ZipFile(stream) as zipped:
         for index, info in enumerate(zipped.infolist()):
@@ -228,17 +234,19 @@ def ota_recipe(fd, size):
             if base == "vela_ap.bin":
                 record["sha256"] = ap["sha256"]
             records.append(record)
-            if base in ("ota.json", "version", "version.ini", "ota.sh", "build.prop") and info.file_size <= 65536:
+            if base in ("ota.json", "version", "version.ini", "version.txt", "ota.sh", "build.prop") and info.file_size <= 65536:
                 small.setdefault(base, zipped.read(info).decode("utf-8", "replace"))
-    family, version = "", None
+    family, version, package_kind = "", None, "full"
     if "ota.json" in small:
         try:
             spec = json.loads(small["ota.json"])
             family = str(spec.get("magic_string", ""))[:16] if isinstance(spec, dict) else ""
+            if isinstance(spec, dict) and spec.get("firmware_type") in ("diff", "incremental"):
+                package_kind = "incremental"
             version = _version(str(spec.get("sw_version", ""))) if isinstance(spec, dict) else None
         except ValueError:
             pass
-    for name in ("version", "version.ini", "ota.sh"):
+    for name in ("version", "version.ini", "version.txt", "ota.sh"):
         version = version or _version(small.get(name))
     version = version or _version(ap.get("build", {}).get("VERSION"))
     if version is None:
@@ -255,8 +263,12 @@ def ota_recipe(fd, size):
                 break
     version = version or "0"
     declared = sorted({m.decode("ascii") for m in DECLARED_MODEL.findall(ap_data)})[:64]
+    if ap.get("chip") == "xring" and {"vela_tee.bin", "vela_mmap.bin", "vela_CP_boot.bin", "vela_CP.bin", "vela_CRF.bin"} <= {PurePosixPath(r["name"]).name for r in records}:
+        declared = ["o62m"]
     return {"version": version, "family": family, "declaredModels": declared, "ap": ap,
-            "partitions": records, "resourceLayout": archive["resourceLayout"]}
+            "partitions": records, "resourceLayout": archive["resourceLayout"],
+            "packageKind": "incremental" if any(PurePosixPath(r["name"]).name.startswith("vela_") and r["name"].endswith(".patch") for r in records) else package_kind,
+            "container": "zip"}
 
 
 def _inflate_member(data, record):
@@ -313,9 +325,9 @@ def _envelope_members(data):
             need(len(infos) == 1 and infos[0].filename == name and infos[0].header_offset == 0,
                  "资源 ZIP 必须恰好包含一个成员")
             info = infos[0]
-        need(info.compress_type in (0, 8) and not info.flag_bits & ~0x808,
+        need(info.compress_type in (0, 8) and not info.flag_bits & ~0x80e,
              "固件成员包含链接、加密或不支持的压缩方式")
-        records.append({"index": index, "name": name, "header_offset": start,
+        records.append({"index": index, "name": name, "target_path": path, "header_offset": start,
                         "data_offset": start + 30 + nlen + elen,
                         "compressed_size": info.compress_size, "size": info.file_size,
                         "compression_method": info.compress_type, "crc32": f"{info.CRC:08x}"})
@@ -325,56 +337,154 @@ def _envelope_members(data):
 def _envelope_recipe(data):
     records = _envelope_members(data)
     ap_entries = [record for record in records if record["name"] == "vela_ap.bin"]
-    need(len(ap_entries) == 1, "完整固件必须包含唯一 vela_ap.bin")
-    ap_data = _inflate_member(data, ap_entries[0])
-    ap = engine_ap(ap_data)
-    ap_entries[0]["sha256"] = ap["sha256"]
+    need(len(ap_entries) <= 1, "固件包含多个 AP，无法确定启动镜像")
+    ap_data = _inflate_member(data, ap_entries[0]) if ap_entries else b""
+    ap = engine_ap(ap_data) if ap_data else {}
+    if ap_entries:
+        ap_entries[0]["sha256"] = ap["sha256"]
     version = None
     for record in records:
         if record["name"] == "version.ini":
             version = _version(_inflate_member(data, record).decode("utf-8", "replace"))
             break
     if version is None:
-        version = _version(data[4:24].split(b"\0", 1)[0].decode("ascii", "replace"))
+        base = struct.unpack_from("<I", data, 0x54)[0]
+        version = _version(data[base + 4:base + 68].split(b"\0", 1)[0].decode("ascii", "replace"))
     if version is None:
         match = re.search(rb"ro\.build\.[a-zA-Z_.]{1,40}=[ \t]*([0-9]+(?:\.[0-9]+){1,7})", ap_data)
         version = _version(match.group(1).decode("ascii", "ignore")) if match else None
     declared = sorted({m.decode("ascii") for m in DECLARED_MODEL.findall(ap_data)})[:64]
+    if ap.get("chip") == "xring" and {"vela_tee.bin", "vela_mmap.bin", "vela_CP_boot.bin", "vela_CP.bin", "vela_CRF.bin"} <= {PurePosixPath(r["name"]).name for r in records}:
+        declared = ["o62m"]
     return {"version": version or "0", "family": "", "declaredModels": declared, "ap": ap,
-            "partitions": records, "resourceLayout": "multi-partition"}
+            "partitions": records, "resourceLayout": "multi-partition", "container": "bes-envelope",
+            "packageKind": "full" if ap and any(r["target_path"].startswith("/system/")
+                and not r["target_path"].startswith("/system/version/") for r in records) else "unknown"}
+
+
+ARCHIVE_FILENAME = re.compile(
+    r"(?P<model>[a-z0-9]+(?:\.[a-z0-9]+){2,})_v(?P<version>[0-9]+(?:\.[0-9]+){1,7})"
+    r"(?:_from_v(?P<base>[0-9]+(?:\.[0-9]+){1,7}))?_(?P<kind>full|incremental)_[0-9a-f]{8,64}\.bin$",
+    re.IGNORECASE)
+
+
+def archive_recipe(fd, size, filename=""):
+    """Parse containers; keep unimplemented binary families as described archives.
+
+    Archive filenames supply release metadata, never CPU identity or execution
+    approval. ZIP/BES members retain their original boundaries and AP bytes.
+    """
+    need(0 < size <= MAX_INPUT, "固件文件为空或超过大小限制")
+    head = os.pread(fd, min(size, 4096), 0)
+    match = ARCHIVE_FILENAME.fullmatch(PurePosixPath(filename).name)
+    named = match.groupdict() if match else {}
+    if head[:4] in (b"PK\x03\x04", BES_ENVELOPE_MAGIC):
+        result = ota_recipe(fd, size)
+        names = [PurePosixPath(r["name"]).name for r in result["partitions"]]
+        need(named or any(n.startswith("vela_") or n in ("ota.json", "ota.sh", "build.prop") for n in names),
+             "ZIP 不包含可识别的固件成员")
+        result["structure"] = "member-inventory"
+    else:
+        need(len(head) >= 64, "固件头不完整")
+        result = {"version": "0", "family": "", "declaredModels": [], "ap": {},
+                  "partitions": [], "resourceLayout": "binary", "packageKind": "unknown",
+                  "structure": "header-only"}
+        if head[:4] == b"AOTA":
+            need(size >= 512, "AOTA 固件头不完整")
+            result.update(container="aota", headerVersion=head[64:96].split(b"\0", 1)[0].decode("ascii", "replace"),
+                          boardName=head[96:128].split(b"\0", 1)[0].decode("ascii", "replace"))
+            count, table = struct.unpack_from("<H", head, 12)[0], struct.unpack_from("<H", head, 16)[0]
+            need(0 < count <= MAX_MEMBERS and table >= 128 and table + count * 32 <= size,
+                 "AOTA 成员表越界")
+            records = []
+            for index in range(count):
+                row = os.pread(fd, 32, table + index * 32)
+                need(len(row) == 32, "AOTA 成员表不完整")
+                name = row[:16].split(b"\0", 1)[0].decode("ascii")
+                offset, length = struct.unpack_from("<II", row, 16)
+                need(name and table + count * 32 <= offset <= offset + length <= size,
+                     "AOTA 成员数据越界")
+                records.append({"index": index, "name": name, "data_offset": offset, "size": length})
+            result.update(partitions=records, structure="member-inventory")
+        elif head[:4] == b"\x78\x56\x34\x12":
+            mode = struct.unpack_from("<I", head, 8)[0]
+            need(mode in (1, 2), "手环升级容器类型无效")
+            result.update(container="band-update", packageKind="incremental" if mode == 1 else "full",
+                          version=_version(head[12:76].split(b"\0", 1)[0].decode("ascii", "replace")) or "0")
+        elif head[:8] == b"full\0\0\0\0":
+            major, minor, patch = struct.unpack_from(">BBH", head, 12)
+            result.update(container="midr-full", packageKind="full", version=f"{major}.{minor}.{patch}")
+            device = head[16:48].split(b"\0", 1)[0].decode("ascii", "replace")
+            if re.fullmatch(r"midr\.watch\.[a-z0-9]+", device):
+                result["declaredModels"] = [device]
+        else:
+            # Older archive releases have no shared container signature. Keep
+            # their bytes intact and label the release metadata's provenance.
+            need(named, "无法识别固件容器；请选择原始固件包")
+            result.update(container="raw-binary", structure="opaque")
+    if named:
+        result["archiveModel"] = named["model"].lower()
+        result["archiveVersion"] = named["version"]
+        result["metadataSource"] = "archive-filename"
+        result["version"] = named["version"]
+        if named["kind"] == "incremental":
+            result["packageKind"] = "incremental"
+        elif result["packageKind"] == "unknown":
+            result["packageKind"] = "full"
+        if named["base"]:
+            result["baseVersion"] = named["base"]
+        if not result["declaredModels"]:
+            result["declaredModels"] = [named["model"].lower()]
+    else:
+        result["metadataSource"] = "firmware"
+    ap = result["ap"]
+    result["bootablePackage"] = (result["packageKind"] == "full" and
+        ap.get("image_format") in ("bes-header", "xring-vector"))
+    return result
 
 
 def inspect_firmware(source):
-    """Describe the imported bytes. The result never gates execution."""
+    """Describe a firmware package without executing or changing it."""
     fd, before = _open_file(_path(source), MAX_INPUT)
     try:
-        need(before.st_size > 0, "固件文件为空")
-        result = {"version": 1, "bytes": before.st_size,
-                  "executed": False, "modified": False, "compatibility": "unverified",
-                  "guestDebuggingVerified": False, "versionWhitelistUsed": False}
-        head = os.pread(fd, 4, 0)
-        if head == b"PK\x03\x04":
-            data, result["archive"] = inventory(fd, before.st_size)
-            result["inputKind"] = "full-ota-zip"
-            result["ap"] = inspect_ap(data)
-        elif head == BES_ENVELOPE_MAGIC:
-            # The BES full-package envelope: report its own AP member and the
-            # embedded member count under the ZIP-compatible diagnostic shape.
-            recipe = _envelope_recipe(os.pread(fd, before.st_size, 0))
-            result["archive"] = {"members": len(recipe["partitions"]),
-                                 "resourceLayout": recipe["resourceLayout"]}
-            result["inputKind"] = "full-ota-zip"
-            result["ap"] = recipe["ap"]
-        else:
-            need(before.st_size <= MAX_AP, "非 ZIP 文件超过 AP 上限，需要识别其固件容器")
+        head = os.pread(fd, 8, 0)
+        if (head[:4] not in (b"PK\x03\x04", BES_ENVELOPE_MAGIC, b"AOTA", b"\x78\x56\x34\x12", b"full")
+                and not ARCHIVE_FILENAME.fullmatch(PurePosixPath(os.fspath(source)).name)):
+            need(0 < before.st_size <= MAX_AP, "非容器文件超过 AP 静态分析上限")
             data = os.pread(fd, before.st_size, 0)
             need(len(data) == before.st_size, "分析期间固件发生变化")
-            result["inputKind"] = "ap-candidate"
-            result["ap"] = inspect_ap(data)
-        # The AP digest is the only identity that matters; no whole-file pass.
-        result["sha256"] = result["ap"]["sha256"]
-        result["nextStep"] = "导入后即按实例的硬件预设开机；不比对版本、不要求哈希匹配"
-        result["runtimeReady"] = False
+            ap = inspect_ap(data)
+            return {"version": 1, "sha256": ap["sha256"], "bytes": before.st_size,
+                    "inputKind": "ap-candidate", "executed": False, "modified": False,
+                    "compatibility": "unverified", "guestDebuggingVerified": False,
+                    "versionWhitelistUsed": False, "runtimeReady": False, "ap": ap,
+                    "nextStep": "单独 AP 缺少启动所需资源；请选择完整固件包进行导入"}
+        recipe = archive_recipe(fd, before.st_size, os.fspath(source))
+        result = {"version": 1, "bytes": before.st_size, "executed": False, "modified": False,
+                  "compatibility": "unverified", "guestDebuggingVerified": False, "versionWhitelistUsed": False,
+                  "inputKind": recipe["packageKind"], "container": recipe["container"],
+                  "firmwareVersion": recipe["version"], "declaredModels": recipe["declaredModels"],
+                  "metadataSource": recipe["metadataSource"], "structure": recipe["structure"],
+                  "archive": {"members": len(recipe["partitions"]), "resourceLayout": recipe["resourceLayout"],
+                              "expandedBytes": sum(r["size"] for r in recipe["partitions"])},
+                  "ap": None, "runtimeReady": False}
+        digest = hashlib.sha256()
+        for offset in range(0, before.st_size, 1024 * 1024):
+            digest.update(os.pread(fd, min(1024 * 1024, before.st_size - offset), offset))
+        result["sha256"] = digest.hexdigest()
+        ap = recipe["ap"]
+        if ap:
+            result["ap"] = {"sha256": ap["sha256"], "bytes": ap["size"], "chip": ap["chip"],
+                            "headerRecognized": ap["image_format"] in ("bes-header", "xring-vector")}
+            for source_key, target_key in (("build", "build"), ("ap_offset", "apOffset"),
+                    ("flash_bytes", "flashBytes"), ("data_alias", "dataAlias"), ("image_base", "imageBase"),
+                    ("reset_entry", "resetEntry"), ("reset_sp", "resetSP")):
+                if source_key in ap:
+                    result["ap"][target_key] = ap[source_key]
+        if "baseVersion" in recipe:
+            result["baseVersion"] = recipe["baseVersion"]
+        result["nextStep"] = ("完整包已解析，可选择对应的硬件实例" if recipe["bootablePackage"] else
+                              "可保存到固件库；此文件不能独立启动")
         after = os.fstat(fd)
         need((before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
              (after.st_size, after.st_mtime_ns, after.st_ctime_ns), "分析期间固件发生变化")

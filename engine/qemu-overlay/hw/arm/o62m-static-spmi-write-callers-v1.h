@@ -1,0 +1,36 @@
+/* SPDX-License-Identifier: MIT
+ * Finite public-original Thumb BL encoding candidates to 0x60c4d044.
+ * Classification only: no stack access, runtime values or reachability claim.
+ * Exact odd Thumb returns only; unknown values are not exposed.
+ */
+#ifndef O62M_STATIC_SPMI_WRITE_CALLERS_V1_H
+#define O62M_STATIC_SPMI_WRITE_CALLERS_V1_H
+#include <stdint.h>
+#define O62M_STATIC_SPMI_WRITE_CALLERS_V1_COUNT 106u
+static inline int o62m_static_spmi_write_caller_index_v1(uint32_t saved_return)
+{
+    static const uint32_t returns[O62M_STATIC_SPMI_WRITE_CALLERS_V1_COUNT]={
+        UINT32_C(0x609d7bbf),UINT32_C(0x609d7bf1),UINT32_C(0x609d7c47),UINT32_C(0x609d7c79),UINT32_C(0x609d7ccf),UINT32_C(0x609d7d01),
+        UINT32_C(0x609dbf83),UINT32_C(0x609dbf99),UINT32_C(0x609dbfd5),UINT32_C(0x609dbff3),UINT32_C(0x60c2a6b3),UINT32_C(0x60c2a6bd),
+        UINT32_C(0x60c2a6c7),UINT32_C(0x60c31553),UINT32_C(0x60c31565),UINT32_C(0x60c3156d),UINT32_C(0x60c3159f),UINT32_C(0x60c315a7),
+        UINT32_C(0x60c315b5),UINT32_C(0x60c315c3),UINT32_C(0x60c3b643),UINT32_C(0x60c3b651),UINT32_C(0x60c3b659),UINT32_C(0x60c3b673),
+        UINT32_C(0x60c3b697),UINT32_C(0x60c3b6a5),UINT32_C(0x60c3b6c1),UINT32_C(0x60c4d0c1),UINT32_C(0x60c4dc5b),UINT32_C(0x60c4dec5),
+        UINT32_C(0x60c4df6f),UINT32_C(0x60c4df7b),UINT32_C(0x60c4df87),UINT32_C(0x60c4df93),UINT32_C(0x60c4df9f),UINT32_C(0x60c4dfab),
+        UINT32_C(0x60c4dfb9),UINT32_C(0x60c4dfc7),UINT32_C(0x60c4dfd5),UINT32_C(0x60c4dfe3),UINT32_C(0x60c4dff1),UINT32_C(0x60c4dffd),
+        UINT32_C(0x60c4e089),UINT32_C(0x60c4e095),UINT32_C(0x60c4e0a1),UINT32_C(0x60c4e0ad),UINT32_C(0x60c4e0b9),UINT32_C(0x60c4e0c5),
+        UINT32_C(0x60c4e0d3),UINT32_C(0x60c4e149),UINT32_C(0x60c4e155),UINT32_C(0x60c4e161),UINT32_C(0x60c4e16d),UINT32_C(0x60c4e179),
+        UINT32_C(0x60c4e185),UINT32_C(0x60c4e193),UINT32_C(0x60c4e1dd),UINT32_C(0x60c4e20b),UINT32_C(0x60c4e21b),UINT32_C(0x60c4e271),
+        UINT32_C(0x60c4e28b),UINT32_C(0x60c4e29b),UINT32_C(0x60c4e2ab),UINT32_C(0x60c4e2c9),UINT32_C(0x60c4e2e9),UINT32_C(0x60c4e2ff),
+        UINT32_C(0x60c4e323),UINT32_C(0x60c4e33d),UINT32_C(0x60c4e357),UINT32_C(0x60c52bdd),UINT32_C(0x60c52c77),UINT32_C(0x60c52d1b),
+        UINT32_C(0x60c54a6b),UINT32_C(0x60c54adf),UINT32_C(0x60c54ae9),UINT32_C(0x60c54b69),UINT32_C(0x60c54bdd),UINT32_C(0x60d3093d),
+        UINT32_C(0x60d30949),UINT32_C(0x60d30955),UINT32_C(0x60d30961),UINT32_C(0x60d3096d),UINT32_C(0x60d30979),UINT32_C(0x60d30edf),
+        UINT32_C(0x60d30ee9),UINT32_C(0x60d5a4a3),UINT32_C(0x60da6eaf),UINT32_C(0x60da6ebb),UINT32_C(0x60da6ec7),UINT32_C(0x60da6ed3),
+        UINT32_C(0x60da6edf),UINT32_C(0x60da6eeb),UINT32_C(0x60da6f07),UINT32_C(0x60da6f13),UINT32_C(0x60dc0385),UINT32_C(0x60dc03a1),
+        UINT32_C(0x60dc03bf),UINT32_C(0x60dc03db),UINT32_C(0x60dc0401),UINT32_C(0x60dc0ae5),UINT32_C(0x60dc0af1),UINT32_C(0x60dc0afd),
+        UINT32_C(0x60dc0b09),UINT32_C(0x60dc0b15),UINT32_C(0x60dc0b21),UINT32_C(0x60dc0b2f),
+    };
+    for(unsigned i=0;i<O62M_STATIC_SPMI_WRITE_CALLERS_V1_COUNT;i++)
+        if(saved_return==returns[i])return (int)i;
+    return -1;
+}
+#endif

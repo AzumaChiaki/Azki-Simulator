@@ -292,7 +292,9 @@ def _read_json(path):
 
 def _committed(folder):
     manifest = _read_json(folder / "revision.json")
-    return manifest is not None and isinstance(manifest.get("dataSHA256"), str)
+    return manifest is not None and (isinstance(manifest.get("dataSHA256"), str)
+        or (manifest.get("committed") is True and isinstance(manifest.get("firmware"), dict)
+            and manifest["firmware"].get("data_format") == "xring-emmc"))
 
 
 def _head_name(storage):

@@ -1,0 +1,16 @@
+#ifndef O62M_PMIC_CLOCK_DEFS_V2_H
+#define O62M_PMIC_CLOCK_DEFS_V2_H
+#include <stdint.h>
+/* Original typed catalog SHA256 cb9c702af27c90c8287abd6aa69f13f26a83bc63951f1b6a53a73cc95f05b884 */
+#define O62M_PMIC_CLOCK_WORDS_V2 6u
+#define O62M_PMIC_CLOCK_FIELDS_MAX_V2 11u
+typedef struct O62MPmicClockDefV2 { uint16_t reg, union_mask; unsigned field_count; uint16_t field_mask[11]; } O62MPmicClockDefV2;
+static const O62MPmicClockDefV2 o62m_pmic_clock_defs_v2[6] = {
+    {0x0004, 0x0f7f, 11, {0x0001, 0x0002, 0x0004, 0x0008, 0x0010, 0x0020, 0x0040, 0x0100, 0x0200, 0x0400, 0x0800}},
+    {0x0018, 0x0007, 2, {0x0003, 0x0004}},
+    {0x001c, 0x000f, 2, {0x0007, 0x0008}},
+    {0x1000, 0x0fde, 10, {0x0002, 0x0004, 0x0008, 0x0010, 0x0040, 0x0080, 0x0100, 0x0200, 0x0400, 0x0800}},
+    {0x1004, 0x00a5, 4, {0x0001, 0x0004, 0x0020, 0x0080}},
+    {0x1014, 0x1f7f, 4, {0x003f, 0x0040, 0x0f00, 0x1000}},
+};
+#endif

@@ -52,11 +52,13 @@ import SwiftUI
                 Text(message).font(.system(size: 12)).foregroundStyle(messageIsError ? .red : .secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            note(footer)
-            HStack(spacing: 8) {
-                Text("语言、时区、时间格式、开机时间和系统属性：").font(.system(size: 12)).foregroundStyle(.secondary)
-                Button("系统设置…", action: editSystemSettings).disabled(!enabled || runtime.instanceID == nil)
-                    .accessibilityIdentifier("simulator.firmware-settings")
+            if runtime.modelConstraint != "miwear.watch.o62m" {
+                note(footer)
+                HStack(spacing: 8) {
+                    Text("语言、时区、时间格式、开机时间和系统属性：").font(.system(size: 12)).foregroundStyle(.secondary)
+                    Button("系统设置…", action: editSystemSettings).disabled(!enabled || runtime.instanceID == nil)
+                        .accessibilityIdentifier("simulator.firmware-settings")
+                }
             }
         }
         .task(id: runtime.instanceID) { await loadSettings() }

@@ -69,6 +69,8 @@ def execution_prefix(adapter):
         instance_data = adapter.root / "instance-data"
         expected_images = {"dataImage": "nand-data.bin", "spareImage": "nand-spare.bin",
                            "norImage": "nor-config.bin"}
+        if storage_binding.get("kind") == "xring-emmc":
+            expected_images = {"emmcImage": "emmc.img"}
         for key, name in expected_images.items():
             image = storage_binding.get(key)
             if image is None and key == "norImage":

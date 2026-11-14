@@ -7,6 +7,8 @@ license does not replace those terms.
 | Component | Source | License |
 | --- | --- | --- |
 | QEMU 10.1.0 | https://download.qemu.org/qemu-10.1.0.tar.xz | GPLv2 overall; individual files retain their own terms |
+| XRing O62M model and SD extensions | `qemu-overlay/` | Per-file notices |
+| Mbed TLS SHA-256 | `qemu-overlay/hw/arm/o62m-hash-backend-v1/` | Apache-2.0; vendored notices retained |
 | BES1503 model and storage extensions | `qemu-overlay/` | GPL-2.0-or-later, as marked in files |
 | CPython 3.12.10 | https://www.python.org/ftp/python/3.12.10/Python-3.12.10.tar.xz | PSF and historical licenses in `LICENSE` |
 | Pillow 12.3.0 | https://pypi.org/project/pillow/12.3.0/ | MIT-CMU and included notices |

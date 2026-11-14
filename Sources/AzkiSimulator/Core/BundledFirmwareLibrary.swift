@@ -20,12 +20,17 @@ nonisolated struct BundledFirmwareItem: Codable, Identifiable, Equatable, Sendab
     let height: Int
     let availability: Availability
     let source: Source
+    var packageKind: String? = nil
+    var container: String? = nil
+    var baseVersion: String? = nil
+    var metadataSource: String? = nil
 
     func validate() throws {
         guard FirmwareLibraryValidation.identifier(id),
               [displayName, device, model, firmwareVersion].allSatisfy({ FirmwareLibraryValidation.text($0, limit: 240) }),
               FirmwareLibraryValidation.digest(otaSHA256),
-              [(192, 490), (212, 520), (336, 480), (432, 514)].contains(where: { $0 == (width, height) }),
+              ([(192, 490), (212, 520), (336, 480), (432, 514), (466, 466)].contains(where: { $0 == (width, height) })
+                || (!availability.ready && width == 0 && height == 0)),
               FirmwareLibraryValidation.text(availability.reason, limit: 1_024, empty: true),
               availability.missingRoles.count <= 32,
               availability.missingRoles.allSatisfy({ FirmwareLibraryValidation.identifier($0) }),
@@ -48,7 +53,7 @@ nonisolated struct BundledDevicePreset: Decodable, Identifiable, Equatable, Send
     func validate() throws {
         guard FirmwareLibraryValidation.identifier(model),
               FirmwareLibraryValidation.text(displayName, limit: 240),
-              [(192, 490), (212, 520), (336, 480), (432, 514)].contains(where: { $0 == (width, height) }) else {
+              [(192, 490), (212, 520), (336, 480), (432, 514), (466, 466)].contains(where: { $0 == (width, height) }) else {
             throw SimulatorError.invalidSession("硬件预设包含无效的型号或尺寸")
         }
     }
@@ -89,7 +94,7 @@ nonisolated struct BundledFirmwareCatalog: Decodable, Sendable {
 }
 
 nonisolated struct FirmwareImportReceipt: Decodable, Sendable {
-    enum InputKind: String, Decodable, Sendable { case ap, ota }
+    enum InputKind: String, Decodable, Sendable { case ap, ota, archive }
     let version: Int
     let recognized: Bool
     let imported: Bool
@@ -121,7 +126,7 @@ nonisolated struct FirmwareImportReceipt: Decodable, Sendable {
 /// catalog entry. Even a recognized boot header remains runtimeReady == false.
 nonisolated struct FirmwareDiagnostic: Decodable, Sendable {
     enum InputKind: String, Decodable, Sendable {
-        case apCandidate = "ap-candidate", fullOTA = "full-ota-zip"
+        case apCandidate = "ap-candidate", fullOTA = "full-ota-zip", full, incremental, unknown
     }
     struct AP: Decodable, Sendable {
         let sha256: String
@@ -135,6 +140,7 @@ nonisolated struct FirmwareDiagnostic: Decodable, Sendable {
         let dataAlias: Int?
         let resetEntry: Int?
         let resetSP: Int?
+        let imageBase: Int?
     }
     struct Archive: Decodable, Sendable {
         let members: Int
@@ -152,23 +158,38 @@ nonisolated struct FirmwareDiagnostic: Decodable, Sendable {
     let versionWhitelistUsed: Bool
     let runtimeReady: Bool
     let nextStep: String
-    let ap: AP
+    let ap: AP?
     let archive: Archive?
+    var container: String? = nil
+    var firmwareVersion: String? = nil
+    var baseVersion: String? = nil
+    var declaredModels: [String]? = nil
+    var metadataSource: String? = nil
+    var structure: String? = nil
 
     var summary: String {
-        ap.headerRecognized ? "已读取启动头；导入后即按实例的硬件预设开机" : "已完成结构检查；启动头尚未适配，仍可导入后由运行结果说明"
+        if inputKind == .incremental { return "已识别增量固件；需要对应基础版本才能还原完整系统" }
+        if ap?.headerRecognized == true { return "已读取启动头；可导入到对应机型" }
+        return structure == "opaque" ? "已保存原文件，封装内部尚未解析" : "已读取固件包信息"
     }
     var details: String {
-        var lines = ["输入：\(inputKind == .fullOTA ? "完整 OTA ZIP" : "AP 候选文件") · \(bytes) 字节",
-                     "AP SHA-256：\(sha256)", "芯片：\(ap.chip)"]
-        if let version = ap.build?["VERSION"] { lines.append("头部版本字段：\(version)") }
-        if let archive {
+        var lines = ["输入：\(container ?? inputKind.rawValue) · \(bytes) 字节", "文件 SHA-256：\(sha256)"]
+        if let firmwareVersion { lines.append("版本：\(firmwareVersion)") }
+        if let baseVersion { lines.append("基础版本：\(baseVersion)") }
+        if metadataSource == "archive-filename" { lines.append("型号与版本来源：归档文件名") }
+        if structure == "header-only" { lines.append("解析范围：容器头部") }
+        if let models = declaredModels, !models.isEmpty { lines.append("型号：" + models.joined(separator: "、")) }
+        if let ap {
+            lines.append("芯片：\(ap.chip)")
+            if let version = ap.build?["VERSION"] { lines.append("头部版本字段：\(version)") }
+        }
+        if let archive, structure != "opaque", structure != "header-only" {
             lines.append("包内 \(archive.members) 个成员 · 展开约 \(archive.expandedBytes) 字节 · 资源布局：\(archive.resourceLayout)")
         }
-        if let offset = ap.apOffset, let flash = ap.flashBytes, let entry = ap.resetEntry, let stack = ap.resetSP {
+        if let ap, let offset = ap.apOffset, let flash = ap.flashBytes, let entry = ap.resetEntry, let stack = ap.resetSP {
             lines.append(String(format: "AP 偏移：0x%X · Flash：0x%X · 启动入口：0x%X · 初始栈：0x%X", offset, flash, entry, stack))
         }
-        if let diagnostic = ap.diagnostic { lines.append(diagnostic) }
+        if let diagnostic = ap?.diagnostic { lines.append(diagnostic) }
         lines += [nextStep, "仅静态读取；未修改原文件，未启动固件，未验证客体调试能力。"]
         return lines.joined(separator: "\n")
     }
@@ -180,15 +201,26 @@ nonisolated struct FirmwareDiagnostic: Decodable, Sendable {
               (1...805_306_368).contains(value.bytes), value.compatibility == "unverified",
               !value.executed, !value.modified, !value.guestDebuggingVerified,
               !value.versionWhitelistUsed, !value.runtimeReady,
-              FirmwareLibraryValidation.text(value.nextStep, limit: 1_024),
-              FirmwareLibraryValidation.digest(ap.sha256), (0...67_108_864).contains(ap.bytes),
+              FirmwareLibraryValidation.text(value.nextStep, limit: 1_024) else {
+            throw SimulatorError.invalidSession("固件静态诊断内容无效")
+        }
+        if let ap {
+            guard FirmwareLibraryValidation.digest(ap.sha256), (0...67_108_864).contains(ap.bytes),
               FirmwareLibraryValidation.text(ap.chip, limit: 128),
               ap.diagnostic.map({ FirmwareLibraryValidation.text($0, limit: 1_024) }) ?? true,
               (ap.build?.count ?? 0) <= 128,
               ap.build?.allSatisfy({ FirmwareLibraryValidation.identifier($0.key) && FirmwareLibraryValidation.text($0.value, limit: 2_048) }) ?? true else {
-            throw SimulatorError.invalidSession("固件静态诊断内容无效；未赋予运行能力")
+                throw SimulatorError.invalidSession("固件静态诊断内容无效；未赋予运行能力")
+            }
         }
-        if ap.headerRecognized {
+        if let ap, ap.headerRecognized, ap.chip == "xring" {
+            guard let base = ap.imageBase, base == 0x605c0000,
+                  let entry = ap.resetEntry, let stack = ap.resetSP,
+                  entry & 1 == 1, (base..<(base + ap.bytes)).contains(entry & ~1),
+                  (0x60000000...0x62000000).contains(stack), stack % 8 == 0 else {
+                throw SimulatorError.invalidSession("XRing 启动向量诊断边界无效")
+            }
+        } else if let ap, ap.headerRecognized {
             let ramEnd = ap.chip == "best1502p" ? 0x201a0000 : 0x20160000
             guard ["best1503", "best1502p"].contains(ap.chip), let offset = ap.apOffset, let flash = ap.flashBytes,
                   let alias = ap.dataAlias, let entry = ap.resetEntry, let stack = ap.resetSP,
@@ -200,13 +232,13 @@ nonisolated struct FirmwareDiagnostic: Decodable, Sendable {
             }
         }
         if value.inputKind == .fullOTA {
-            guard let archive = value.archive, (1...4096).contains(archive.members),
+            guard let ap, let archive = value.archive, (1...4096).contains(archive.members),
                   (ap.bytes...1_073_741_824).contains(archive.expandedBytes),
                   ["romfs", "multi-partition"].contains(archive.resourceLayout) else {
                 throw SimulatorError.invalidSession("固件包静态诊断不完整")
             }
-        } else {
-            guard value.archive == nil, value.bytes == ap.bytes, value.sha256 == ap.sha256 else {
+        } else if value.inputKind == .apCandidate {
+            guard let ap, value.archive == nil, value.bytes == ap.bytes, value.sha256 == ap.sha256 else {
                 throw SimulatorError.invalidSession("AP 静态诊断与输入身份不一致")
             }
         }
@@ -242,7 +274,7 @@ nonisolated struct BundledPreparedSession: Sendable {
             ("version", value.version == 1), ("id", UUID(uuidString: value.id) != nil),
             ("directory", sameDirectory), ("profileID", value.profileID == profileID),
             ("identifier", FirmwareLibraryValidation.identifier(profileID)),
-            ("geometry", [(192, 490), (212, 520), (336, 480), (432, 514)].contains(where: { $0 == (value.width, value.height) })),
+            ("geometry", [(192, 490), (212, 520), (336, 480), (432, 514), (466, 466)].contains(where: { $0 == (value.width, value.height) })),
             ("digest", FirmwareLibraryValidation.digest(value.identityDigest)),
             ("runLimit", StandaloneRunLimits.isValid(value.maxRuntimeSeconds)),
             ("summary", FirmwareLibraryValidation.text(value.summary, limit: 48_000)),
