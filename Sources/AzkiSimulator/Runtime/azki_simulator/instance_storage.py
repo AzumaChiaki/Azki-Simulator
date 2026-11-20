@@ -383,8 +383,12 @@ try:
     _clonefile = _libc.clonefile
     _clonefile.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int)
     _clonefile.restype = ctypes.c_int
+    _fclonefileat = _libc.fclonefileat
+    _fclonefileat.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32)
+    _fclonefileat.restype = ctypes.c_int
 except (AttributeError, OSError):
     _clonefile = None
+    _fclonefileat = None
 
 # Support is a property of the volume, not of each file. Probe the destination
 # volume once with a 4 KiB file so a non-APFS library never pays for a useless
@@ -430,7 +434,7 @@ def clonefile_supported(library_root):
     return ok
 
 
-def _clone_file(source, target):
+def _clone_file(source, target, *, readonly_source=False):
     """Create target as an APFS clone of source; False when unsupported.
 
     The source and both parent directories are validated with lstat before the
@@ -439,11 +443,23 @@ def _clone_file(source, target):
     if _clonefile is None:
         return False
     source, target = Path(source), Path(target)
-    _private(source)
     _private(target.parent, directory=True)
     if os.path.lexists(target):
         raise FileExistsError(errno.EEXIST, "clone target exists", str(target))
-    if _clonefile(os.fsencode(source), os.fsencode(target), 0) != 0:
+    if readonly_source:
+        source_fd, _ = _open_file(source)
+        try:
+            directory = _directory_fd(target.parent, private=True)
+            try:
+                status = _fclonefileat(source_fd, directory, os.fsencode(target.name), 0x0002)  # CLONE_NOOWNERCOPY
+            finally:
+                os.close(directory)
+        finally:
+            os.close(source_fd)
+    else:
+        _private(source)
+        status = _clonefile(os.fsencode(source), os.fsencode(target), 0)
+    if status != 0:
         # ENOTSUP/EXDEV/EINVAL/EPERM: the caller has a byte-copy fallback.
         return False
     try:
@@ -782,7 +798,7 @@ class InstanceStorage:
 
     def begin(self, firmware: Firmware, *, synthetic_seed: Path | None = None,
               synthetic_seed_sha256: str | None = None, virtual_state=None, rebuild_identity=False,
-              _previous_head=_UNREAD_HEAD):
+              _previous_head=_UNREAD_HEAD, session_root=None):
         self._ensure(); firmware.validate()
         if firmware.model != self.info["model"]:
             raise ValueError("此实例的数据属于 " + self.info["model"] + "，不能用 " + firmware.model
@@ -795,7 +811,7 @@ class InstanceStorage:
             if synthetic_seed is not None or virtual_state is not None or rebuild_identity:
                 raise ValueError("XRing eMMC does not accept NAND/virtual identity seeds")
             from .xring_storage import begin
-            return begin(self, firmware, old)
+            return begin(self, firmware, old, session_root=session_root)
         if old and old[2].data_format == "xring-emmc":
             raise ValueError("XRing eMMC cannot be reinterpreted as NAND")
         if rebuild_identity and (old is None or virtual_state is None):
@@ -809,6 +825,13 @@ class InstanceStorage:
         notes = []
         nor_prefix = firmware.nor_prefix_from(old[2]) if carry else 0
         if carry and old[2].data_bytes != firmware.data_bytes:
+            if session_root is not None and firmware.data_bytes < old[2].data_bytes:
+                for name, size, _, _ in firmware.images[:2]:
+                    with (old[0] / name).open("rb") as source:
+                        source.seek(size)
+                        while chunk := source.read(1024 * 1024):
+                            if chunk != b"\xff" * len(chunk):
+                                raise ValueError("所选固件的数据分区过小，无法完整挂载此实例的数据盘")
             notes.append("此固件的数据分区大小与上次不同，已沿用原数据并按新大小" +
                          ("补齐空白区" if firmware.data_bytes > old[2].data_bytes else "截断末尾") +
                          "；上次的快照保留到本次正常停止为止")
@@ -817,20 +840,21 @@ class InstanceStorage:
         # NOR saved by an earlier firmware travels along unused ("dormant")
         # through firmware without NOR, so switching back restores it.
         dormant = None
-        if carry and old[2].nor_bytes:
-            dormant = {"file": old[0] / "nor-config.bin", "layout": list(old[2].nor_layout), "bytes": old[2].nor_bytes}
-        elif carry and isinstance(old[1].get("dormantNor"), dict):
+        if carry and isinstance(old[1].get("dormantNor"), dict):
             record = old[1]["dormantNor"]
             if (old[0] / "nor-config.dormant.bin").exists() and type(record.get("bytes")) is int:
                 dormant = {"file": old[0] / "nor-config.dormant.bin", "layout": record.get("layout"),
                            "bytes": record["bytes"]}
         if not nor_carry and dormant and firmware.nor_bytes and dormant["layout"] == list(firmware.nor_layout):
             nor_carry, nor_source = True, dormant["file"]
+            dormant = None
             notes.append("已恢复此实例早先保存的 NOR 配置")
         else:
             nor_source = old[0] / "nor-config.bin" if nor_carry else None
+        if carry and old[2].nor_bytes and nor_source != old[0] / "nor-config.bin":
+            dormant = {"file": old[0] / "nor-config.bin", "layout": list(old[2].nor_layout), "bytes": old[2].nor_bytes}
         if carry and dormant and firmware.nor_bytes and not nor_carry:
-            notes.append("此固件的 NOR 配置区布局与上次不同，NOR 配置区已重新初始化（原配置仍保存在旧快照中）；NAND 用户数据已沿用")
+            notes.append("此固件的 NOR 配置区布局与上次不同，本次重新初始化，原配置与 NAND 用户数据随实例保留")
         if carry and dormant and not firmware.nor_bytes:
             notes.append("此固件不使用 NOR 配置区，上次的 NOR 配置原样保留，换回原固件时继续使用；NAND 用户数据已沿用")
         revisions = self.root / "revisions"
@@ -853,12 +877,18 @@ class InstanceStorage:
         folder.mkdir(mode=0o700)
         marker = {"revision": tx, "previous": old[0].name if old else None,
                   "firmware": firmware.record, "phase": "preparing"}
+        working = folder
+        if session_root is not None:
+            working = session_root / "instance-data"
+            marker.update(sessionRoot=str(session_root), sessionWorkDisk=True)
         _atomic_json(self.root / "pending.json", marker)
         self.active = folder
         try:
+            if session_root is not None:
+                working.mkdir(mode=0o700)
             # <library>/instances/<uuid>/storage -> <library>
             library_root = self.root.parents[2]
-            data, spare = folder / "nand-data.bin", folder / "nand-spare.bin"
+            data, spare = working / "nand-data.bin", working / "nand-spare.bin"
             if carry:
                 _copy(old[0] / data.name, data); _copy(old[0] / spare.name, spare)
                 _resize(data, firmware.data_bytes)
@@ -870,21 +900,20 @@ class InstanceStorage:
                 else:
                     # Only the host's independently verified synthetic UI seed
                     # may be passed here. Never accept factory/identity dumps.
-                    _private(synthetic_seed, size=firmware.data_bytes)
-                    with synthetic_seed.open("rb") as stream:
-                        sha = hashlib.file_digest(stream, "sha256").hexdigest()
-                    if sha != synthetic_seed_sha256:
+                    from .firmware_catalog import _copy as copy_readonly_asset
+                    seed = copy_readonly_asset(synthetic_seed, data)
+                    if seed != {"bytes": firmware.data_bytes, "sha256": synthetic_seed_sha256}:
                         raise ValueError("Synthetic seed hash mismatch")
-                    _copy(synthetic_seed, data); origin = "host-verified-synthetic-ui-seed"
+                    origin = "host-verified-synthetic-ui-seed"
                 _blank_shared(library_root, spare, firmware.data_bytes // 2048 * 64)
             if firmware.nor_bytes:
                 if nor_carry:
-                    _copy(nor_source, folder / "nor-config.bin",
+                    _copy(nor_source, working / "nor-config.bin",
                           erased_prefix=nor_prefix, preserved_prefix=firmware.nor_config_bytes)
                 else:
-                    _blank_shared(library_root, folder / "nor-config.bin", firmware.nor_bytes)
+                    _blank_shared(library_root, working / "nor-config.bin", firmware.nor_bytes)
             dormant_kept = False
-            if dormant and not firmware.nor_bytes:
+            if dormant:
                 _copy(dormant["file"], folder / "nor-config.dormant.bin")
                 dormant_kept = True
             if carry and VIRTUAL_SHA in old[1]:
@@ -920,8 +949,8 @@ class InstanceStorage:
                     "compatibility": "data carried over; firmware decides at boot"}
         except BaseException:
             # Preparation only: no process has received the image paths yet.
-            shutil.rmtree(folder); (self.root / "pending.json").unlink()
-            self.active = None; raise
+            self.finish(success=False)
+            raise
 
     def _make_room(self, *, protect=()):
         """Keep the snapshot count under the limit instead of refusing to start.
@@ -976,7 +1005,10 @@ class InstanceStorage:
         pending = _json(self.root / "pending.json")
         firmware = Firmware(**pending["firmware"]); firmware.validate()
         folder = self.active
-        fds = self._idle_files(folder, firmware)  # Refuse while core owns either disk.
+        # Session callers hold the working disk locks through publication. A
+        # failed or partial preparation may have no images in this revision.
+        fds = [] if not success and (pending.get("sessionWorkDisk") or pending.get("phase") == "preparing") \
+            else self._idle_files(folder, firmware)
         try:
             if success:
                 for fd in fds: os.fsync(fd)
@@ -1010,6 +1042,30 @@ class InstanceStorage:
             self.active = None
         finally:
             for fd in fds: os.close(fd)
+
+    def retire_previous(self, head):
+        """After a session commit, retire the superseded HEAD chain under the store lock."""
+        from .maintenance import REVISION, _committed, _read_json, remove_tree
+        if head is None or head[1].get("sessionWorkDisk") is not True:
+            return
+        revisions = self.root / "revisions"
+        name = head[1].get("previous")
+        visited = {head[0].name}
+        obsolete = []
+        while isinstance(name, str) and REVISION.fullmatch(name) and name not in visited:
+            folder = revisions / name
+            manifest = _read_json(folder / "revision.json")
+            if manifest is None or not _committed(folder):
+                break
+            obsolete.append(name)
+            visited.add(name)
+            name = manifest.get("previous")
+        # Remove oldest first so an interrupted cleanup can still walk HEAD.
+        for name in reversed(obsolete):
+            try:
+                remove_tree(revisions, name)
+            except OSError:
+                break
 
     def recover(self):
         """Discard interrupted unpublished work once no guest holds its disk."""
@@ -1056,7 +1112,7 @@ class InstanceStorage:
             (self.root / "pending.json").unlink(); _sync_dir(self.root)
             self.active = None
             return "already-published"
-        if pending.get("phase") == "preparing":
+        if pending.get("phase") == "preparing" or pending.get("sessionWorkDisk") is True:
             # Paths were never returned to a core; preparation may be partial.
             shutil.rmtree(folder); (self.root / "pending.json").unlink(); _sync_dir(self.root)
             self.active = None
@@ -1318,7 +1374,7 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
     from .maintenance import reset_instance
     reset_instance(library_root, instance_id)
     store = _open_or_create(root, firmware.model)
-    clones = session_root / "instance-data"
+    working = session_root / "instance-data"
     try:
         if store.info["model"] != firmware.model:
             raise ValueError("此实例的数据属于 " + store.info["model"] + "，不能用 " + firmware.model
@@ -1374,26 +1430,18 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
                 virtual_state["identityVersion"] = previous_identity["identityVersion"] + 1
             _virtual_value(virtual_state, instance_id=instance_id)
         seed = plan["identity"]["prepared"].get("seed") if not old or rebuild_identity else None
-        private_seed = None
-        if seed:
-            private_seed = session_root / "instance-initial-seed.bin"
-            # Copy a hash-pinned synthetic seed, never factory/credential data.
-            if _pin(seed["path"])["sha256"] != seed["sha256"]:
-                raise ValueError("Synthetic seed identity changed")
-            _copy(Path(seed["path"]), private_seed)
-        transaction = store.begin(firmware, synthetic_seed=private_seed,
+        transaction = store.begin(firmware, synthetic_seed=Path(seed["path"]) if seed else None,
                                   synthetic_seed_sha256=seed["sha256"] if seed else None,
-                                  virtual_state=virtual_state, rebuild_identity=rebuild_identity, _previous_head=old)
-        clones.mkdir(mode=0o700)
-        for name, _, _, _ in firmware.images:
-            _copy(store.active / name, clones / name)
+                                  virtual_state=virtual_state, rebuild_identity=rebuild_identity,
+                                  _previous_head=old, session_root=session_root)
         carry_notes = list(transaction.get("notes", [])) + ([identity_note] if identity_note else [])
         binding = {**base, "available": True, "reason": "仅持久化 NAND 用户区和 OOB；NOR 尚未持久化",
-                   "sessionRoot": str(session_root), "model": firmware.model, "profileID": firmware.profile,
+                   "sessionRoot": str(session_root), "libraryRoot": str(_path(library_root)),
+                   "model": firmware.model, "profileID": firmware.profile,
                    "transactionID": store.active.name, "previousRevision": transaction["previous_revision"],
-                   "dataImage": str(clones / "nand-data.bin"), "spareImage": str(clones / "nand-spare.bin"),
-                   "dataSHA256": _initial_pin(clones / "nand-data.bin"),
-                   "spareSHA256": _initial_pin(clones / "nand-spare.bin"),
+                   "dataImage": transaction["data_image"], "spareImage": transaction["data_spare_image"],
+                   "dataSHA256": _initial_pin(working / "nand-data.bin"),
+                   "spareSHA256": _initial_pin(working / "nand-spare.bin"),
                    "dataOffset": firmware.data_offset, "dataBytes": firmware.data_bytes,
                    "dataFormat": firmware.data_format, "qemuSHA256": capability["qemuSHA256"]}
         # This changes only newly authored revision files. The accepted HEAD
@@ -1401,7 +1449,7 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
         if firmware.nor_bytes:
             binding.update(kind="nand-oob-and-nor", norPersistent=True,
                 reason="NAND、OOB 与此精确固件声明的 NOR 可写区共同提交；文件系统干净卸载尚未验证",
-                norImage=str(clones / "nor-config.bin"), norSHA256=_initial_pin(clones / "nor-config.bin"),
+                norImage=str(working / "nor-config.bin"), norSHA256=_initial_pin(working / "nor-config.bin"),
                 norOffset=firmware.nor_offset, norBytes=firmware.nor_bytes, norInitialize=transaction["nor_initialize"],
                 )
             if firmware.nor_ap_sha256:
@@ -1417,12 +1465,12 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
             from .instance_settings import materialize
             # The instance hardware preset binds the board options; a preset
             # without that device keeps the emulated default.
-            settings_path, settings_sha = materialize(library_root, instance_id, clones, model=firmware.model)
+            settings_path, settings_sha = materialize(library_root, instance_id, working, model=firmware.model)
             binding.update(settingsPath=settings_path, settingsSHA256=settings_sha)
         if (store.active / VIRTUAL_STATE).exists():
             _, _, digest = _virtual_read(store.active / VIRTUAL_STATE, instance_id=instance_id)
-            _copy(store.active / VIRTUAL_STATE, clones / VIRTUAL_STATE)
-            binding.update(virtualPeerStateSchema=1, virtualPeerStatePath=str(clones / VIRTUAL_STATE),
+            _copy(store.active / VIRTUAL_STATE, working / VIRTUAL_STATE)
+            binding.update(virtualPeerStateSchema=1, virtualPeerStatePath=str(working / VIRTUAL_STATE),
                            virtualPeerStateSHA256=digest, virtualPeerEnabled=virtual_enabled)
             if virtual_enabled:
                 binding["virtualPeerReason"] = "本实例的合成通信身份与 NAND、OOB、NOR 在同一快照提交"
@@ -1432,8 +1480,6 @@ def prepare_session_storage(library_root, session_root, instance_id, plan, *,
         if carry_notes:
             binding["reason"] = binding["reason"] + "。" + "；".join(carry_notes)
             binding["carryOver"] = carry_notes
-        pending = _json(store.root / "pending.json")
-        _atomic_json(store.root / "pending.json", {**pending, "sessionRoot": str(session_root)})
         _atomic_json(session_root / "instance-storage.json", binding)
         return binding
     except BaseException:
@@ -1680,7 +1726,8 @@ def finish_session_storage(library_root, session_root, instance_id):
     """
     session = _path(session_root)
     binding = _json(session / "instance-storage.json")
-    if binding.get("instanceID") != _uuid(instance_id):
+    if (binding.get("instanceID") != _uuid(instance_id)
+            or binding.get("libraryRoot", str(_path(library_root))) != str(_path(library_root))):
         raise ValueError("提交的实例与这次运行准备的实例不一致，未改动任何数据")
     result_path = session / "instance-storage-result.json"
     if result_path.exists():
@@ -1792,6 +1839,8 @@ def finish_session_storage(library_root, session_root, instance_id):
                     if target.exists(): target.unlink()
         store.finish(success=healthy)
         _atomic_json(result_path, receipt)
+        if healthy:
+            store.retire_previous(store.head())
         if healthy and binding.get("settingsPath"):
             # Informational: the firmware's own settings as committed now.
             try:

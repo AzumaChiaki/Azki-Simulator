@@ -3,7 +3,6 @@ from pathlib import Path
 import errno
 import os
 import re
-import shutil
 import uuid
 
 EMMC_BYTES = 4 * 1024**3
@@ -59,7 +58,7 @@ def copy_image(source, target):
         os.close(fd)
 
 
-def begin(store, firmware, previous):
+def begin(store, firmware, previous, *, session_root=None):
     """Use the existing revision/HEAD protocol with a single whole-media file."""
     from . import instance_storage as storage
     if previous and previous[2].data_format != KIND:
@@ -70,10 +69,16 @@ def begin(store, firmware, previous):
     folder.mkdir(mode=0o700)
     marker = {'revision': tx, 'previous': previous[0].name if previous else None,
               'firmware': firmware.record, 'phase': 'preparing'}
+    work = folder
+    if session_root is not None:
+        work = session_root / 'instance-data'
+        marker.update(sessionRoot=str(session_root), sessionWorkDisk=True)
     storage._atomic_json(store.root / 'pending.json', marker)
     store.active = folder
     try:
-        image = folder / 'emmc.img'
+        if session_root is not None:
+            work.mkdir(mode=0o700)
+        image = work / 'emmc.img'
         if previous:
             copy_image(previous[0] / 'emmc.img', image)
         else:
@@ -88,8 +93,7 @@ def begin(store, firmware, previous):
         storage._atomic_json(store.root / 'pending.json', {**marker, 'phase': 'guest'})
         return {'previous_revision': marker['previous'], 'emmc_initialize': previous is None}
     except BaseException:
-        shutil.rmtree(folder); (store.root / 'pending.json').unlink()
-        store.active = None
+        store.finish(success=False)
         raise
 
 
@@ -103,20 +107,17 @@ def prepare(library_root, session_root, instance_id, plan):
     reset_instance(library_root, instance_id)
     store = storage._open_or_create(storage._instance_root(library_root, instance_id), MODEL)
     try:
-        tx = store.begin(firmware)
+        tx = store.begin(firmware, session_root=session)
         work = session / 'instance-data'
-        work.mkdir(mode=0o700)
-        copy_image(store.active / 'emmc.img', work / 'emmc.img')
         binding = {'available': True, 'kind': KIND, 'instanceID': instance_id,
-            'sessionRoot': str(session), 'model': MODEL, 'profileID': firmware.profile,
+            'sessionRoot': str(session), 'libraryRoot': str(storage._path(library_root)),
+            'model': MODEL, 'profileID': firmware.profile,
             'qemuSHA256': plan['identity']['qemu']['sha256'],
             'transactionID': store.active.name, 'previousRevision': tx['previous_revision'],
             'emmcImage': str(work / 'emmc.img'), 'emmcBytes': EMMC_BYTES,
             'emmcInitialize': tx['emmc_initialize'], 'norPersistent': False,
             'virtualPeerEnabled': False, 'virtualPeerReason': 'XRing 不使用虚拟对端绑定状态',
             'consistency': 'crash-consistent', 'reason': '独立 eMMC 会话快照；正常关闭后保存'}
-        pending = storage._json(store.root / 'pending.json')
-        storage._atomic_json(store.root / 'pending.json', {**pending, 'sessionRoot': str(session)})
         storage._atomic_json(session / 'instance-storage.json', binding)
         return binding
     except BaseException:

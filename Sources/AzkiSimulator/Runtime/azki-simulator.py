@@ -15,7 +15,7 @@ from azki_simulator.bridge import SessionBridge, create_session, request, privat
 
 BUNDLED_ACTIONS = ("library-catalog", "library-import", "library-delete", "library-delete-all", "library-probe", "prepare-bundled", "instance-storage-finish",
                    "instance-identity", "instance-settings", "instance-parameters", "instance-delete", "instance-reset", "sessions-cleanup",
-                   "storage-report", "storage-maintain")
+                   "session-release", "storage-report", "storage-maintain")
 ACTION_FAILURES = {
     "library-catalog": "读取固件库失败，请稍后重试",
     "library-import": "导入固件失败，请确认所选文件是完整的 OTA 固件包后重试",
@@ -30,6 +30,7 @@ ACTION_FAILURES = {
     "instance-delete": "删除实例数据失败",
     "instance-reset": "整理实例数据失败；已保存的数据未被删除",
     "sessions-cleanup": "清理临时会话失败",
+    "session-release": "释放本次会话失败",
     "storage-report": "读取存储占用失败",
     "storage-maintain": "整理存储失败；已保存的数据未被删除",
 }
@@ -68,6 +69,8 @@ def main():
         if action == "sessions-cleanup":
             # Tests point this at a scratch folder; the app always uses /private/tmp.
             library.add_argument("--tmp-root", type=Path, default=Path("/private/tmp"), help=argparse.SUPPRESS)
+        if action == "session-release":
+            library.add_argument("--session-root", type=Path, required=True)
         if action == "instance-settings":
             library.add_argument("--instance-id", required=True)
             library.add_argument("--set", help="Replace the instance settings with this JSON document")
@@ -211,7 +214,19 @@ def main():
             bridge = SessionBridge(args.session, hashes if all(hashes.values()) else None, args.max_runtime, args.allow_private_memfd)
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda *_: bridge.shutdown.set())
-        bridge.serve(discovery=not args.no_discovery)
+        from azki_simulator.maintenance import SDK_RUN, SDK_STATE, TMP_ROOT, release_session, session_lease
+        with session_lease(bridge.root):
+            bridge.serve(discovery=not args.no_discovery)
+        container = bridge.root.parent
+        state = container.parent
+        if (not args.native_broker and bridge.root.name == "session" and state.parent == TMP_ROOT
+                and SDK_STATE.fullmatch(state.name) and SDK_RUN.fullmatch(container.name)):
+            # The SDK stops its guest and consumes its storage receipt before
+            # terminating this helper. A direct SIGTERM can settle it here too.
+            try:
+                release_session(state / "library", container)
+            except (OSError, ValueError) as error:
+                print(f"Azki session cleanup: {error}", file=sys.stderr)
         return 0
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("ok", True) else 1
@@ -248,6 +263,9 @@ def bundled_action(args):
     if args.action == "sessions-cleanup":
         from azki_simulator.maintenance import cleanup_sessions
         return cleanup_sessions(args.library_root, args.tmp_root)
+    if args.action == "session-release":
+        from azki_simulator.maintenance import release_session
+        return release_session(args.library_root, args.session_root)
     if args.action == "instance-identity":
         from azki_simulator.instance_storage import public_instance_identity
         return public_instance_identity(args.library_root, args.instance_id)

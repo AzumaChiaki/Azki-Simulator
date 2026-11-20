@@ -105,7 +105,6 @@ final class SimulatorInstanceLibrary {
             let catalog = catalog
             StandaloneRuntimeModel.launchCleanup = Task { @MainActor in
                 await catalog.cleanupStaleSessions()
-                await catalog.autoStorageMaintenance()
             }
         }
         let targets = instances

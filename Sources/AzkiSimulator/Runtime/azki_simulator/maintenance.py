@@ -12,7 +12,9 @@ root it was given, and stops at the first entry owned by another user.
 from __future__ import annotations
 
 import ctypes
+from contextlib import ExitStack, contextmanager
 import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -22,10 +24,12 @@ import stat
 import sys
 import time
 
-from .minative import _decode, _path
+from .minative import _decode, _directory_fd, _path
 
 TMP_ROOT = Path("/private/tmp")
 SESSION_PREFIXES = ("azki-b-", "azki-sim-", "azki-cmd-")
+SDK_STATE = re.compile(r"rksim(?:-[A-Za-z0-9_-]{1,32})?\Z")
+SDK_RUN = re.compile(r"[A-Za-z0-9]{1,6}\Z")
 # A root with no process/socket evidence is treated as live while this young:
 # it may be a session being prepared right now.
 GRACE_SECONDS = 10 * 60
@@ -92,6 +96,28 @@ def _remove_if_present(parent, name, removed, label):
 
 
 # --------------------------------------------------------------- liveness
+
+@contextmanager
+def session_lease(path, *, exclusive=False):
+    fd = _directory_fd(path)
+    try:
+        opened = os.fstat(fd)
+        if opened.st_uid != os.getuid() or opened.st_mode & 0o022:
+            raise OSError(errno.EPERM, "会话目录归属或写权限无效", str(path))
+        fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        current = os.lstat(path)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise OSError(errno.EAGAIN, "会话目录已替换", str(path))
+        yield
+    finally:
+        os.close(fd)
+
+
+def _run_lease(path, stack):
+    stack.enter_context(session_lease(path, exclusive=True))
+    session = path / "session"
+    if os.path.lexists(session):
+        stack.enter_context(session_lease(session, exclusive=True))
 
 class _BSDInfo(ctypes.Structure):
     _fields_ = [("flags", ctypes.c_uint32), ("status", ctypes.c_uint32), ("xstatus", ctypes.c_uint32),
@@ -183,7 +209,7 @@ def _small_json(directory_fd, name):
 
 
 def session_state(root):
-    """Return ("running" | "stopped" | "unknown", newest mtime) for a session root.
+    """Return (state, newest mtime) for a session root.
 
     "stopped" requires recorded processes that are gone and sockets nobody
     listens on; a root with no such evidence is "unknown".
@@ -246,7 +272,9 @@ def session_state(root):
         os.close(fd)
     if alive:
         return "running", newest
-    if unsure or not evidence:
+    if unsure:
+        return "unconfirmed", newest
+    if not evidence:
         return "unknown", newest
     return "stopped", newest
 
@@ -418,7 +446,7 @@ def _repair_head(store, storage):
     return best[1]
 
 
-def reset_instance(library_root, instance_id, *, finish_sessions=True):
+def reset_instance(library_root, instance_id, *, finish_sessions=True, locked_session=None):
     """Settle one instance so it can start; never touches committed data."""
     identifier, instance = _instance_dir(library_root, instance_id)
     result = {"ok": True, "version": 1, "instanceID": identifier, "recovered": False, "removed": []}
@@ -433,8 +461,10 @@ def reset_instance(library_root, instance_id, *, finish_sessions=True):
     if (storage / "pending.json").exists() or os.path.islink(storage / "pending.json"):
         session = pending.get("sessionRoot") if pending else None
         if isinstance(session, str) and session.startswith("/") and finish_sessions:
-            state, _ = session_state(os.path.dirname(session))
-            if state == "running":
+            container = Path(session).parent
+            state, newest = session_state(container)
+            if state in ("running", "unconfirmed") or (state == "unknown" and container != locked_session
+                    and time.time() - newest < GRACE_SECONDS):
                 result.update(active=True, message="此实例仍在运行，未改动它的数据")
                 return result
             try:
@@ -446,6 +476,9 @@ def reset_instance(library_root, instance_id, *, finish_sessions=True):
         if (storage / "pending.json").exists() or os.path.islink(storage / "pending.json"):
             store = _open_store(storage)
             try:
+                if _read_json(storage / "pending.json") != pending:
+                    result.update(active=True)
+                    return result
                 _settle_pending(storage, removed)
                 result.update(recovered=True, committed=False)
             finally:
@@ -460,6 +493,11 @@ def reset_instance(library_root, instance_id, *, finish_sessions=True):
             repaired = _repair_head(store, storage)
             if repaired:
                 result.update(recovered=True, headRepaired=repaired)
+            if not os.path.lexists(storage / "pending.json"):
+                try:
+                    store.retire_previous(store.head())
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass
     finally:
         if store is not None:
             store.close()
@@ -513,19 +551,24 @@ def _settle_session(root, library_root):
     receipt here, so the next cleanup removes the folder).
     """
     session = Path(root) / "session"
-    binding = _read_json(session / "instance-storage.json")
-    if binding is None or (session / "instance-storage-result.json").exists():
+    binding_path = session / "instance-storage.json"
+    binding = _read_json(binding_path)
+    if binding is None:
+        return "unreadable-storage-binding" if os.path.lexists(binding_path) else None
+    receipt = _read_json(session / "instance-storage-result.json")
+    if (receipt and receipt.get("ok") is True and receipt.get("instanceID") == binding.get("instanceID")
+            and receipt.get("transactionID") == binding.get("transactionID")):
         return None
     instance_id = binding.get("instanceID")
     if not isinstance(instance_id, str):
         return None
-    if library_root is None:
+    if library_root is None or binding.get("libraryRoot", str(library_root)) != str(library_root):
         return "awaiting-instance-reset"
     try:
         _, instance = _instance_dir(library_root, instance_id)
         pending_path = instance / "storage" / "pending.json"
         if not os.path.lexists(pending_path):
-            return None
+            return None if _read_json(instance / "storage/instance.json") else "unknown-instance-library"
         pending = _read_json(pending_path)
     except (MaintenanceError, OSError):
         return "awaiting-instance-reset"
@@ -534,7 +577,7 @@ def _settle_session(root, library_root):
     if pending.get("sessionRoot") != str(session):
         return None
     try:
-        reset_instance(library_root, instance_id)
+        reset_instance(library_root, instance_id, locked_session=Path(root))
     except Exception:
         return "awaiting-instance-reset"
     return None if (session / "instance-storage-result.json").exists() or not os.path.lexists(pending_path) \
@@ -542,15 +585,73 @@ def _settle_session(root, library_root):
 
 
 # Files a finished helper command may leave in its azki-cmd- folder.
-CMD_LEFTOVERS = {"native-p256.bin"}
+CMD_LEFTOVERS = re.compile(r"(?:native-p256\.bin|outer-[0-9a-f-]{36}\.sb)\Z")
 
 
 def _cmd_leftovers_only(path):
     try:
         with os.scandir(path) as entries:
-            return all(entry.name in CMD_LEFTOVERS and entry.is_file(follow_symlinks=False) for entry in entries)
+            return all(CMD_LEFTOVERS.fullmatch(entry.name) and entry.is_file(follow_symlinks=False) for entry in entries)
     except OSError:
         return False
+
+
+def _session_candidates(tmp_root, library_root):
+    try:
+        entries = sorted(os.listdir(tmp_root))
+    except OSError as error:
+        raise MaintenanceError("tmp_unavailable", "无法读取临时目录 " + str(tmp_root) + "：" + error.strerror) from error
+    for name in entries:
+        path = tmp_root / name
+        if name.startswith(SESSION_PREFIXES):
+            yield path, library_root
+        elif SDK_STATE.fullmatch(name):
+            try:
+                fd = _directory_fd(path, private=True)
+                try:
+                    # Current and older SDKs keep the instance registry and
+                    # persistent library beside the six-character run roots.
+                    if _small_json(fd, "instances.json")[0] is None:
+                        continue
+                    names = sorted(os.listdir(fd))
+                finally:
+                    os.close(fd)
+                os.close(_directory_fd(path / "library", private=True))
+            except (OSError, ValueError):
+                continue
+            for run in names:
+                if SDK_RUN.fullmatch(run) and run != "keys":
+                    candidate = path / run
+                    if ((candidate / "prepared").is_dir() or
+                            _read_json(candidate / "session/session.json") is not None):
+                        yield candidate, path / "library"
+
+
+def _release_if_idle(path, library_root, *, now, discard_unstarted=False):
+    """Check ownership and liveness while holding exclusion against startup."""
+    try:
+        with ExitStack() as stack:
+            _run_lease(path, stack)
+            state, newest = session_state(path)
+            if state in ("running", "unconfirmed"):
+                return state
+            if state == "unknown" and not discard_unstarted and now - newest < GRACE_SECONDS:
+                receipt = _read_json(path / "session/instance-storage-result.json")
+                if not receipt or receipt.get("ok") is not True:
+                    return "recent"
+            if path.name.startswith("azki-cmd-") and not _cmd_leftovers_only(path):
+                return "unknown-helper-files"
+            waiting = _settle_session(path, library_root)
+            if waiting:
+                return waiting
+            remove_tree(path.parent, path.name)
+    except FileNotFoundError:
+        pass
+    except BlockingIOError:
+        return "running"
+    except (OSError, ValueError) as error:
+        return "remove-failed: " + str(error)[:160]
+    return None
 
 
 def cleanup_sessions(library_root=None, tmp_root=TMP_ROOT, *, now=None):
@@ -558,55 +659,39 @@ def cleanup_sessions(library_root=None, tmp_root=TMP_ROOT, *, now=None):
     now = time.time() if now is None else now
     result = {"ok": True, "version": 1, "removed": [], "kept": [], "reasons": {}}
     protected = _protected_paths()
-    try:
-        entries = sorted(os.listdir(tmp_root))
-    except OSError as error:
-        raise MaintenanceError("tmp_unavailable", "无法读取临时目录 " + str(tmp_root) + "：" + error.strerror) from error
-    for name in entries:
-        if not name.startswith(SESSION_PREFIXES) or "/" in name:
-            continue
-        path = str(tmp_root / name)
+    for path, owner_library in _session_candidates(tmp_root, library_root):
         try:
-            info = os.lstat(path)
-        except FileNotFoundError:
+            info = path.lstat()
+        except OSError:
             continue
-        # Links and other users' entries are never ours to judge or remove.
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             continue
-        def keep(reason):
-            result["kept"].append(path)
-            result["reasons"][path] = reason
-        real = os.path.realpath(path)
+        real = str(path)
         if any(item == real or item.startswith(real + "/") for item in protected):
-            keep("in-use-by-this-command")
-            continue
-        state, newest = session_state(path)
-        if state == "running":
-            keep("running")
-            continue
-        if state == "unknown" and now - newest < GRACE_SECONDS:
-            keep("recent")
-            continue
-        if name.startswith("azki-cmd-") and not _cmd_leftovers_only(path):
-            # Unknown interpreter-created files: possibly an in-use helper.
-            keep("unknown-helper-files")
-            continue
-        try:
-            waiting = _settle_session(path, library_root)
-        except Exception as error:  # Never lose an uncommitted run silently.
-            waiting = "instance-settle-failed: " + str(error)[:160]
-        if waiting:
-            keep(waiting)
-            continue
-        try:
-            remove_tree(str(tmp_root), name)
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            keep("remove-failed: " + (error.strerror or str(error))[:160])
-            continue
-        result["removed"].append(path)
+            reason = "in-use-by-this-command"
+        else:
+            reason = _release_if_idle(path, owner_library, now=now)
+        if reason is None:
+            result["removed"].append(real)
+        else:
+            result["kept"].append(real)
+            result["reasons"][real] = reason
     return result
+
+
+def release_session(library_root, root):
+    root = _path(root)
+    if root.parent == TMP_ROOT and root.name.startswith(("azki-b-", "azki-sim-")):
+        pass
+    elif (root.parent.parent == TMP_ROOT and SDK_STATE.fullmatch(root.parent.name)
+          and SDK_RUN.fullmatch(root.name) and root.name != "keys" and library_root == root.parent / "library"):
+        pass
+    else:
+        raise MaintenanceError("unsafe_session", "会话目录不在受管理的临时运行区")
+    reason = _release_if_idle(root, library_root, now=time.time(), discard_unstarted=True)
+    if reason is not None:
+        raise MaintenanceError("session_retained", f"会话目录暂时保留（{reason}）")
+    return {"ok": True, "version": 1}
 
 
 def remove_instance_sessions(instance_id, tmp_root=TMP_ROOT):
@@ -644,8 +729,8 @@ def remove_instance_sessions(instance_id, tmp_root=TMP_ROOT):
         if not isinstance(binding, dict) or binding.get("instanceID") != identifier:
             continue
         state, newest = session_state(path)
-        if state == "running":
-            result["kept"].append(str(path)); result["reasons"][str(path)] = "running"
+        if state in ("running", "unconfirmed"):
+            result["kept"].append(str(path)); result["reasons"][str(path)] = state
             continue
         if (state == "unknown" and not (session / "instance-storage-result.json").exists()
                 and time.time() - newest < GRACE_SECONDS):
@@ -655,12 +740,14 @@ def remove_instance_sessions(instance_id, tmp_root=TMP_ROOT):
             result["kept"].append(str(path)); result["reasons"][str(path)] = "recent-unknown-session"
             continue
         try:
-            remove_tree(str(tmp_root), name)
+            with ExitStack() as stack:
+                _run_lease(path, stack)
+                remove_tree(tmp_root, name)
         except FileNotFoundError:
             pass
-        except OSError as error:
+        except (OSError, ValueError) as error:
             result["kept"].append(str(path))
-            result["reasons"][str(path)] = "remove-failed: " + (error.strerror or str(error))[:160]
+            result["reasons"][str(path)] = "remove-failed: " + str(error)[:160]
             continue
         result["removed"].append(str(path))
     return result

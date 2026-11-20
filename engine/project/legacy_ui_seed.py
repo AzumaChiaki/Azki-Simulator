@@ -47,7 +47,7 @@ def data_partition(ap_data):
     return result
 
 
-def prepare_ui_seed(profile, data_bytes=None):
+def prepare_ui_seed(profile, data_bytes=None, *, working_image=None):
     """Return (image Path, image SHA-256, proof dict) for a fresh local session."""
     if not profile['model'].startswith(('miwear.watch.n66', 'miwear.watch.o66', 'miwear.watch.n67')):
         raise ValueError('This seed is only validated for legacy UnQLite/YAFFS firmware')
@@ -82,6 +82,8 @@ def prepare_ui_seed(profile, data_bytes=None):
                            ensure_ascii=True).encode('ascii')
     config_sha = hashlib.sha256(canonical).hexdigest()
     expected['cache_config_sha256'] = config_sha
+    if working_image is not None:
+        return _build_seed(working_image, expected, partition)
     directory = CACHE / profile['ota_sha256'] / 'local-ui' / config_sha
     directory.mkdir(parents=True, exist_ok=True)
     # Two native windows can request the same configuration concurrently. Hold
@@ -102,24 +104,30 @@ def _prepare_locked_seed(directory, expected, partition):
             raise ValueError('Cached local UI image hash or size mismatch')
         return image, proof['sha256'], proof
     with tempfile.TemporaryDirectory(prefix='ui-seed-', dir=directory) as temp:
+        staged_image = Path(temp) / image.name
+        _, sha, proof = _build_seed(staged_image, expected, partition)
+        staged_proof = Path(temp) / proof_path.name
+        staged_proof.write_text(json.dumps(proof, indent=2) + '\n')
+        staged_image.replace(image)
+        staged_proof.replace(proof_path)
+    return image, sha, proof
+
+
+def _build_seed(image, expected, partition):
+    with tempfile.TemporaryDirectory(prefix='ui-seed-') as temp:
         staging = Path(temp)
         tree = staging / 'tree'
         tree.mkdir()
         database = tree / 'persist.db'
         subprocess.run([str(DB_HELPER), str(database)], check=True, capture_output=True, text=True)
-        built = staging / 'nand-data.bin'
-        completed = subprocess.run([str(YAFFS_HELPER), str(built), '--bytes',
+        completed = subprocess.run([str(YAFFS_HELPER), str(image), '--bytes',
                                     str(partition['size']), '--tree', str(tree)],
                                    check=True, capture_output=True, text=True)
-        if built.stat().st_size != partition['size']:
+        if image.stat().st_size != partition['size']:
             raise ValueError('YAFFS builder produced incorrect data partition size')
-        proof = dict(expected, sha256=digest(built), database_sha256=digest(database),
+        proof = dict(expected, sha256=digest(image), database_sha256=digest(database),
                      database_bytes=database.stat().st_size,
                      cold_remount_verification=completed.stdout.strip())
-        staged_proof = staging / 'nand-data.json'
-        staged_proof.write_text(json.dumps(proof, indent=2) + '\n')
-        built.replace(image)
-        staged_proof.replace(proof_path)
     return image, proof['sha256'], proof
 
 

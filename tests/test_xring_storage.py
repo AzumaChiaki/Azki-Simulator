@@ -73,11 +73,11 @@ class XRingStorageTests(unittest.TestCase):
         with target.open('rb') as stream:
             stream.seek(xring.EMMC_BYTES-4);self.assertEqual(stream.read(),b'tail')
 
-    def session(self):
+    def session(self, instance_id=None):
         root = self.root / ('azki-b-'+uuid.uuid4().hex[:12]); root.mkdir(mode=0o700)
         project = root/'prepared/project';project.mkdir(parents=True,mode=0o700)
         session = root/'session';session.mkdir(mode=0o700)
-        instance_id=str(uuid.uuid4())
+        instance_id = instance_id or str(uuid.uuid4())
         identity={'profile':{'model':xring.MODEL,'ap':{'chip':'xring'}},'ap':{'path':'/unused/ap.bin','bytes':123,'sha256':'a'*64},
                   'qemu':{'sha256':'b'*64},'runtimeCapabilities':{}}
         plan={'identity':identity,'profileID':self.firmware().profile,'spec':{'project':str(project)}}
@@ -90,7 +90,7 @@ class XRingStorageTests(unittest.TestCase):
         storage._atomic_json(broker/'config.json',{'approvalDigest':plan['approvalDigest'],'id':'owned','run':run})
         storage._atomic_json(broker/'state.json',{'id':'owned','run':run,'state':'exited','cleanup':'reaped','exitCode':0})
         result={'returncode':0,'outcome':'window_closed','emmc_writeback':True,
-                'emmc_image':binding['emmcImage'],'emmc_bytes':xring.EMMC_BYTES,'emmc_initialized':True}
+                'emmc_image':binding['emmcImage'],'emmc_bytes':xring.EMMC_BYTES,'emmc_initialized':binding['emmcInitialize']}
         storage._atomic_json(session/run/'result.json',result)
         return session,instance_id,binding,plan,result
 
@@ -106,6 +106,24 @@ class XRingStorageTests(unittest.TestCase):
         try:
             with (store.head()[0]/'emmc.img').open('rb') as stream:stream.seek(4096);self.assertEqual(stream.read(5),b'guest')
         finally:store.close()
+
+    def test_session_prepares_one_work_disk_and_retires_previous_revision(self):
+        session, instance_id, binding, _, _ = self.session()
+        revisions = storage._instance_root(self.library, instance_id) / 'revisions'
+        image = Path(binding['emmcImage'])
+        self.assertEqual(list(revisions.glob('*/emmc.img')), [])
+        with image.open('r+b') as stream:
+            stream.seek(4096)
+            stream.write(b'guest')
+        self.assertTrue(storage.finish_session_storage(self.library, session, instance_id)['committed'])
+
+        session, _, binding, _, _ = self.session(instance_id)
+        self.assertEqual(len(list(revisions.glob('*/emmc.img'))), 1)
+        with Path(binding['emmcImage']).open('rb') as stream:
+            stream.seek(4096)
+            self.assertEqual(stream.read(5), b'guest')
+        self.assertTrue(storage.finish_session_storage(self.library, session, instance_id)['committed'])
+        self.assertEqual([p.name for p in revisions.iterdir()], [binding['transactionID']])
 
     def test_unconfirmed_writeback_rolls_back(self):
         session,instance_id,binding,plan,result=self.session()

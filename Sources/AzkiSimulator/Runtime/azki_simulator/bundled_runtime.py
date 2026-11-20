@@ -6,6 +6,7 @@ execution of the bundled interpreter, QEMU or firmware.
 """
 from __future__ import annotations
 
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -109,6 +110,7 @@ def _write_json(path, value):
 
 
 def _materialize(engine, prepared):
+    from .instance_storage import _clone_file
     for relative, record in engine["files"].items():
         if not relative.startswith(("project/", "lib/")):
             continue
@@ -118,13 +120,15 @@ def _materialize(engine, prepared):
               "invalid_engine", "内置引擎不能携带未登记的固件或开发环境")
         target = prepared / relative
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        _copy(engine["root"] / relative, target, hash_content=False)
+        source = engine["root"] / relative
+        if not _clone_file(source, target, readonly_source=True):
+            _copy(source, target, hash_content=False)
         if record["executable"]:
             target.chmod(0o700)
         # Preserve an existing quarantine attribute; never clear it to launch.
         if record["executable"]:
             from .bridge import quarantine
-            value = quarantine(engine["root"] / relative)
+            value = quarantine(source)
             if value is not None:
                 quarantine(target, value)
 
@@ -158,8 +162,12 @@ def prepare_profile(engine_root, library_root, profile_id, session_root, *, rese
             raise CatalogError("session_exists", "准备目录已存在，请使用新的独立会话目录") from error
         finally:
             os.close(parent)
+    from .maintenance import session_lease
     prepared = container / "prepared"
-    try:
+    with ExitStack() as stack:
+        if reservation is not None:
+            stack.callback(reservation.close)
+        stack.enter_context(session_lease(container))
         if reservation is not None:
             reservation.check()
             os.mkdir("prepared", mode=0o700, dir_fd=reservation.fd)
@@ -236,7 +244,3 @@ def prepare_profile(engine_root, library_root, profile_id, session_root, *, rese
                             "engineSource": "bundled", "engineManifestSHA256": engine["sha256"],
                             "assetCount": len(resolved["assets"]), "firmwareModified": False,
                             "desktopVerified": False, "guestInstallSupported": True}}
-    finally:
-        # Keep a claimed/failed preparation for diagnosis; never clear or reuse it.
-        if reservation is not None:
-            reservation.close()

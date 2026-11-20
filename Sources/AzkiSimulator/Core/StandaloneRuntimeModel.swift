@@ -80,15 +80,15 @@ final class StandaloneRuntimeModel {
     let instanceID: UUID?
     private(set) var instanceStorageMessage = "用户数据盘尚未启用"
     @ObservationIgnored private var storageSession: URL?
-    @ObservationIgnored private var storageFinishing: Task<Bool, Never>?
+    @ObservationIgnored private var ownedSessionRoot: URL?
+    @ObservationIgnored private var finalizingSession: Task<Bool, Never>?
     /// Bumped whenever this instance's runtime caches are reset. Views clear
     /// their own per-instance caches (debug text, guest inventory, drafts) on it.
     private(set) var resetEpoch = 0
     /// The identity the user already confirmed to run. A cold restart of the
     /// same prepared identity does not ask again.
     @ObservationIgnored private var confirmedIdentity: String?
-    /// One launch-wide cleanup of stale session roots. Helper commands wait for
-    /// it (bounded) so it never races a fresh session's temporary directory.
+    /// Launch-wide cleanup runs independently of catalog and new sessions.
     static var launchCleanup: Task<Void, Never>?
     var selectedProfileID: String? { didSet {
         guard oldValue != selectedProfileID else { return }
@@ -293,8 +293,6 @@ final class StandaloneRuntimeModel {
 
     func loadCatalog() async {
         guard !isBusy else { return }
-        await Self.waitForLaunchCleanup()
-        guard !isBusy else { return }
         let token = revision
         operationCount += 1
         defer { operationCount -= 1; if token == revision { hasLoadedCatalog = true } }
@@ -485,7 +483,7 @@ final class StandaloneRuntimeModel {
         // Every boot starts clean: no earlier receipt, frame, status or error.
         clearRuntimeCaches()
         do {
-            guard await finishInstanceStorage() else {
+            guard await finishAndReleaseSession() else {
                 errorMessage = instanceStorageMessage
                     + "\n可再次点击运行重试；或使用「重置实例」放弃这次未提交的数据（保留上一快照）。"
                 return false
@@ -495,6 +493,7 @@ final class StandaloneRuntimeModel {
             guard token == revision, profileID == selectedProfileID else { return false }
             let root = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
                 .appendingPathComponent("azki-b-" + UUID().uuidString.lowercased().prefix(12), isDirectory: true)
+            ownedSessionRoot = root
             var arguments = ["prepare-bundled", "--profile-id", profileID, "--session-root", root.path]
             if let instanceID { arguments += ["--instance-id", instanceID.uuidString.lowercased()] }
             if bluetoothMode == .virtual, modelConstraint != "miwear.watch.o62m",
@@ -519,12 +518,17 @@ final class StandaloneRuntimeModel {
             arguments += [skipOOBE ? "--skip-oobe" : "--no-skip-oobe"]
             let output = try await runHelper(arguments)
             let receipt = try BundledPreparedSession.decode(output, requestedRoot: root, profileID: profileID)
-            guard token == revision, profileID == selectedProfileID else { _ = await esp32Bridge.stop(); return false }
+            if receipt.instanceStorage?["available"]?.bool == true {
+                storageSession = receipt.root
+            }
+            guard token == revision, profileID == selectedProfileID else {
+                if await esp32Bridge.stop() { await finishAndReleaseSession() }
+                return false
+            }
             prepared = nil
             bundledPrepared = receipt
             sessionURL = receipt.root
-            if receipt.instanceStorage?["available"]?.bool == true {
-                storageSession = receipt.root
+            if storageSession != nil {
                 instanceStorageMessage = receipt.instanceStorage?["kind"]?.string == "xring-emmc"
                     ? "独立 eMMC 数据盘已启用；正常停止后保存。"
                     : receipt.instanceStorage?["norPersistent"]?.bool == true
@@ -538,7 +542,8 @@ final class StandaloneRuntimeModel {
             return true
         } catch {
             let stopped = await esp32Bridge.stop()
-            if stopped, storageSession == nil { esp32Bridge.archiveStoppedState() }
+            if stopped { await finishAndReleaseSession() }
+            guard token == revision else { return false }
             errorMessage = error.localizedDescription + (stopped ? "" : "\n" + (esp32Bridge.lastFailure ?? "ESP32 清理尚未确认"))
             NSLog("[AzkiRun] prepare failed: %@", errorMessage ?? error.localizedDescription)
             return false
@@ -595,7 +600,7 @@ final class StandaloneRuntimeModel {
         defer { if access { backup?.stopAccessingSecurityScopedResource() } }
         do {
             guard await esp32Bridge.stop() else { throw SimulatorError.transport("ESP32 桥接尚未退出") }
-            guard await finishInstanceStorage() else { throw SimulatorError.transport(instanceStorageMessage) }
+            guard await finishAndReleaseSession() else { throw SimulatorError.transport(instanceStorageMessage) }
             try SimulatorSerialDevice.validatePath(esp32Port)
             var arguments = ["esp32-flash", "--port", esp32Port, "--backup-root",
                              BundledFirmwareService.libraryRoot.appendingPathComponent("esp32-backups").path,
@@ -609,8 +614,7 @@ final class StandaloneRuntimeModel {
     }
 
     private func runHelper(_ arguments: [String]) async throws -> Data {
-        await Self.waitForLaunchCleanup()
-        return try await firmwareService.run(arguments)
+        try await firmwareService.run(arguments)
     }
 
     /// Once per app launch: remove session roots an earlier run left behind.
@@ -618,8 +622,7 @@ final class StandaloneRuntimeModel {
     func cleanupStaleSessions() async {
         // This action scans global temporary sessions, outside the selected
         // library. An explicitly isolated development launch must leave other
-        // tasks' sessions alone. Automatic storage maintenance has the same
-        // global cleaner and is independently skipped below.
+        // tasks' sessions alone.
         if SimulatorDataLocations.isolatedDevelopment {
             NSLog("[AzkiReset] sessions-cleanup skipped: validated isolated development data root; global temporary sessions preserved")
             return
@@ -630,34 +633,6 @@ final class StandaloneRuntimeModel {
             NSLog("[AzkiReset] sessions-cleanup removed=%ld kept=%ld", receipt.removed?.count ?? 0, receipt.kept?.count ?? 0)
         } catch {
             NSLog("[AzkiReset] sessions-cleanup skipped: %@", error.localizedDescription)
-        }
-    }
-
-    /// Launch-time storage pass: share byte-identical images and the erased
-    /// template, then remove stopped sessions. It never prunes a committed
-    /// snapshot; that remains an explicit user action in Storage settings.
-    func autoStorageMaintenance() async {
-        // --auto also invokes the global temporary-session cleaner. It is not
-        // limited to this library, even when the library contains no instances.
-        if SimulatorDataLocations.isolatedDevelopment {
-            NSLog("[AzkiStorage] auto skipped: validated isolated development data root; global temporary sessions preserved")
-            return
-        }
-        struct Receipt: Decodable {
-            struct Issue: Decodable { let error: String? }
-            let freedBytes: Int64?
-            let clonedFiles: Int?
-            let errors: [Issue]?
-        }
-        do {
-            let receipt = try JSONDecoder().decode(Receipt.self, from: await firmwareService.run(
-                ["storage-maintain", "--auto"]))
-            NSLog("[AzkiStorage] auto freed=%lld cloned=%ld issues=%ld",
-                  receipt.freedBytes ?? 0, receipt.clonedFiles ?? 0, receipt.errors?.count ?? 0)
-        } catch {
-            // An older engine without the action, or a busy library, must not
-            // delay or block launch.
-            NSLog("[AzkiStorage] auto-maintenance skipped: %@", error.localizedDescription)
         }
     }
 
@@ -715,15 +690,21 @@ final class StandaloneRuntimeModel {
     /// and let the helper repair the instance folder. Saved snapshots,
     /// firmware settings and imported firmware are kept.
     @discardableResult func resetInstance() async -> Bool {
-        guard await stop() else {
+        operationCount += 1
+        defer { operationCount -= 1 }
+        let finished = await stop()
+        if !finished, !(await stopOwnedHelper()) {
             statusMessage = "重置未完成：设备进程尚未确认退出，请稍后重试"
             return false
         }
-        storageSession = nil
-        operationCount += 1
-        defer { operationCount -= 1 }
         clearRuntimeCaches()
-        await resetInstanceOnDisk()
+        let reset = await resetInstanceOnDisk()
+        if !finished, !reset {
+            statusMessage = "重置未完成：数据盘事务尚待恢复"
+            return false
+        }
+        storageSession = nil
+        await finishAndReleaseSession()
         statusMessage = "实例已重置；已保存的数据与固件设置保留，可重新运行"
         return true
     }
@@ -758,18 +739,23 @@ final class StandaloneRuntimeModel {
         errorMessage = nil
         defer { operationCount -= 1 }
         do {
+            guard await finishAndReleaseSession() else { return }
             let root = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
                 .appendingPathComponent("azki-sim-" + UUID().uuidString.lowercased().prefix(12), isDirectory: true)
+            ownedSessionRoot = root
             let output = try await runHelper(["prepare", root.path,
                 "--qemu", qemuURL.path, "--firmware", firmwareURL.path, "--resource", resourceURL.path])
             let result = try StandalonePreparedSession.decode(output, root: root)
-            guard token == revision else { return }
+            guard token == revision else { await finishAndReleaseSession(); return }
             bundledPrepared = nil
             prepared = result
             sessionURL = root
             selectedSummary = result.summary
             statusMessage = "已完成静态检查；尚未执行核心或固件"
-        } catch { errorMessage = error.localizedDescription }
+        } catch {
+            await finishAndReleaseSession()
+            if token == revision { errorMessage = error.localizedDescription }
+        }
     }
 
     /// Start the prepared instance using its private paths and sandbox policy.
@@ -888,7 +874,7 @@ final class StandaloneRuntimeModel {
             let stopped: Bool
             if let launchedProcess { stopped = await stopOwnedHelper(expected: launchedProcess) }
             else { stopped = await esp32Bridge.stop() }
-            if stopped { await finishInstanceStorage() }
+            if stopped { await finishAndReleaseSession() }
             // A cancelled/older attempt must not overwrite a later session's UI.
             guard token == revision else { return }
             errorMessage = message
@@ -906,6 +892,7 @@ final class StandaloneRuntimeModel {
             errorMessage = "旧会话停止尚未确认，未连接新会话"
             return
         }
+        await finishAndReleaseSession()
         sessionURL = url
         runtimeSession.attach(url)
         statusMessage = "连接已有本机会话；关闭应用只断开该连接"
@@ -915,9 +902,9 @@ final class StandaloneRuntimeModel {
         operationCount += 1
         defer { operationCount -= 1 }
         revision &+= 1
-        if storageFinishing == nil { await firmwareService.cancelAll() }
+        if finalizingSession == nil { await firmwareService.cancelAll() }
         let stopped = await stopOwnedHelper()
-        let storageFinished = stopped ? await finishInstanceStorage() : false
+        let storageFinished = stopped ? await finishAndReleaseSession() : false
         if stopped && !storageFinished {
             statusMessage = "设备已停止，数据保存尚未完成；请重试停止"
             errorMessage = instanceStorageMessage
@@ -939,7 +926,7 @@ final class StandaloneRuntimeModel {
                 self.revision &+= 1
                 let token = self.revision
                 let stopped = await self.stopOwnedHelper(expected: completed)
-                let storageFinished = stopped ? await self.finishInstanceStorage() : false
+                let storageFinished = stopped ? await self.finishAndReleaseSession() : false
                 guard token == self.revision else { return }
                 if stopped && !storageFinished {
                     self.statusMessage = "设备已停止，数据保存尚未完成；请重试停止"
@@ -990,37 +977,51 @@ final class StandaloneRuntimeModel {
         return message + (detail.isEmpty ? "" : "\n" + String(detail.suffix(1_024)))
     }
 
-    @discardableResult private func finishInstanceStorage() async -> Bool {
-        if let storageFinishing { return await storageFinishing.value }
+    @discardableResult private func finishAndReleaseSession() async -> Bool {
+        if let finalizingSession { return await finalizingSession.value }
+        let task = Task { @MainActor in
+            guard await self.finishInstanceStorage() else { return false }
+            guard let root = self.ownedSessionRoot else { return true }
+            do {
+                _ = try await self.runHelper(["session-release", "--session-root", root.path])
+            } catch {
+                NSLog("[AzkiStorage] session-release deferred: %@", error.localizedDescription)
+            }
+            self.ownedSessionRoot = nil
+            self.bundledPrepared = nil
+            self.prepared = nil
+            self.sessionURL = nil
+            return true
+        }
+        finalizingSession = task
+        defer { finalizingSession = nil }
+        return await task.value
+    }
+
+    private func finishInstanceStorage() async -> Bool {
         guard let directory = storageSession, let instanceID else {
             esp32Bridge.archiveStoppedState()
             return true
         }
         operationCount += 1
         defer { operationCount -= 1 }
-        let task = Task { @MainActor [self] in
-            do {
-                let data = try await runHelper(["instance-storage-finish", "--session", directory.path,
-                    "--instance-id", instanceID.uuidString.lowercased()])
-                let result = try JSONDecoder().decode(SimulatorJSON.self, from: data)
-                instanceStorageMessage = result["committed"]?.bool == true
-                    ? (result["norPersistent"]?.bool == true
-                        ? "本次数据和设备配置已保存。" : "本次 NAND 数据已保存；NOR 配置尚未持久化。")
-                    : "本次数据未提交，保留上一快照。\(result["reason"]?.string ?? "请查看会话诊断。")"
-                storageSession = nil
-                esp32Bridge.archiveStoppedState()
-                return true
-            } catch {
-                // Keep the binding and radio receipt until the storage helper
-                // publishes its result, so Stop can retry the same transaction.
-                instanceStorageMessage = "数据盘提交未完成，已保留已有快照：\(error.localizedDescription)"
-                return false
-            }
+        do {
+            let data = try await runHelper(["instance-storage-finish", "--session", directory.path,
+                "--instance-id", instanceID.uuidString.lowercased()])
+            let result = try JSONDecoder().decode(SimulatorJSON.self, from: data)
+            instanceStorageMessage = result["committed"]?.bool == true
+                ? (result["norPersistent"]?.bool == true
+                    ? "本次数据和设备配置已保存。" : "本次 NAND 数据已保存；NOR 配置尚未持久化。")
+                : "本次数据未提交，保留上一快照。\(result["reason"]?.string ?? "请查看会话诊断。")"
+            storageSession = nil
+            esp32Bridge.archiveStoppedState()
+            return true
+        } catch {
+            // Keep the binding and radio receipt until the storage helper
+            // publishes its result, so Stop can retry the same transaction.
+            instanceStorageMessage = "数据盘提交未完成，已保留已有快照：\(error.localizedDescription)"
+            return false
         }
-        storageFinishing = task
-        let finished = await task.value
-        storageFinishing = nil
-        return finished
     }
 
     private func stopOwnedHelper(expected: Process? = nil) async -> Bool {
@@ -1106,7 +1107,7 @@ nonisolated enum StandalonePython {
         // Importing an arbitrary full OTA hashes and validates every member.
         let timeout = command == "esp32-flash" ? 2400.0 : command == "library-import" ? 300.0
             : command == "sessions-cleanup" ? 90.0
-            : ["prepare", "prepare-bundled", "library-probe", "instance-reset"].contains(command) ? 45.0 : 15.0
+            : ["prepare", "prepare-bundled", "library-probe", "instance-reset", "instance-storage-finish"].contains(command) ? 45.0 : 15.0
         let deadline = StandaloneCommandDeadline()
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
             if process.isRunning {

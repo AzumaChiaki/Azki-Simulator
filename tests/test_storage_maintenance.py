@@ -7,12 +7,15 @@ import sys
 import tempfile
 import unittest
 import uuid
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Sources/AzkiSimulator/Runtime"))
 
 from azki_simulator import instance_settings
+from azki_simulator import instance_storage
 from azki_simulator.instance_storage import InstanceStorage, Firmware
-from azki_simulator.maintenance import remove_instance_sessions
+from azki_simulator.maintenance import cleanup_sessions, remove_instance_sessions, session_lease
+from azki_simulator.minative import _digest
 from azki_simulator.storage_maintenance import maintain, report
 
 MODEL = "miwear.watch.n66cn"
@@ -194,6 +197,59 @@ class StorageMaintenanceTests(unittest.TestCase):
         removed = remove_instance_sessions(IDENTIFIER, tmp_root=self.tmp_sessions)
         self.assertEqual(removed["removed"], [])
         self.assertTrue(real.exists())
+
+    def test_session_uses_one_working_disk_and_only_keeps_the_accepted_head(self):
+        storage = self.revisions(self.instance(), count=2)
+        for index, healthy in enumerate((True, False, True)):
+            root = self.tmp_sessions / f"azki-b-storage-{index}"
+            session = root / "session"
+            root.mkdir(mode=0o700)
+            session.mkdir(mode=0o700)
+            identity = {"runtimeCapabilities": {"nandPersistence": {"qemuSHA256": "a" * 64}},
+                        "prepared": {}, "profile": {"model": MODEL}, "ap": {"sha256": "b" * 64},
+                        "qemu": {"sha256": "a" * 64}}
+            plan = {"identity": identity, "profileID": PROFILE, "spec": {"project": str(root / "prepared/project")}}
+            with mock.patch.object(instance_storage, "_firmware", return_value=firmware()):
+                binding = instance_storage.prepare_session_storage(self.library, session, IDENTIFIER, plan)
+            revision = storage / "revisions" / binding["transactionID"]
+            disk = Path(binding["dataImage"])
+            self.assertTrue(disk.is_file())
+            self.assertFalse((revision / disk.name).exists())
+            with disk.open("r+b") as stream:
+                stream.write(bytes([index]))
+            identity["instanceStorage"] = binding
+            plan["approvalDigest"] = _digest(identity)
+            instance_storage._atomic_json(session / "backend-plan.json", plan)
+            instance_storage._atomic_json(session / "session.json", {"approvalDigest": plan["approvalDigest"]})
+            with mock.patch.object(instance_storage, "_stopped_health", return_value=(healthy, "test")):
+                self.assertEqual(instance_storage.finish_session_storage(self.library, session, IDENTIFIER)["committed"], healthy)
+            store = InstanceStorage(storage)
+            try:
+                accepted = store.head()[0] / disk.name
+                self.assertEqual(accepted.read_bytes()[0], index if healthy else 0)
+                self.assertEqual(list((storage / "revisions").iterdir()), [accepted.parent])
+            finally:
+                store.close()
+
+    def test_cleanup_sweeps_sdk_runs_and_keeps_active_leases_and_libraries(self):
+        sdk = self.tmp_sessions / "rksim-merge"
+        sdk.mkdir(mode=0o700)
+        library = sdk / "library"
+        library.mkdir(mode=0o700)
+        (sdk / "instances.json").write_text('{"version":1,"instances":[]}')
+        (sdk / "keys").mkdir(mode=0o700)
+        old, active = sdk / "Old123", sdk / "Act456"
+        for root in (old, active):
+            root.mkdir(mode=0o700)
+            (root / "prepared").mkdir(mode=0o700)
+            (root / "session").mkdir(mode=0o700)
+        with session_lease(active / "session"):
+            result = cleanup_sessions(self.library, self.tmp_sessions, now=10**10)
+        self.assertEqual(result["removed"], [str(old)])
+        self.assertEqual(result["reasons"][str(active)], "running")
+        self.assertTrue(library.is_dir())
+        self.assertTrue((sdk / "keys").is_dir())
+        self.assertTrue((sdk / "instances.json").is_file())
 
 
 if __name__ == "__main__":

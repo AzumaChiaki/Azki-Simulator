@@ -55,7 +55,7 @@ def instance_machine_options(storage):
             ',data-writeback=on')
 
 
-def initialize_instance_data(storage, seed_path, *, initialize):
+def initialize_instance_data(storage, seed_path=None, *, initialize, build_seed=None):
     """Apply a legacy UI seed only to a newly created, entirely erased disk.
 
     YAFFS uses in-band tags here, so the separate spare image stays erased.
@@ -64,8 +64,10 @@ def initialize_instance_data(storage, seed_path, *, initialize):
     import fcntl
     if initialize is not True:
         raise ValueError('Data seed is limited to a first-run transaction')
-    seed_path = Path(seed_path)
-    if not seed_path.is_absolute() or seed_path.resolve() != seed_path:
+    if (seed_path is None) == (build_seed is None):
+        raise ValueError('Exactly one data seed source is required')
+    seed_path = Path(seed_path) if seed_path is not None else None
+    if seed_path is not None and (not seed_path.is_absolute() or seed_path.resolve() != seed_path):
         raise ValueError('Data seed must be an absolute non-symlink file')
     size = storage['dataBytes']
     descriptors = []
@@ -81,6 +83,15 @@ def initialize_instance_data(storage, seed_path, *, initialize):
             while chunk := os.read(fd, 1024 * 1024):
                 if chunk != b'\xff' * len(chunk):
                     return False
+        if build_seed is not None:
+            image, _, proof = build_seed(Path(storage['dataImage']))
+            opened = os.fstat(descriptors[0])
+            current = image.lstat()
+            if (image != Path(storage['dataImage']) or opened.st_size != size
+                    or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)):
+                raise ValueError('Data seed builder changed the working image identity or size')
+            os.fsync(descriptors[0])
+            return proof
         seed_fd = os.open(seed_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         descriptors.append(seed_fd)
         before = os.fstat(seed_fd)

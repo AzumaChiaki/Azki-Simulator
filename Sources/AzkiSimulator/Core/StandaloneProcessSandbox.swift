@@ -450,7 +450,25 @@ nonisolated enum StandaloneProcessSandbox {
             // `subpath` cannot express a name prefix, so the grant is a fixed regex
             // over our own prefixes; listing the parent reveals names only.
             guard arguments.count == 1 else { throw SimulatorError.transport("会话清理参数无效") }
+            writes.append(library.appendingPathComponent("instances", isDirectory: true))
             extraRules = sessionCleanupRules
+        case "session-release":
+            guard arguments.count == 3, arguments[1] == "--session-root" else {
+                throw SimulatorError.transport("会话释放参数无效")
+            }
+            let root = try StandaloneSandboxFiles.canonicalURL(arguments[2])
+            guard root.deletingLastPathComponent().path == "/private/tmp",
+                  root.lastPathComponent.range(of: #"^azki-(b|sim)-[0-9a-f]{8}-[0-9a-f]{3}$"#,
+                                               options: .regularExpression) != nil else {
+                throw SimulatorError.unsafeFile("会话目录不是本应用准备的临时目录")
+            }
+            writes += [root, library.appendingPathComponent("instances", isDirectory: true)]
+            extraRules = [
+                "(allow process-info*)",
+                "(allow file-read-data (literal \"/private/tmp\"))",
+                "(allow network-outbound (local unix-socket (subpath \(quote(root.path)))))",
+            ]
+            if !isolatedDevelopment { extraRules += stoppedRadioReceiptRules }
         case "storage-report":
             guard arguments.count == 1 else { throw SimulatorError.transport("存储报告参数无效") }
             extraRules = storageReadRules
@@ -550,7 +568,17 @@ nonisolated enum StandaloneProcessSandbox {
     }
 
     /// Prepared sessions only: lets instance recovery commit an earlier stopped run.
-    static let preparedSessionRules = [
+    static let sessionLivenessRules = [
+        "(allow process-info*)",
+        #"(allow network-outbound (local unix-socket (regex #"^/private/tmp/(azki-(b|sim|cmd)-|rksim[^/]*/)")))"#,
+    ]
+
+    static let stoppedRadioReceiptRules = [
+        #"(allow file-read* (regex #"^/private/tmp/azki-esp-[0-9a-f]{12}/closed\.json$"))"#,
+        #"(allow file-read-metadata (regex #"^/private/tmp/azki-esp-[0-9a-f]{12}$"))"#,
+    ]
+
+    static let preparedSessionRules = sessionLivenessRules + stoppedRadioReceiptRules + [
         "(allow file-read-metadata (literal \"/private/tmp\") (literal \"/tmp\") (literal \"/private\"))",
         "(allow file-read* file-write* (regex #\"^/private/tmp/azki-b-\"))",
     ]
@@ -565,10 +593,12 @@ nonisolated enum StandaloneProcessSandbox {
 
     /// Session roots created by this app: prepared (`azki-b-`), advanced
     /// (`azki-sim-`) and inspection temporaries (`azki-cmd-`).
-    static let sessionCleanupRules = [
+    static let sessionCleanupRules = sessionLivenessRules + stoppedRadioReceiptRules + [
         "(allow file-read* (literal \"/private/tmp\"))",
         "(allow file-read-metadata (literal \"/tmp\") (literal \"/private\"))",
         "(allow file-read* file-write* (regex #\"^/private/tmp/azki-(b|sim|cmd)-\"))",
+        #"(allow file-read* (regex #"^/private/tmp/rksim(-[A-Za-z0-9_-]{1,32})?(/|$)"))"#,
+        #"(allow file-write* (regex #"^/private/tmp/rksim(-[A-Za-z0-9_-]{1,32})?/([A-Za-z0-9]{1,6}|library/instances)(/|$)"))"#,
     ]
 
     private static func permitsSyntheticKey(runtime: StandaloneBundledRuntime, profile: String) throws -> Bool {

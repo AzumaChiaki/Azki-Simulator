@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import struct
+import subprocess
 import sys
 
 from device_catalog import ROOT, digest, load_catalog, prepare_storage, select, zip_member_records
@@ -309,13 +310,6 @@ def main():
         board['qemu_sha256'] = qemu_sha256
         data_image=None
         data_sha=None
-        if storage_kind=='yaffs' and args.skip_oobe and (not instance_requested or args.instance_nor_initialize):
-            from legacy_ui_seed import prepare_ui_seed
-            data_image,data_sha,data_proof=prepare_ui_seed(profile,board['geometry']['nand-data-bytes'])
-            if data_proof['partition']['offset']!=board['geometry']['nand-data-offset']:
-                raise ValueError('Local UI data offset differs from original partition')
-            board['data_image_sha256']=data_sha
-            board['local_ui_seed']=data_proof
         if instance_requested:
             from backend.src.instance_data import validate_instance_images
             instance_storage = validate_instance_images(
@@ -327,7 +321,21 @@ def main():
             instance_nor = validate_instance_nor(args.instance_nor_image, args.instance_nor_sha256,
                                                  args.instance_nor_initialize, board, instance_storage)
             board['instance_nor'] = instance_nor
-    except (ValueError,OSError) as error:
+        if storage_kind == 'yaffs' and args.skip_oobe:
+            from legacy_ui_seed import prepare_ui_seed
+            proof = None
+            if instance_storage is None:
+                data_image, _, proof = prepare_ui_seed(profile, board['geometry']['nand-data-bytes'])
+            elif instance_nor and instance_nor['norInitialize']:
+                from backend.src.instance_data import initialize_instance_data
+                proof = initialize_instance_data(instance_storage, initialize=True,
+                    build_seed=lambda image: prepare_ui_seed(profile, instance_storage['dataBytes'], working_image=image))
+            if proof:
+                if proof['partition']['offset'] != board['geometry']['nand-data-offset']:
+                    raise ValueError('Local UI data offset differs from original partition')
+                data_sha = board['data_image_sha256'] = proof['sha256']
+                board['local_ui_seed'] = proof
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
         parser.error(str(error))
     logdir=args.log_dir or ROOT/'results/devices'/profile['id']
     logdir.mkdir(parents=True,exist_ok=True)
@@ -392,8 +400,6 @@ def main():
                      '--instance-spare-image', instance_storage['spareImage'],
                      '--instance-data-sha256', args.instance_data_sha256,
                      '--instance-spare-sha256', args.instance_spare_sha256]
-        if data_image and instance_nor and args.instance_nor_initialize:
-            sys.argv += ['--instance-data-seed', str(data_image)]
     elif data_image:
         sys.argv += ['--data-image',str(data_image)]
     if args.instance_settings:
