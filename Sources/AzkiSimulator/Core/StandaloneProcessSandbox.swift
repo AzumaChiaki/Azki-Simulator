@@ -849,10 +849,16 @@ nonisolated enum StandaloneProcessSandbox {
             let text = policy(executables: guestExecutables, readTrees: [],
                 readFiles: pins + Array(directories) + instanceReads, writeTrees: guestWrites, writeFiles: instanceWrites,
                 unixDirectory: run, allowChildren: true, extraRules: physicalRules + (debugger.map { [$0.sandboxRule] } ?? []))
-            return StandaloneSandboxLaunch(policyText: text, arguments: [runtime.python.path, "-I", "-S", "-B", supervisor.path,
+            var arguments: [String] = [runtime.python.path, "-I", "-S", "-B", supervisor.path,
                 "--native", String(maxRuntime), run.appendingPathComponent("runner-process.json").path,
-                String(getpid()), runtime.engine.path, project.path, profile, run.path] + instanceArguments + settingsArguments + physicalArguments
-                    + [(plan["skipOOBE"] as? Bool ?? true) ? "--skip-oobe" : "--no-skip-oobe"] + (debugger?.arguments ?? []),
+                String(getpid()), runtime.engine.path, project.path, profile, run.path]
+            arguments.append(contentsOf: instanceArguments)
+            arguments.append(contentsOf: settingsArguments)
+            arguments.append(contentsOf: physicalArguments)
+            let skipOOBE = plan["skipOOBE"] as? Bool ?? true
+            arguments.append(skipOOBE ? "--skip-oobe" : "--no-skip-oobe")
+            if let debugger { arguments.append(contentsOf: debugger.arguments) }
+            return StandaloneSandboxLaunch(policyText: text, arguments: arguments,
                 workingDirectory: project, temporaryDirectory: guestTemporary)
         }
         // H may inspect peer/process ownership, but never forks or executes G.
