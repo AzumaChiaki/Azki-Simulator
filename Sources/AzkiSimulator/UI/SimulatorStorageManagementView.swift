@@ -20,6 +20,7 @@ import SwiftUI
     @State private var confirmingDeep = false
     @State private var pendingOptimize: PendingOptimize?
     @State private var pendingDelete: PendingDelete?
+    @Environment(\.colorScheme) private var colorScheme
 
     private struct PendingDelete: Identifiable {
         let id: String
@@ -72,11 +73,15 @@ import SwiftUI
                 }
                 .padding(20)
             }
-            Divider()
+            Rectangle()
+                .fill(GeminiPalette.hairlineBorder(for: colorScheme))
+                .frame(height: 1)
             actionBar
                 .padding(.horizontal, 20)
                 .padding(.vertical, 12)
+                .background(GeminiPalette.cardFill(for: colorScheme, elevated: false))
         }
+        .background(GeminiPalette.stageBackground(for: colorScheme))
         .frame(minWidth: 620, minHeight: 440)
         .task { await model.refresh() }
         .confirmationDialog("深度清理存储", isPresented: $confirmingDeep, titleVisibility: .visible) {
@@ -146,6 +151,7 @@ import SwiftUI
             } label: {
                 Label("刷新", systemImage: "arrow.clockwise")
             }
+            .buttonStyle(GeminiNeonButtonStyle(tone: .secondary, compact: true))
             .disabled(model.isBusy)
             .accessibilityIdentifier("storage.refresh")
             Button {
@@ -153,7 +159,7 @@ import SwiftUI
             } label: {
                 Label("在访达中打开", systemImage: "folder")
             }
-            .disabled(report == nil)
+            .buttonStyle(GeminiNeonButtonStyle(tone: .secondary, compact: true))
             .accessibilityIdentifier("storage.reveal-root")
         }
     }
@@ -172,20 +178,24 @@ import SwiftUI
     }
 
     private func categories(_ report: SimulatorStorageReport) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("空间分布").font(.headline)
-            ForEach(report.categories) { category in
-                HStack(spacing: 10) {
-                    Text(category.name).frame(width: 110, alignment: .leading)
-                    ProgressView(value: Double(category.bytes),
-                                 total: Double(max(report.totalBytes, 1)))
-                        .tint(category.id == "instances" ? Color.accentColor : Color.secondary)
-                    Text(bytes(category.bytes))
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .frame(width: 82, alignment: .trailing)
+        GeminiGlassCard(cornerRadius: 14, hoverGlow: false, padding: 14) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("空间分布").font(.headline)
+                ForEach(report.categories) { category in
+                    HStack(spacing: 12) {
+                        Text(category.name).font(.system(size: 12.5)).frame(width: 110, alignment: .leading)
+                        GeminiGradientProgressBar(
+                            value: Double(category.bytes),
+                            total: Double(max(report.totalBytes, 1)),
+                            highlighted: category.id == "instances"
+                        )
+                        Text(bytes(category.bytes))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .frame(width: 82, alignment: .trailing)
+                    }
+                    .accessibilityIdentifier("storage.category.\(category.id)")
                 }
-                .accessibilityIdentifier("storage.category.\(category.id)")
             }
         }
     }
@@ -203,13 +213,16 @@ import SwiftUI
                     .font(.callout).foregroundStyle(.secondary)
                     .padding(.vertical, 10)
             } else {
-                VStack(spacing: 0) {
-                    ForEach(report.instances) { entry in
-                        instanceRow(entry)
-                        if entry.id != report.instances.last?.id { Divider() }
+                GeminiGlassCard(cornerRadius: 14, hoverGlow: false, padding: 0) {
+                    VStack(spacing: 0) {
+                        ForEach(report.instances) { entry in
+                            instanceRow(entry)
+                            if entry.id != report.instances.last?.id {
+                                Divider().opacity(0.45)
+                            }
+                        }
                     }
                 }
-                .background(Color(nsColor: .quaternaryLabelColor).opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
             }
         }
     }
@@ -218,24 +231,18 @@ import SwiftUI
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: "applewatch")
                 .font(.title3)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(entry.busy ? AnyShapeStyle(GeminiPalette.emerald) : AnyShapeStyle(Color.secondary))
                 .frame(width: 24)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(name(for: entry)).font(.headline).lineLimit(1)
                     if entry.busy {
-                        Text("运行中").font(.caption2.bold())
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(.green.opacity(0.16), in: Capsule())
+                        GeminiStatusPill(text: "运行中", tone: .running, compact: true)
                     } else if entry.pending == true {
-                        Text("待整理").font(.caption2.bold())
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(.orange.opacity(0.18), in: Capsule())
+                        GeminiStatusPill(text: "待整理", tone: .warning, compact: true)
                     }
                     if entry.unsafe {
-                        Text("需检查").font(.caption2.bold())
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(.orange.opacity(0.18), in: Capsule())
+                        GeminiStatusPill(text: "需检查", tone: .warning, compact: true)
                     }
                 }
                 Text("\(entry.model ?? "未知机型") · \(entry.revisionCount) 个快照 · 实例总计 \(bytes(entry.bytes))")
@@ -243,7 +250,7 @@ import SwiftUI
                 HStack(spacing: 10) {
                     Text("快照数据 \(bytes(entry.revisionBytes))")
                     if entry.duplicateBytes > 0 {
-                        Text("可去重 \(bytes(entry.duplicateBytes))").foregroundStyle(.orange)
+                        Text("可去重 \(bytes(entry.duplicateBytes))").foregroundStyle(GeminiPalette.amber)
                     }
                     if entry.erasedBytes > 0 {
                         Text("空白镜像 \(bytes(entry.erasedBytes))").foregroundStyle(.secondary)
@@ -255,6 +262,7 @@ import SwiftUI
             Button("整理") {
                 pendingOptimize = PendingOptimize(name: "「\(name(for: entry))」", keep: keep, scoped: entry.id)
             }
+            .buttonStyle(GeminiNeonButtonStyle(tone: .secondary, compact: true))
             .disabled(model.isBusy)
             .help("按当前保留数整理这个实例的快照")
             .accessibilityIdentifier("storage.maintain.\(entry.id)")
@@ -265,19 +273,19 @@ import SwiftUI
             } label: {
                 Image(systemName: "folder")
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(GeminiNeonButtonStyle(tone: .subtle, compact: true))
             .help("在访达中显示这个实例的数据")
             Button(role: .destructive) {
                 pendingDelete = PendingDelete(id: entry.id, name: name(for: entry), registered: registeredID(entry))
             } label: {
                 Image(systemName: "trash")
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(GeminiNeonButtonStyle(tone: .destructive, compact: true))
             .help("删除实例及其全部快照")
             .accessibilityIdentifier("storage.delete.\(entry.id)")
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
     }
 
     @ViewBuilder private var sessionSection: some View {
@@ -292,20 +300,24 @@ import SwiftUI
                 Text("没有残留的临时会话。")
                     .font(.callout).foregroundStyle(.secondary)
             } else {
-                ForEach(sessions.prefix(8)) { row in
-                    HStack(spacing: 8) {
-                        Image(systemName: row.session.state == "running" ? "play.circle" : "hourglass")
-                            .foregroundStyle(row.session.state == "running" ? Color.green : Color.secondary)
-                        Text(row.instanceName).lineLimit(1)
-                        Text(row.session.state == "running" ? "运行中" : row.session.state == "unknown" ? "待确认" : "已停止")
-                            .font(.caption).foregroundStyle(.secondary)
-                        Spacer()
-                        Text(bytes(row.session.bytes)).font(.caption.monospacedDigit())
+                GeminiGlassCard(cornerRadius: 12, hoverGlow: false, padding: 12) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(sessions.prefix(8)) { row in
+                            HStack(spacing: 8) {
+                                Image(systemName: row.session.state == "running" ? "play.circle" : "hourglass")
+                                    .foregroundStyle(row.session.state == "running" ? GeminiPalette.emerald : Color.secondary)
+                                Text(row.instanceName).lineLimit(1)
+                                Text(row.session.state == "running" ? "运行中" : row.session.state == "unknown" ? "待确认" : "已停止")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Spacer()
+                                Text(bytes(row.session.bytes)).font(.caption.monospacedDigit())
+                            }
+                            .font(.caption)
+                        }
+                        if sessions.count > 8 {
+                            Text("另有 \(sessions.count - 8) 个会话").font(.caption).foregroundStyle(.secondary)
+                        }
                     }
-                    .font(.caption)
-                }
-                if sessions.count > 8 {
-                    Text("另有 \(sessions.count - 8) 个会话").font(.caption).foregroundStyle(.secondary)
                 }
             }
         }
@@ -333,29 +345,39 @@ import SwiftUI
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .frame(width: 190)
-                Button("优化存储", systemImage: "wand.and.stars") {
+
+                Button {
                     pendingOptimize = PendingOptimize(name: "整个库", keep: keep, scoped: nil)
+                } label: {
+                    Label("优化存储", systemImage: "wand.and.stars")
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(GeminiNeonButtonStyle(tone: .primary, compact: true))
                 .disabled(model.isBusy)
                 .accessibilityIdentifier("storage.optimize")
-                Button("深度清理…", systemImage: "trash.slash", role: .destructive) {
+
+                Button(role: .destructive) {
                     confirmingDeep = true
+                } label: {
+                    Label("深度清理…", systemImage: "trash.slash")
                 }
-                .disabled(model.isBusy || report == nil)
+                .buttonStyle(GeminiNeonButtonStyle(tone: .destructive, compact: true))
+                .disabled(model.isBusy)
+
                 Button("清理临时会话") {
                     Task { await model.cleanupSessions() }
                 }
+                .buttonStyle(GeminiNeonButtonStyle(tone: .secondary, compact: true))
                 .disabled(model.isBusy)
+
                 Spacer(minLength: 0)
                 if model.isBusy { ProgressView().controlSize(.small) }
             }
             HStack(spacing: 6) {
                 if let message = model.lastMessage {
-                    Label(message, systemImage: "checkmark.circle").font(.caption).foregroundStyle(.green)
+                    Label(message, systemImage: "checkmark.circle").font(.caption).foregroundStyle(GeminiPalette.emerald)
                 }
                 if let error = model.errorMessage {
-                    Label(error, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
+                    Label(error, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(GeminiPalette.amber)
                         .lineLimit(2)
                 }
             }
@@ -386,14 +408,14 @@ private struct StorageCard: View {
     let systemImage: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Label(title, systemImage: systemImage)
-                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            Text(value).font(.title3.bold()).monospacedDigit().lineLimit(1)
-            Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+        GeminiGlassCard(cornerRadius: 12, hoverGlow: true, padding: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Label(title, systemImage: systemImage)
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(value).font(.title3.bold()).monospacedDigit().lineLimit(1)
+                Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(Color(nsColor: .quaternaryLabelColor).opacity(0.22), in: RoundedRectangle(cornerRadius: 9))
     }
 }

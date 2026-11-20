@@ -147,12 +147,14 @@ final class StandaloneRuntimeModel {
     }
 
     /// Any imported firmware of this model may run on this instance; the data
-    /// disk is carried across versions. Stopped: just select. Running (owned
-    /// core): stop (committing the data disk), select, then cold-boot.
+    /// disk is carried across versions. Stopped: just select. Attached to an
+    /// external session: detach and select. Running (owned core): stop
+    /// (committing the data disk), select, then cold-boot.
     func switchFirmware(to profileID: String) async {
         guard profileID != selectedProfileID,
               selectableFirmwareItems.contains(where: { $0.id == profileID }) else { return }
-        if !isServing && !runtimeSession.isAttached {
+        if !isServing {
+            if runtimeSession.isAttached { runtimeSession.detach() }
             selectedProfileID = profileID
             statusMessage = "已切换固件；切换固件会保留数据盘"
             return
@@ -164,9 +166,32 @@ final class StandaloneRuntimeModel {
         if isServing { statusMessage = "已切换固件并重新开机，数据盘已保留" }
     }
 
+    /// Auto-pick the first ready firmware for this model when the user clicks
+    /// Run without manually choosing from the dropdown first.
+    @discardableResult func autoSelectReadyFirmwareIfNeeded() -> Bool {
+        if let current = selectedFirmware, current.availability.ready,
+           modelConstraint == nil || current.model == modelConstraint {
+            return true
+        }
+        guard let candidate = selectableFirmwareItems.first(where: { $0.availability.ready }) else {
+            return false
+        }
+        selectedProfileID = candidate.id
+        return true
+    }
+
     /// Host-initiated cold restart, e.g. to apply firmware settings now.
+    /// If the device is currently stopped, boots the selected (or first ready) firmware directly.
     func coldRestart() async {
-        guard isServing, !isStopping, await stop() else { return }
+        guard !isStopping else { return }
+        if isServing {
+            guard await stop() else { return }
+            await continueAfterGuestPower("guest_reboot")
+            return
+        }
+        if runtimeSession.isAttached { runtimeSession.detach() }
+        if !hasLoadedCatalog { await loadCatalog() }
+        _ = autoSelectReadyFirmwareIfNeeded()
         await continueAfterGuestPower("guest_reboot")
     }
 
@@ -300,8 +325,12 @@ final class StandaloneRuntimeModel {
     }
 
     func importFirmware(_ url: URL) async {
-        guard !isBusy, !isServing, !runtimeSession.isAttached else { return }
+        // Firmware library import uses the CLI library lock and never mutates
+        // an already-running VM's open inodes, so users can freely import new
+        // firmware packages even while a device is running.
+        guard !isStopping else { return }
         let token = revision
+        let wasActive = isServing || runtimeSession.isAttached
         let granted = url.startAccessingSecurityScopedResource()
         defer { if granted { url.stopAccessingSecurityScopedResource() } }
         operationCount += 1
@@ -315,7 +344,7 @@ final class StandaloneRuntimeModel {
             // Runnable imports use the selected hardware preset. Archive-only
             // packages retain their own model identity.
             var arguments = ["library-import", "--input", url.path]
-            if let model = selectedFirmware?.model { arguments += ["--model", model] }
+            if let model = modelConstraint ?? selectedFirmware?.model { arguments += ["--model", model] }
             receipt = try FirmwareImportReceipt.decode(await runHelper(arguments))
         } catch {
             guard token == revision, !Task.isCancelled, !isStopping else { return }
@@ -326,7 +355,7 @@ final class StandaloneRuntimeModel {
                 importFailureMessage = importFailure
                 importDiagnostic = diagnostic
                 importCandidateIDs = []
-                selectedProfileID = nil
+                if !wasActive { selectedProfileID = nil }
                 statusMessage = diagnostic.summary
                 // An unknown identity is expected during development. Keep its
                 // readable diagnostic inline, without a second modal or a run.
@@ -359,13 +388,17 @@ final class StandaloneRuntimeModel {
                 return
             }
             let candidates = receipt.candidateIDs.filter { id in selectableFirmwareItems.contains { $0.id == id } }
-            selectedProfileID = candidates.count == 1 ? candidates.first : nil
-            if candidates.isEmpty {
-                statusMessage = "固件已导入；请在本实例对应的硬件预设里选择它。"
+            if wasActive {
+                statusMessage = "固件已导入固件库；当前设备保持运行，可在固件列表随时切换。"
             } else {
-                statusMessage = candidates.count > 1
-                    ? "固件已导入；请选择要在哪个硬件预设上开机。"
-                    : "固件已导入，将按本实例的硬件预设开机。"
+                selectedProfileID = candidates.count == 1 ? candidates.first : (candidates.first ?? selectedProfileID)
+                if candidates.isEmpty {
+                    statusMessage = "固件已导入；请在本实例对应的硬件预设里选择它。"
+                } else {
+                    statusMessage = candidates.count > 1
+                        ? "固件已导入；已为你预选首个匹配固件，也可切换其他预设。"
+                        : "固件已导入，将按本实例的硬件预设开机。"
+                }
             }
         } catch {
             guard token == revision, !Task.isCancelled else { return }
@@ -547,7 +580,13 @@ final class StandaloneRuntimeModel {
 
     private(set) var esp32FlashMessage: String?
     func flashESP32(restore backup: URL? = nil) async {
-        guard !isBusy, !isServing, !runtimeSession.isAttached else { return }
+        guard !isStopping else { return }
+        if isServing || runtimeSession.isAttached {
+            guard await stop() else {
+                errorMessage = "无法在刷写前停止运行中的设备，请重试或重置实例。"
+                return
+            }
+        }
         operationCount += 1
         defer { operationCount -= 1 }
         errorMessage = nil

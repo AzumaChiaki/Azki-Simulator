@@ -234,11 +234,44 @@ final class SimulatorInstanceLibrary {
         return "\(title) \(instances.count + 1)"
     }
 
+    /// Non-blocking toast notice displayed softly in the active stage.
+    var toastMessage: String?
+    var toastIsError = false
+    @ObservationIgnored private var toastTask: Task<Void, Never>?
+
+    func showToast(_ message: String, isError: Bool = false, durationSeconds: Double = 3.2) {
+        toastTask?.cancel()
+        toastMessage = message
+        toastIsError = isError
+        toastTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(durationSeconds))
+            guard let self, !Task.isCancelled else { return }
+            self.toastMessage = nil
+        }
+    }
+
+    func dismissToast() {
+        toastTask?.cancel()
+        toastMessage = nil
+    }
+
+    /// Refresh firmware catalog across the shared catalog and every instance
+    /// after an import so newly imported firmware is immediately selectable.
+    func refreshAllCatalogs(excluding instanceID: UUID? = nil) async {
+        await catalog.loadCatalog()
+        await withTaskGroup(of: Void.self) { group in
+            for item in instances where item.id != instanceID {
+                group.addTask { @MainActor in
+                    await item.runtime.loadCatalog()
+                }
+            }
+        }
+    }
+
     func setVirtualIdentity(_ id: UUID, identity: SimulatorVirtualIdentity) throws {
         guard storageAvailable, let instance = instances.first(where: { $0.id == id }) else {
             throw SimulatorInstanceStoreError.invalid("实例存储不可用")
         }
-        guard !instance.runtime.isBusy else { throw SimulatorInstanceStoreError.invalid("请等待设备启动或停止完成") }
         let identity = try identity.validated(model: instance.record.model)
         var candidate = instances.map(\.record)
         guard let index = candidate.firstIndex(where: { $0.id == id }) else { return }
@@ -257,9 +290,8 @@ final class SimulatorInstanceLibrary {
     }
 
     func setSkipOOBE(_ id: UUID, enabled: Bool) throws {
-        guard storageAvailable, let instance = instances.first(where: { $0.id == id }),
-              !instance.runtime.isBusy, !instance.runtime.isServing, !instance.runtime.runtimeSession.isAttached else {
-            throw SimulatorInstanceStoreError.invalid("停止设备后可修改首次设置选项")
+        guard storageAvailable, let instance = instances.first(where: { $0.id == id }) else {
+            throw SimulatorInstanceStoreError.invalid("实例存储不可用")
         }
         var candidate = instances.map(\.record)
         guard let index = candidate.firstIndex(where: { $0.id == id }) else { return }
@@ -270,13 +302,16 @@ final class SimulatorInstanceLibrary {
     }
 
     func setBluetooth(_ id: UUID, mode: SimulatorBluetoothMode, port: String) async throws {
-        guard storageAvailable, let instance = instances.first(where: { $0.id == id }),
-              !instance.runtime.isBusy, !instance.runtime.isServing, !instance.runtime.runtimeSession.isAttached else {
-            throw SimulatorInstanceStoreError.invalid("停止设备后可修改蓝牙连接")
+        guard storageAvailable, let instance = instances.first(where: { $0.id == id }) else {
+            throw SimulatorInstanceStoreError.invalid("实例存储不可用")
         }
         if !port.isEmpty { try SimulatorSerialDevice.validatePath(port) }
-        guard await instance.runtime.stop() else { throw SimulatorError.transport("旧连接尚未释放") }
-        instance.bluetooth.stop()
+        // Only release idle bridge handles immediately; when the device is
+        // running, persist the new preference so it takes effect on next boot.
+        if !instance.runtime.isServing && !instance.runtime.runtimeSession.isAttached {
+            _ = await instance.runtime.stop()
+            instance.bluetooth.stop()
+        }
         var candidate = instances.map(\.record)
         guard let index = candidate.firstIndex(where: { $0.id == id }) else { return }
         candidate[index].bluetoothMode = mode

@@ -5,11 +5,17 @@ struct SimulatorNativeCanvas: NSViewRepresentable {
     let image: CGImage?
     let geometry: SimulatorDisplayGeometry
     let acceptsInput: Bool
+    var clipToScreenShape: Bool = true
     let onInput: (SimulatorInputEvent) -> Void
 
     init(image: CGImage?, geometry: SimulatorDisplayGeometry = .pixels212x520,
-         acceptsInput: Bool, onInput: @escaping (SimulatorInputEvent) -> Void) {
-        self.image = image; self.geometry = geometry; self.acceptsInput = acceptsInput; self.onInput = onInput
+         acceptsInput: Bool, clipToScreenShape: Bool = true,
+         onInput: @escaping (SimulatorInputEvent) -> Void) {
+        self.image = image
+        self.geometry = geometry
+        self.acceptsInput = acceptsInput
+        self.clipToScreenShape = clipToScreenShape
+        self.onInput = onInput
     }
 
     func makeNSView(context: Context) -> SimulatorCanvasNSView { SimulatorCanvasNSView(frame: .zero) }
@@ -17,6 +23,7 @@ struct SimulatorNativeCanvas: NSViewRepresentable {
         view.onInput = onInput
         view.displayGeometry = geometry
         view.acceptsInput = acceptsInput
+        view.clipToScreenShape = clipToScreenShape
         view.image = image
     }
     static func dismantleNSView(_ view: SimulatorCanvasNSView, coordinator: ()) {
@@ -31,6 +38,13 @@ struct SimulatorNativeCanvas: NSViewRepresentable {
 @MainActor final class SimulatorCanvasNSView: NSView {
     var onInput: ((SimulatorInputEvent) -> Void)?
     var acceptsInput = false { didSet { if !acceptsInput { cancelContact() } } }
+    var clipToScreenShape = true {
+        didSet {
+            guard clipToScreenShape != oldValue else { return }
+            cancelContact()
+            needsDisplay = true
+        }
+    }
     var displayGeometry: SimulatorDisplayGeometry = .pixels212x520 {
         didSet {
             guard displayGeometry != oldValue else { return }
@@ -80,10 +94,38 @@ struct SimulatorNativeCanvas: NSViewRepresentable {
         guard let bitmap else { return }
         drawCount &+= 1
         let rect = SimulatorCanvasGeometry.contentRect(in: bounds, pixelSize: deviceSize)
-        NSColor.black.setFill()
-        NSBezierPath(rect: rect).fill()
-        NSGraphicsContext.current?.imageInterpolation = .none
-        bitmap.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        guard rect.width > 0, rect.height > 0, let graphics = NSGraphicsContext.current else { return }
+        let cg = graphics.cgContext
+
+        if clipToScreenShape {
+            let clipPath = displayGeometry.screenClipPath(in: rect)
+            cg.saveGState()
+            cg.setAllowsAntialiasing(true)
+            cg.setShouldAntialias(true)
+            cg.addPath(clipPath)
+            cg.clip()
+            NSColor.black.setFill()
+            cg.fill(rect)
+            graphics.imageInterpolation = .none
+            bitmap.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            cg.restoreGState()
+
+            // Crisp, restrained hardware silhouette rim so dark watchfaces remain
+            // clearly framed against both light and dark backgrounds.
+            cg.saveGState()
+            cg.setAllowsAntialiasing(true)
+            cg.setShouldAntialias(true)
+            cg.addPath(clipPath)
+            cg.setStrokeColor(NSColor.labelColor.withAlphaComponent(0.16).cgColor)
+            cg.setLineWidth(1.0)
+            cg.strokePath()
+            cg.restoreGState()
+        } else {
+            NSColor.black.setFill()
+            NSBezierPath(rect: rect).fill()
+            graphics.imageInterpolation = .none
+            bitmap.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        }
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
@@ -160,6 +202,10 @@ struct SimulatorNativeCanvas: NSViewRepresentable {
         contact = nil
     }
     private func mapped(_ point: CGPoint, down: Bool) -> SimulatorInputEvent? {
-        SimulatorCanvasGeometry.input(at: point, bounds: bounds, pixelSize: deviceSize, down: down)
+        if clipToScreenShape, down, contact == nil {
+            let rect = SimulatorCanvasGeometry.contentRect(in: bounds, pixelSize: deviceSize)
+            guard displayGeometry.containsInScreenShape(point, in: rect) else { return nil }
+        }
+        return SimulatorCanvasGeometry.input(at: point, bounds: bounds, pixelSize: deviceSize, down: down)
     }
 }

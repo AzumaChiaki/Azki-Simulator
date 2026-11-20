@@ -2,29 +2,33 @@ import AppKit
 import SwiftUI
 
 @MainActor enum SimulatorInstanceActions {
+    /// Core controls remain responsive unless the runtime is actively tearing down.
     static func controlsAvailable(_ instance: SimulatorInstanceContext) -> Bool {
-        SimulatorWorkspaceView.coreControlsAvailable(runtime: instance.runtime, sharing: instance.sharing)
+        !instance.runtime.isStopping
     }
 
     static func canRun(_ instance: SimulatorInstanceContext) -> Bool {
-        controlsAvailable(instance) && instance.runtime.canRunSelectedFirmware
+        !instance.runtime.isStopping
     }
 
     static func canCreateReason(_ library: SimulatorInstanceLibrary) -> String? {
         if !library.storageAvailable { return "实例存储不可用" }
-        if library.deviceModels.isEmpty {
-            return library.catalog.hasLoadedCatalog ? "固件库没有可用的设备型号" : "正在读取设备型号"
-        }
         return nil
     }
 
     static func canStop(_ instance: SimulatorInstanceContext) -> Bool {
-        !instance.runtime.isStopping && (instance.runtime.isServing || instance.runtime.isBusy)
+        !instance.runtime.isStopping
+            && (instance.runtime.isServing
+                || instance.runtime.isBusy
+                || instance.runtime.runtimeSession.isAttached
+                || instance.sharing.isSharing
+                || instance.sharing.sessionURL != nil
+                || instance.recording.isRecording
+                || instance.bluetooth.isActive)
     }
 
     static func canDetach(_ instance: SimulatorInstanceContext) -> Bool {
-        !instance.runtime.isStopping && !instance.runtime.isServing && !instance.runtime.isBusy
-            && instance.runtime.runtimeSession.isAttached
+        !instance.runtime.isStopping && instance.runtime.runtimeSession.isAttached
     }
 
     static func isWatch(_ instance: SimulatorInstanceContext) -> Bool {
@@ -33,25 +37,97 @@ import SwiftUI
     }
 
     static func watchButtonsAvailable(_ instance: SimulatorInstanceContext) -> Bool {
-        guard controlsAvailable(instance), !instance.runtime.isStopping, instance.runtime.runtimeSession.isRunning,
-              case .array(let capabilities)? = instance.runtime.runtimeSession.status?["capabilities"] else { return false }
-        return capabilities.contains(.string("device-button")) && isWatch(instance)
+        !instance.runtime.isStopping && instance.runtime.runtimeSession.isRunning && isWatch(instance)
     }
 
-    static func run(_ instance: SimulatorInstanceContext) {
+    static func canScreenshot(_ instance: SimulatorInstanceContext) -> Bool {
+        instance.runtime.runtimeSession.image != nil
+            || instance.runtime.isServing
+            || instance.runtime.runtimeSession.isAttached
+    }
+
+    static func canToggleRecording(_ instance: SimulatorInstanceContext) -> Bool {
+        !instance.recording.isFinishing
+            && (instance.recording.isRecording
+                || instance.runtime.isServing
+                || instance.runtime.runtimeSession.isAttached)
+    }
+
+    /// Smart one-click Run / Restart: automatically resolves conflicting Studio
+    /// sharing, loads catalog, picks a ready firmware when none is chosen, or
+    /// opens firmware import when the model has no imported firmware yet.
+    static func run(
+        _ instance: SimulatorInstanceContext,
+        library: SimulatorInstanceLibrary? = nil,
+        onNeedImport: (() -> Void)? = nil
+    ) {
         let runtime = instance.runtime
         Task {
-            guard controlsAvailable(instance), runtime.canRunSelectedFirmware else { return }
-            guard await runtime.prepareSelectedFirmware(), controlsAvailable(instance) else { return }
-            if !runtime.preparedNeedsReview { await runtime.startApproved() }
-            else { instance.runReview = SimulatorRunReview(summary: runtime.selectedSummary, runLimitSeconds: runtime.preparedRunLimitSeconds) }
+            guard !runtime.isStopping else { return }
+
+            if instance.sharing.isSharing || instance.sharing.sessionURL != nil {
+                library?.showToast("已自动关闭 Studio 只读共享，正在准备启动…")
+                _ = await instance.sharing.disable()
+            }
+
+            if runtime.isServing {
+                library?.showToast("正在重新启动「\(instance.record.name)」…")
+                await instance.recording.stop()
+                await runtime.coldRestart()
+                return
+            }
+
+            if runtime.runtimeSession.isAttached {
+                await instance.recording.stop()
+                runtime.runtimeSession.detach()
+            }
+
+            if !runtime.hasLoadedCatalog {
+                await runtime.loadCatalog()
+            }
+
+            let hadSelection = runtime.selectedProfileID != nil
+            let hasReady = runtime.autoSelectReadyFirmwareIfNeeded()
+            if hasReady && !hadSelection, let name = runtime.selectedFirmware?.displayName {
+                library?.showToast("已自动选择固件：\(name)")
+            }
+
+            if !runtime.canRunSelectedFirmware {
+                if runtime.selectableFirmwareItems.isEmpty, let onNeedImport {
+                    library?.showToast("此机型尚未导入固件，请选择固件包导入")
+                    onNeedImport()
+                } else {
+                    let reason = runtime.runUnavailableReason ?? "请先导入或选择可用固件"
+                    library?.showToast(reason, isError: true)
+                }
+                return
+            }
+
+            guard await runtime.prepareSelectedFirmware(), !runtime.isStopping else { return }
+            if !runtime.preparedNeedsReview {
+                await runtime.startApproved()
+            } else {
+                instance.runReview = SimulatorRunReview(
+                    summary: runtime.selectedSummary,
+                    runLimitSeconds: runtime.preparedRunLimitSeconds
+                )
+            }
         }
     }
 
-    static func stop(_ instance: SimulatorInstanceContext) {
+    static func stop(_ instance: SimulatorInstanceContext, library: SimulatorInstanceLibrary? = nil) {
         Task {
+            instance.bluetooth.stop()
             await instance.recording.stop()
-            if instance.runtime.isServing || instance.runtime.isBusy { await instance.runtime.stop() }
+            if instance.sharing.isSharing || instance.sharing.sessionURL != nil {
+                _ = await instance.sharing.disable()
+            }
+            if instance.runtime.isServing || instance.runtime.isBusy {
+                await instance.runtime.stop()
+            } else if instance.runtime.runtimeSession.isAttached {
+                instance.runtime.runtimeSession.detach()
+                library?.showToast("已断开外部设备会话")
+            }
         }
     }
 
@@ -62,34 +138,53 @@ import SwiftUI
         }
     }
 
-    static func screenshot(_ instance: SimulatorInstanceContext) {
-        guard let image = instance.runtime.runtimeSession.image else { return }
+    static func screenshot(_ instance: SimulatorInstanceContext, library: SimulatorInstanceLibrary? = nil) {
+        guard let image = instance.runtime.runtimeSession.image else {
+            library?.showToast("设备画面尚未就绪，等待第一帧后再截图")
+            return
+        }
+        let clipGeometry: SimulatorDisplayGeometry? = DisplaySettings.shared.clipToScreenShape
+            ? (instance.runtime.runtimeSession.manifest?.displayGeometry
+                ?? SimulatorDisplayGeometry(width: image.width, height: image.height))
+            : nil
         do {
-            let url = try SimulatorScreenshot.save(image, instanceName: instance.record.name)
+            let url = try SimulatorScreenshot.save(image, instanceName: instance.record.name, clipGeometry: clipGeometry)
             NSWorkspace.shared.activateFileViewerSelecting([url])
+            library?.showToast("截图已保存：\(url.lastPathComponent)")
         } catch {
             instance.runtime.errorMessage = error.localizedDescription
         }
     }
 
-    static func toggleRecording(_ instance: SimulatorInstanceContext) {
+    static func toggleRecording(_ instance: SimulatorInstanceContext, library: SimulatorInstanceLibrary? = nil) {
         let session = instance.runtime.runtimeSession
         if instance.recording.isRecording {
-            Task { await instance.recording.stop() }
-        } else if session.isRunning, session.image != nil {
-            instance.recording.start(session: session, instanceName: instance.record.name)
+            Task {
+                await instance.recording.stop()
+                library?.showToast("录屏已停止，正在保存…")
+            }
+        } else if session.isRunning, let image = session.image {
+            let clipGeometry: SimulatorDisplayGeometry? = DisplaySettings.shared.clipToScreenShape
+                ? (session.manifest?.displayGeometry
+                    ?? SimulatorDisplayGeometry(width: image.width, height: image.height))
+                : nil
+            instance.recording.start(session: session, instanceName: instance.record.name, clipGeometry: clipGeometry)
+            library?.showToast("开始录制设备画面")
+        } else {
+            library?.showToast("设备尚未输出画面，请等待画面出现后再录屏")
         }
     }
 
+    /// Importing firmware writes to the shared library under a lock and never
+    /// interferes with running VMs, so it stays freely accessible.
     static func importFirmware(_ instance: SimulatorInstanceContext) -> Bool {
-        controlsAvailable(instance) && instance.runtime.libraryAvailable
-            && !instance.runtime.isServing && !instance.runtime.runtimeSession.isAttached
+        !instance.runtime.isStopping
     }
 
     static func confirmRun(_ instance: SimulatorInstanceContext, review: SimulatorRunReview) {
         instance.runReview = nil
         let runtime = instance.runtime
-        guard controlsAvailable(instance), runtime.canStartPrepared, runtime.selectedSummary == review.summary,
+        guard !runtime.isStopping, runtime.canStartPrepared, runtime.selectedSummary == review.summary,
               runtime.preparedRunLimitSeconds == review.runLimitSeconds else {
             runtime.errorMessage = "准备的文件已变化，请重新准备并核对指纹。"
             return
@@ -121,37 +216,47 @@ import SwiftUI
             Button("存储管理", systemImage: "externaldrive") { openWindow(id: "storage") }
                 .help("查看和管理实例快照、固件库与临时会话")
                 .accessibilityIdentifier("simulator.storage")
+            Button("导入固件", systemImage: "square.and.arrow.down") { onImport() }
+                .help("选择固件包导入到固件库（运行期间也可直接导入）")
+                .disabled(instance.map { !SimulatorInstanceActions.importFirmware($0) } ?? false)
+                .accessibilityIdentifier("simulator.import-firmware")
             if let instance {
-                Button("运行", systemImage: "play.fill") { SimulatorInstanceActions.run(instance) }
-                    .help(instance.runtime.runUnavailableReason ?? "按本实例的硬件预设开机（⌘R）")
-                    .disabled(!SimulatorInstanceActions.canRun(instance))
-                    .accessibilityIdentifier("simulator.run-firmware")
-                Button("停止", systemImage: "stop.fill") { SimulatorInstanceActions.stop(instance) }
-                    .help(instance.runtime.isStopping ? "正在停止…" : "停止本应用启动的设备（⌘.）")
-                    .disabled(!SimulatorInstanceActions.canStop(instance))
-                    .accessibilityIdentifier("simulator.stop")
+                let serving = instance.runtime.isServing
+                Button(serving ? "重启" : "运行", systemImage: serving ? "arrow.clockwise" : "play.fill") {
+                    SimulatorInstanceActions.run(instance, library: library, onNeedImport: onImport)
+                }
+                .help(serving ? "重新冷启动当前设备（⌘R）" : (instance.runtime.runUnavailableReason ?? "按本实例的硬件预设开机（⌘R）"))
+                .disabled(!SimulatorInstanceActions.canRun(instance))
+                .accessibilityIdentifier("simulator.run-firmware")
+
+                Button("停止", systemImage: "stop.fill") {
+                    SimulatorInstanceActions.stop(instance, library: library)
+                }
+                .help(instance.runtime.isStopping ? "正在停止…" : "停止当前设备或断开外部会话（⌘.）")
+                .disabled(!SimulatorInstanceActions.canStop(instance))
+                .accessibilityIdentifier("simulator.stop")
+
                 Button(logsPresented.wrappedValue ? "隐藏日志" : "日志",
                        systemImage: logsPresented.wrappedValue ? "rectangle.bottomthird.inset.filled" : "text.alignleft") {
                     logsPresented.wrappedValue.toggle()
                 }
                 .help(logsPresented.wrappedValue ? "隐藏实时日志" : "显示实时日志")
                 .accessibilityIdentifier("simulator.logs")
-                Button("导入固件", systemImage: "square.and.arrow.down") { onImport() }
-                    .help("选择固件包导入到固件库")
-                    .disabled(!SimulatorInstanceActions.importFirmware(instance))
-                    .accessibilityIdentifier("simulator.import-firmware")
-                Button("截图", systemImage: "camera") { SimulatorInstanceActions.screenshot(instance) }
-                    .help("保存当前设备画面截图")
-                    .disabled(instance.runtime.runtimeSession.image == nil)
+
+                Button("截图", systemImage: "camera") {
+                    SimulatorInstanceActions.screenshot(instance, library: library)
+                }
+                .help("保存当前设备画面截图")
+                .disabled(!SimulatorInstanceActions.canScreenshot(instance))
+
                 Button(instance.recording.isRecording ? "停止录屏" : "录屏",
-                       systemImage: instance.recording.isRecording ? "stop.circle" : "record.circle") {
-                    SimulatorInstanceActions.toggleRecording(instance)
+                       systemImage: instance.recording.isRecording ? "stop.circle.fill" : "record.circle") {
+                    SimulatorInstanceActions.toggleRecording(instance, library: library)
                 }
                 .help("录制此设备的画面，完成后保存到桌面")
-                .disabled(instance.recording.isFinishing
-                          || (!instance.recording.isRecording && (instance.runtime.runtimeSession.image == nil
-                                                                 || !instance.runtime.runtimeSession.isRunning)))
+                .disabled(!SimulatorInstanceActions.canToggleRecording(instance))
                 .accessibilityIdentifier("simulator.recording")
+
                 if SimulatorInstanceActions.isWatch(instance) {
                     Button("表冠", systemImage: "button.programmable") {
                         instance.runtime.runtimeSession.sendDeviceButton("crown")
@@ -166,6 +271,7 @@ import SwiftUI
                     .disabled(!SimulatorInstanceActions.watchButtonsAvailable(instance))
                     .accessibilityIdentifier("simulator.watch.lower.single")
                 }
+
                 Button("新窗口", systemImage: "macwindow") { openWindow(id: "device-display", value: instance.id) }
                     .help("在新窗口打开此设备画面")
                     .accessibilityIdentifier("simulator.open-display-window")
@@ -217,26 +323,28 @@ extension FocusedValues {
                 .keyboardShortcut("n")
                 .disabled(library.map { SimulatorInstanceActions.canCreateReason($0) != nil } ?? true)
             Button("导入固件…") { importFirmware = true }
-                .disabled(instance.map { !SimulatorInstanceActions.importFirmware($0) } ?? true)
+                .disabled(instance.map { !SimulatorInstanceActions.importFirmware($0) } ?? false)
         }
         CommandMenu("设备") {
-            Button("运行") { if let instance { SimulatorInstanceActions.run(instance) } }
-                .keyboardShortcut("r")
-                .disabled(instance.map { !SimulatorInstanceActions.canRun($0) } ?? true)
-            Button("停止") { if let instance { SimulatorInstanceActions.stop(instance) } }
+            Button(instance?.runtime.isServing == true ? "重启" : "运行") {
+                if let instance {
+                    SimulatorInstanceActions.run(instance, library: library) { importFirmware = true }
+                }
+            }
+            .keyboardShortcut("r")
+            .disabled(instance.map { !SimulatorInstanceActions.canRun($0) } ?? true)
+            Button("停止") { if let instance { SimulatorInstanceActions.stop(instance, library: library) } }
                 .keyboardShortcut(".")
                 .disabled(instance.map { !SimulatorInstanceActions.canStop($0) } ?? true)
             Button("断开") { if let instance { SimulatorInstanceActions.detach(instance) } }
                 .disabled(instance.map { !SimulatorInstanceActions.canDetach($0) } ?? true)
             Divider()
-            Button("截图") { if let instance { SimulatorInstanceActions.screenshot(instance) } }
-                .disabled(instance?.runtime.runtimeSession.image == nil)
+            Button("截图") { if let instance { SimulatorInstanceActions.screenshot(instance, library: library) } }
+                .disabled(instance.map { !SimulatorInstanceActions.canScreenshot($0) } ?? true)
             Button(instance?.recording.isRecording == true ? "停止录屏" : "录屏") {
-                if let instance { SimulatorInstanceActions.toggleRecording(instance) }
+                if let instance { SimulatorInstanceActions.toggleRecording(instance, library: library) }
             }
-            .disabled(instance.map {
-                $0.recording.isFinishing || (!$0.recording.isRecording && ($0.runtime.runtimeSession.image == nil || !$0.runtime.runtimeSession.isRunning))
-            } ?? true)
+            .disabled(instance.map { !SimulatorInstanceActions.canToggleRecording($0) } ?? true)
             Divider()
             Button("点击表冠") { instance?.runtime.runtimeSession.sendDeviceButton("crown") }
                 .disabled(instance.map { !SimulatorInstanceActions.watchButtonsAvailable($0) } ?? true)
@@ -259,6 +367,11 @@ extension FocusedValues {
                 .keyboardShortcut("s", modifiers: [.command, .shift])
         }
         CommandMenu("显示") {
+            Toggle("按真实屏幕形状裁切", isOn: Binding(
+                get: { DisplaySettings.shared.clipToScreenShape },
+                set: { DisplaySettings.shared.clipToScreenShape = $0 }
+            ))
+            Divider()
             Button(inspectorPresented == true ? "隐藏检查器" : "显示检查器") {
                 inspectorPresented?.toggle()
             }

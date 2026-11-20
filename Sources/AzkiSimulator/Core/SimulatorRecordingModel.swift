@@ -33,12 +33,13 @@ final class SimulatorRecordingModel {
         self.publishRecording = publishRecording
     }
 
-    func start(session: SimulatorSessionModel, instanceName: String) {
+    func start(session: SimulatorSessionModel, instanceName: String,
+               clipGeometry: SimulatorDisplayGeometry? = nil) {
         guard session.isRunning, session.image != nil, let sessionID = session.manifest?.id else {
             errorMessage = "请等待设备启动并显示画面后录制"
             return
         }
-        start(instanceName: instanceName) { [weak session] in
+        start(instanceName: instanceName, clipGeometry: clipGeometry) { [weak session] in
             guard let session, session.isRunning, session.manifest?.id == sessionID else { return nil }
             return session.image
         }
@@ -46,7 +47,8 @@ final class SimulatorRecordingModel {
 
     /// An injectable framebuffer source also permits tests without starting a guest.
     /// nil means the originating session ended; a new session is never spliced in.
-    func start(instanceName: String, frameSource: @escaping () -> CGImage?) {
+    func start(instanceName: String, clipGeometry: SimulatorDisplayGeometry? = nil,
+               frameSource: @escaping () -> CGImage?) {
         guard !isRecording, !isFinishing, finishing == nil else { return }
         errorMessage = nil
         savedFileURL = nil
@@ -58,6 +60,7 @@ final class SimulatorRecordingModel {
         }
         do {
             encoder = try SimulatorRecordingEncoder(image: firstFrame, instanceName: instanceName,
+                                                    clipGeometry: clipGeometry,
                                                     outputDirectory: outputDirectory, publishRecording: publishRecording)
             source = frameSource
             started = clock.now
@@ -151,6 +154,7 @@ private actor SimulatorRecordingEncoder {
     private let adaptor: AVAssetWriterInputPixelBufferAdaptor
     private let width: Int
     private let height: Int
+    private let clipGeometry: SimulatorDisplayGeometry?
     private let stagingDirectory: URL
     private let stagingURL: URL
     private let destinationURL: URL
@@ -159,9 +163,11 @@ private actor SimulatorRecordingEncoder {
     private var lastTime = CMTime.zero
     private var completedURL: URL?
 
-    init(image: CGImage, instanceName: String, outputDirectory: URL,
+    init(image: CGImage, instanceName: String, clipGeometry: SimulatorDisplayGeometry? = nil,
+         outputDirectory: URL,
          publishRecording: @escaping @Sendable (URL, URL) throws -> Void) throws {
         self.publishRecording = publishRecording
+        self.clipGeometry = clipGeometry
         width = image.width
         height = image.height
         guard width > 0, height > 0, width <= 2_048, height <= 2_048,
@@ -242,8 +248,7 @@ private actor SimulatorRecordingEncoder {
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
         else { throw SimulatorRecordingError.cannotDraw }
-        context.interpolationQuality = .none
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        Self.drawFrame(image, in: context, width: width, height: height, clipGeometry: clipGeometry)
         // First sample starts at zero. Later samples use monotonic elapsed time,
         // so dropped frames and temporary backpressure do not shorten the movie.
         let time = frameCount == 0 ? CMTime.zero : CMTime(seconds: seconds, preferredTimescale: 60_000)
@@ -278,6 +283,27 @@ private actor SimulatorRecordingEncoder {
 
     func recoverableFileURL() -> URL? {
         FileManager.default.fileExists(atPath: stagingURL.path) ? stagingURL : nil
+    }
+
+    nonisolated static func drawFrame(_ image: CGImage, in context: CGContext,
+                                      width: Int, height: Int,
+                                      clipGeometry: SimulatorDisplayGeometry?) {
+        let frameRect = CGRect(x: 0, y: 0, width: width, height: height)
+        if let clipGeometry {
+            context.saveGState()
+            context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+            context.fill(frameRect)
+            context.setAllowsAntialiasing(true)
+            context.setShouldAntialias(true)
+            context.addPath(clipGeometry.screenClipPath(in: frameRect))
+            context.clip()
+            context.interpolationQuality = .none
+            context.draw(image, in: frameRect)
+            context.restoreGState()
+        } else {
+            context.interpolationQuality = .none
+            context.draw(image, in: frameRect)
+        }
     }
 
     private static func safeName(_ proposed: String) -> String {

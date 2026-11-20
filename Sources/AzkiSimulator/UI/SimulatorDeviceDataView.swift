@@ -56,7 +56,9 @@ import SwiftUI
                 note(footer)
                 HStack(spacing: 8) {
                     Text("语言、时区、时间格式、开机时间和系统属性：").font(.system(size: 12)).foregroundStyle(.secondary)
-                    Button("系统设置…", action: editSystemSettings).disabled(!enabled || runtime.instanceID == nil)
+                    Button("系统设置…", action: editSystemSettings)
+                        .buttonStyle(GeminiNeonButtonStyle(tone: .secondary, compact: true))
+                        .disabled(runtime.instanceID == nil)
                         .accessibilityIdentifier("simulator.firmware-settings")
                 }
             }
@@ -73,7 +75,6 @@ import SwiftUI
     private var showsCharger: Bool { batteryInputs?.charger == true || live?.supports("charger") == true }
     private var showsTemperature: Bool { live?.supports("temperature") == true }
     private var hasRows: Bool { showsWear || showsSteps || showsLevel || showsCharger || showsTemperature }
-    private var running: Bool { session.isRunning && live != nil && liveUnavailable == nil }
 
     private var table: some View {
         Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
@@ -94,7 +95,9 @@ import SwiftUI
                 GridRow {
                     label("心率")
                     current(live?.int("heartRate").map { "\($0) 次/分" } ?? bootHeartRate)
-                    field($heartRateText, unit: "次/分", label: "心率，每分钟次数")
+                    field($heartRateText, unit: "次/分", label: "心率，每分钟次数") {
+                        Task { busy = true; await applyHeartRate(); busy = false }
+                    }
                     applyButton("应用", id: "heart-rate", enabled: heartRate != nil) { await applyHeartRate() }
                 }
             }
@@ -102,20 +105,27 @@ import SwiftUI
                 GridRow {
                     label("步频")
                     current(live?.int("cadence").map { "\($0) 步/分" } ?? settings?.health?.cadence.map { "\($0) 步/分（开机）" } ?? "110 步/分")
-                    field($cadenceText, unit: "步/分", label: "步频，每分钟步数")
+                    field($cadenceText, unit: "步/分", label: "步频，每分钟步数") {
+                        Task { busy = true; await applyCadence(); busy = false }
+                    }
                     applyButton("应用", id: "cadence", enabled: cadence != nil) { await applyCadence() }
                 }
                 GridRow {
                     label("走路")
                     current(walkSummary)
-                    field($walkText, unit: "步", label: "立即步行的步数")
-                    applyButton("走", id: "walk", enabled: running && live?.supports("steps") == true
-                                && parse(walkText, SimulatorLiveState.addStepsRange) != nil) { await applyWalk() }
+                    field($walkText, unit: "步", label: "立即步行的步数") {
+                        Task { busy = true; await applyWalk(); busy = false }
+                    }
+                    applyButton("走", id: "walk", enabled: session.isRunning && parse(walkText, SimulatorLiveState.addStepsRange) != nil) {
+                        await applyWalk()
+                    }
                 }
                 GridRow {
                     label("开机后步行")
                     current(settings?.health?.walkSteps.map { "\($0) 步" } ?? "不走")
-                    field($bootWalkText, unit: "步", label: "每次开机后步行的步数")
+                    field($bootWalkText, unit: "步", label: "每次开机后步行的步数") {
+                        Task { busy = true; await applyBootWalk(); busy = false }
+                    }
                     applyButton("保存", id: "boot-walk", enabled: bootWalk != nil) { await applyBootWalk() }
                 }
             }
@@ -124,7 +134,9 @@ import SwiftUI
                 GridRow {
                     label("电量")
                     current(settings?.battery?.level.map { "开机 \($0)%" } ?? "固件默认")
-                    field($levelText, unit: "%", label: "电池电量百分比")
+                    field($levelText, unit: "%", label: "电池电量百分比") {
+                        Task { busy = true; await applyLevel(); busy = false }
+                    }
                     applyButton("应用", id: "battery-level", enabled: level != nil) { await applyLevel() }
                 }
             }
@@ -137,15 +149,17 @@ import SwiftUI
                         Text("充电中").tag(InstanceFirmwareSettings.Charger.charging)
                         Text("已充满").tag(InstanceFirmwareSettings.Charger.full)
                     }.labelsHidden().frame(width: 150)
-                    applyButton("应用", id: "charger", enabled: charger != .auto) { await applyCharger() }
+                    applyButton("应用", id: "charger", enabled: true) { await applyCharger() }
                 }
             }
             if showsTemperature {
                 GridRow {
                     label("电池温度")
                     current(live?.number("temperatureC").map { String(format: "%.1f °C", $0) } ?? "—")
-                    field($temperatureText, unit: "°C", label: "电池温度，摄氏度")
-                    applyButton("应用", id: "temperature", enabled: running && temperature != nil) { await applyTemperature() }
+                    field($temperatureText, unit: "°C", label: "电池温度，摄氏度") {
+                        Task { busy = true; await applyTemperature(); busy = false }
+                    }
+                    applyButton("应用", id: "temperature", enabled: session.isRunning && temperature != nil) { await applyTemperature() }
                 }
             }
         }
@@ -199,9 +213,13 @@ import SwiftUI
             .frame(minWidth: 130, alignment: .leading)
     }
 
-    private func field(_ text: Binding<String>, unit: String, label: String) -> some View {
+    private func field(_ text: Binding<String>, unit: String, label: String, onSubmit: @escaping () -> Void) -> some View {
         HStack(spacing: 4) {
-            TextField("", text: text).textFieldStyle(.roundedBorder).frame(width: 80).accessibilityLabel(label)
+            TextField("", text: text)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 80)
+                .accessibilityLabel(label)
+                .onSubmit(onSubmit)
             Text(unit).font(.system(size: 12)).foregroundStyle(.secondary)
         }
     }
@@ -213,9 +231,9 @@ import SwiftUI
         return Button(title == "应用" && !(session.isRunning && supportsLive) ? "保存" : title) {
             Task { busy = true; await run(); busy = false }
         }
-            .disabled(!self.enabled || busy || !enabled
-                      || (supportsLive && session.isRunning && liveUnavailable != nil))
-            .accessibilityIdentifier("simulator.data.\(id)")
+        .buttonStyle(GeminiNeonButtonStyle(tone: .secondary, compact: true))
+        .disabled(busy || !enabled)
+        .accessibilityIdentifier("simulator.data.\(id)")
     }
 
     private func note(_ text: String) -> some View {
@@ -281,8 +299,9 @@ import SwiftUI
     }
 
     private func applyCharger() async {
-        await apply(live: live?.supports("charger") == true ? ["charger": .string(charger.rawValue)] : nil) {
-            $0.battery { $0.charger = charger }
+        let effective: InstanceFirmwareSettings.Charger = charger == .auto ? .unplugged : charger
+        await apply(live: live?.supports("charger") == true ? ["charger": .string(effective.rawValue)] : nil) {
+            $0.battery { $0.charger = effective }
         }
     }
 
@@ -297,13 +316,16 @@ import SwiftUI
         var progress = SimulatorLiveApplyProgress()
         do {
             if let change, session.isRunning, live != nil {
-                guard liveUnavailable == nil else { throw SimulatorError.remote("实时状态已过期，请等待刷新后再提交") }
-                let receipt = try SimulatorLiveWriteReceipt(await session.liveCommand(SimulatorLiveCommands.set, arguments: change))
-                progress.hardwareAccepted = true
-                if let snapshot = receipt.snapshot { receive(snapshot) }
-                else {
-                    progress.stateUnavailable = true
-                    liveUnavailable = "模拟硬件已接受输入，但暂时无法回读；当前值可能已过期，请等待刷新。"
+                if liveUnavailable == nil {
+                    let receipt = try SimulatorLiveWriteReceipt(await session.liveCommand(SimulatorLiveCommands.set, arguments: change))
+                    progress.hardwareAccepted = true
+                    if let snapshot = receipt.snapshot { receive(snapshot) }
+                    else {
+                        progress.stateUnavailable = true
+                        liveUnavailable = "模拟硬件已接受输入，但暂时无法回读；当前值可能已过期，请等待刷新。"
+                    }
+                } else if boot == nil {
+                    throw SimulatorError.remote("实时状态正在刷新，请稍候再试")
                 }
             }
             if let boot, runtime.instanceID != nil {

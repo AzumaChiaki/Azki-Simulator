@@ -7,7 +7,18 @@ import UniformTypeIdentifiers
 /// the screen recordings and named the same way.
 nonisolated enum SimulatorScreenshot {
     static func save(_ image: CGImage, instanceName: String,
+                     clipGeometry: SimulatorDisplayGeometry? = nil,
                      directory: URL = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0]) throws -> URL {
+        let outputImage: CGImage
+        if let clipGeometry {
+            guard let masked = SimulatorDisplayGeometry.maskedCGImage(image, geometry: clipGeometry,
+                                                                      transparentBackground: true) else {
+                throw SimulatorError.invalidSession("无法按设备屏幕形状裁切截图")
+            }
+            outputImage = masked
+        } else {
+            outputImage = image
+        }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd-HH-mm-ss"
@@ -22,7 +33,7 @@ nonisolated enum SimulatorScreenshot {
         guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
             throw SimulatorError.invalidSession("无法在桌面创建截图文件")
         }
-        CGImageDestinationAddImage(destination, image, nil)
+        CGImageDestinationAddImage(destination, outputImage, nil)
         guard CGImageDestinationFinalize(destination) else {
             throw SimulatorError.invalidSession("截图保存失败")
         }

@@ -14,6 +14,67 @@ nonisolated enum SimulatorDisplayGeometry: CaseIterable, Equatable, Sendable {
         switch self { case .pixels192x490: 490; case .pixels212x520: 520; case .pixels336x480: 480; case .pixels432x514: 514; case .pixels466x466: 466 }
     }
     var size: CGSize { CGSize(width: width, height: height) }
+    /// Physical screen corner radius in native device pixels:
+    /// - 192×490 (Mi Band 9) & 212×520 (Mi Band 10/11): exact pill/capsule (width / 2)
+    /// - 336×480 (Mi Band 9 Pro): rounded rectangular AMOLED (R66)
+    /// - 432×514 (Mi Band 10 Pro / Redmi Watch 6/7): rounded rectangular AMOLED (R96)
+    /// - 466×466 (XRing / round watch): exact circle (width / 2)
+    var screenCornerRadius: CGFloat {
+        switch self {
+        case .pixels192x490: 96
+        case .pixels212x520: 106
+        case .pixels336x480: 66
+        case .pixels432x514: 96
+        case .pixels466x466: 233
+        }
+    }
+
+    /// Physical screen clip path scaled into the destination rectangle.
+    func screenClipPath(in rect: CGRect) -> CGPath {
+        guard rect.width > 0, rect.height > 0, size.width > 0, size.height > 0 else {
+            return CGPath(rect: rect, transform: nil)
+        }
+        let rx = min(rect.width * 0.5, screenCornerRadius * (rect.width / size.width))
+        let ry = min(rect.height * 0.5, screenCornerRadius * (rect.height / size.height))
+        return CGPath(roundedRect: rect, cornerWidth: rx, cornerHeight: ry, transform: nil)
+    }
+
+    /// Returns whether `point` falls inside the physical screen silhouette mapped into `rect`.
+    func containsInScreenShape(_ point: CGPoint, in rect: CGRect) -> Bool {
+        guard rect.contains(point) else { return false }
+        return screenClipPath(in: rect).contains(point)
+    }
+
+    /// Renders `image` clipped to this geometry's real screen shape.
+    /// Screenshots use a transparent alpha channel outside the mask; opaque video
+    /// frames fill the masked outer area with black.
+    static func maskedCGImage(_ image: CGImage, geometry: SimulatorDisplayGeometry,
+                              transparentBackground: Bool) -> CGImage? {
+        let width = image.width, height = image.height
+        guard width > 0, height > 0, let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        let bitmapInfo: UInt32 = (transparentBackground
+            ? CGImageAlphaInfo.premultipliedLast.rawValue
+            : CGImageAlphaInfo.noneSkipLast.rawValue) | CGBitmapInfo.byteOrder32Big.rawValue
+        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                      bytesPerRow: width * 4, space: colorSpace, bitmapInfo: bitmapInfo) else {
+            return nil
+        }
+        let rect = CGRect(x: 0, y: 0, width: width, height: height)
+        if transparentBackground {
+            context.clear(rect)
+        } else {
+            context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+            context.fill(rect)
+        }
+        context.setAllowsAntialiasing(true)
+        context.setShouldAntialias(true)
+        context.addPath(geometry.screenClipPath(in: rect))
+        context.clip()
+        context.interpolationQuality = .none
+        context.draw(image, in: rect)
+        return context.makeImage()
+    }
+
     init?(width: Int, height: Int) {
         guard let match = Self.allCases.first(where: { $0.width == width && $0.height == height }) else { return nil }
         self = match

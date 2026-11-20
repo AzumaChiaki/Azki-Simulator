@@ -63,14 +63,16 @@ final class SimulatorGuestOperationsModel {
     var isBusy: Bool { isRequestInFlight || isResolvingCompletion || operationState == "running" }
     var canConnect: Bool {
         isAvailable && identity != nil && !isBusy && !isAuthenticated
-            && ["idle", "disconnected", "failed"].contains(authPhase)
     }
     // A package/request error does not invalidate authentication. The engine's
     // reported transport state determines whether another operation may start.
     var canInstall: Bool { isAvailable && packagesAvailable && isAuthenticated && isTransportReady && identity != nil && !isBusy }
+    /// Allows the UI install button to stay interactive while running even before
+    /// authentication completes, so clicking can trigger connection directly.
+    var canStartInstallFlow: Bool { isAvailable && packagesAvailable && !isBusy }
     var canRefresh: Bool { canInstall }
     var canSelect: Bool {
-        canInstall && selectedWatchfaceID.map { id in inventory.contains { $0.id == id && !$0.isCurrent } } == true
+        canInstall && selectedWatchfaceID.map { id in inventory.contains { $0.id == id } } == true
     }
     func canUninstall(_ app: QuickApp) -> Bool { canInstall && applications.contains(app) }
     var connectionLabel: String {

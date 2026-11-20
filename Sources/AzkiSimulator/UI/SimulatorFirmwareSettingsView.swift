@@ -24,56 +24,64 @@ import SwiftUI
 
     var body: some View {
         NavigationStack {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("下次开机时写入固件的系统设置数据库（persist.db），并按以下时钟启动；佩戴、心率、步行、电量、充电在检查器“设备数据”中修改。目录覆盖的手环 9 / 9 Pro / 10 / 10 Pro / 11 与导入固件共用同一套 /data 存储，均按实例的硬件预设生效。")
-                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            if !loaded {
-                ProgressView().controlSize(.small)
-            } else {
-                Form {
-                    clockSection
-                    Section("系统") {
-                        choicePicker("语言", key: InstanceFirmwareSettingKeys.locale,
-                                     options: InstanceFirmwareSettingKeys.languages)
-                        choicePicker("时间格式", key: InstanceFirmwareSettingKeys.timeFormat,
-                                     options: [("false", "24 小时制"), ("true", "12 小时制")])
-                        timeZonePicker
+            VStack(alignment: .leading, spacing: 14) {
+                Text("下次开机时写入固件的系统设置数据库（persist.db），并按以下时钟启动；佩戴、心率、步行、电量、充电在检查器“设备数据”中修改。目录覆盖的手环 9 / 9 Pro / 10 / 10 Pro / 11 与导入固件共用同一套 /data 存储，均按实例的硬件预设生效。")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if !loaded {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Form {
+                        clockSection
+                        Section("系统") {
+                            choicePicker("语言", key: InstanceFirmwareSettingKeys.locale,
+                                         options: InstanceFirmwareSettingKeys.languages)
+                            choicePicker("时间格式", key: InstanceFirmwareSettingKeys.timeFormat,
+                                         options: [("false", "24 小时制"), ("true", "12 小时制")])
+                            timeZonePicker
+                        }
+                        propertiesSection
                     }
-                    propertiesSection
+                    .formStyle(.grouped)
+                    .frame(minHeight: 420)
                 }
-                .formStyle(.grouped)
-                .frame(minHeight: 420)
-            }
-            if let message {
-                Text(message).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
-            }
-            if loadFailed {
-                HStack {
-                    Text("未能读取已保存的设置；可重试，或直接保存以写入新的设置。")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    Button("重新读取") { Task { await load() } }
+                if let message {
+                    Text(message).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
                 }
-            }
-            if let observedAt {
-                Text("固件当前值读取于 \(observedAt.formatted(date: .abbreviated, time: .shortened))")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-        }
-        .padding(24)
-        .navigationTitle("固件设置")
-        .toolbar {
-            ToolbarItem(placement: .cancellationAction) {
-                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-            }
-            if restartAvailable {
-                ToolbarItem(placement: .automatic) {
-                    Button("保存并重新开机") { save(thenRestart: true) }.disabled(!loaded || saving)
+                if loadFailed {
+                    HStack {
+                        Text("未能读取已保存的设置；可重试，或直接保存以写入新的设置。")
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        Button("重新读取") { Task { await load() } }
+                            .buttonStyle(GeminiNeonButtonStyle(tone: .secondary, compact: true))
+                    }
+                }
+                if let observedAt {
+                    Text("固件当前值读取于 \(observedAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
-            ToolbarItem(placement: .confirmationAction) {
-                Button("保存") { save(thenRestart: false) }.keyboardShortcut(.defaultAction).disabled(!loaded || saving)
+            .padding(24)
+            .navigationTitle("固件设置")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
+                }
+                if restartAvailable {
+                    ToolbarItem(placement: .automatic) {
+                        Button(runtime.isServing ? "保存并重新开机" : "保存并开机") {
+                            save(thenRestart: true)
+                        }
+                        .buttonStyle(GeminiNeonButtonStyle(tone: .secondary, compact: true))
+                        .disabled(!loaded || saving)
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") { save(thenRestart: false) }
+                        .buttonStyle(GeminiNeonButtonStyle(tone: .primary, compact: true))
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!loaded || saving)
+                }
             }
-        }
         }
         .frame(minWidth: 620, minHeight: 520)
         .task { await load() }
@@ -125,6 +133,7 @@ import SwiftUI
                     }
                     settings.set(key, .some(newValue)); newKey = ""; newValue = ""; message = nil
                 }
+                .buttonStyle(GeminiNeonButtonStyle(tone: .secondary, compact: true))
             }
         } header: {
             Text("全部属性（\(observed.count) 项来自上次运行）")
@@ -152,16 +161,20 @@ import SwiftUI
             switch settings.override(key) {
             case .none:
                 Button("修改") { settings.set(key, .some(observed[key] ?? "")) }
+                    .buttonStyle(GeminiNeonButtonStyle(tone: .subtle, compact: true))
             case .some(.none):
                 Text("将恢复默认").font(.caption)
                 Button("撤销") { settings.set(key, nil) }
+                    .buttonStyle(GeminiNeonButtonStyle(tone: .subtle, compact: true))
             case .some(.some(let value)):
                 TextField("值", text: Binding(get: { value }, set: { settings.set(key, .some($0)) }))
                     .frame(width: 180)
                 Button("撤销") { settings.set(key, nil) }
+                    .buttonStyle(GeminiNeonButtonStyle(tone: .subtle, compact: true))
             }
             if !isReset(key) {
                 Button("恢复默认") { settings.set(key, .some(nil)) }
+                    .buttonStyle(GeminiNeonButtonStyle(tone: .subtle, compact: true))
             }
         }
     }
